@@ -1,0 +1,212 @@
+"""Research planning node."""
+
+import structlog
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from pydantic import BaseModel, Field
+
+from src.workflow.nodes.memory_search import format_memory_context_for_prompt
+from src.workflow.state import ResearchState
+
+logger = structlog.get_logger(__name__)
+
+
+class ResearchPlan(BaseModel):
+    """Structured research plan."""
+
+    overview: str = Field(..., description="High-level overview of the research approach")
+    topics: list[str] = Field(
+        ...,
+        description="Specific topics or questions to investigate",
+        min_length=1,
+        max_length=10,
+    )
+    rationale: str = Field(..., description="Reasoning behind this research plan")
+
+
+PLANNING_SYSTEM_PROMPT = """You are a research planning expert. Your role is to create a strategic research plan.
+
+Given a research query and any relevant memory context, create a comprehensive plan that:
+1. Breaks down the query into specific, researchable topics
+2. Identifies key questions that need to be answered
+3. Considers what we already know (from memory) and what we need to find out
+4. Prioritizes topics by importance and relevance
+
+Your plan should be:
+- **Focused**: Each topic should be specific and well-defined
+- **Comprehensive**: Cover all aspects of the query
+- **Actionable**: Topics should be concrete enough for researchers to investigate
+- **Non-redundant**: Avoid overlapping topics
+
+Mode-specific guidance:
+- **Speed mode**: 1-2 topics, very targeted
+- **Balanced mode**: 3-5 topics, balanced coverage
+- **Quality mode**: 5-8 topics, comprehensive exploration"""
+
+
+PLANNING_USER_TEMPLATE = """Research Query: {query}
+
+Research Mode: {mode}
+
+{memory_context}
+
+Based on this information, create a strategic research plan.
+
+Your response should include:
+1. **Overview**: Brief description of the research approach (2-3 sentences)
+2. **Topics**: List of specific topics to investigate (numbered list)
+3. **Rationale**: Why this plan will effectively answer the query (2-3 sentences)
+
+Format your response as:
+
+## Overview
+[Your overview here]
+
+## Research Topics
+1. [Topic 1]
+2. [Topic 2]
+...
+
+## Rationale
+[Your rationale here]"""
+
+
+async def plan_research_node(
+    state: ResearchState,
+    llm: any,  # LangChain LLM instance
+) -> dict:
+    """
+    Create research plan based on query and memory context.
+
+    Args:
+        state: Current research state
+        llm: LangChain LLM for planning
+
+    Returns:
+        State update with research_plan and research_topics
+    """
+    query = state.get("clarified_query") or state.get("query", "")
+    mode = state.get("mode", "balanced")
+    memory_context = state.get("memory_context", [])
+    stream = state.get("stream")
+
+    logger.info("Creating research plan", query=query, mode=mode)
+
+    try:
+        # Format memory context
+        memory_str = format_memory_context_for_prompt(memory_context)
+
+        # Create planning prompt
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                SystemMessage(content=PLANNING_SYSTEM_PROMPT),
+                HumanMessage(
+                    content=PLANNING_USER_TEMPLATE.format(
+                        query=query,
+                        mode=mode,
+                        memory_context=memory_str,
+                    )
+                ),
+            ]
+        )
+
+        # Generate plan
+        chain = prompt | llm | StrOutputParser()
+        plan_text = await chain.ainvoke({})
+
+        # Parse topics from plan
+        topics = _extract_topics_from_plan(plan_text)
+
+        # Limit topics based on mode
+        max_topics = _get_max_topics_for_mode(mode)
+        topics = topics[:max_topics]
+
+        logger.info(
+            "Research plan created",
+            topics_count=len(topics),
+            mode=mode,
+        )
+
+        if stream:
+            stream.emit_research_plan(plan_text, topics)
+
+        return {
+            "research_plan": {"type": "override", "value": plan_text},
+            "research_topics": {"type": "override", "value": topics},
+        }
+
+    except Exception as e:
+        logger.error("Research planning failed", error=str(e))
+
+        # Fallback: use query as single topic
+        return {
+            "research_plan": {
+                "type": "override",
+                "value": f"Direct research on: {query}",
+            },
+            "research_topics": {"type": "override", "value": [query]},
+        }
+
+
+def _extract_topics_from_plan(plan_text: str) -> list[str]:
+    """
+    Extract numbered topics from plan text.
+
+    Args:
+        plan_text: Full plan text
+
+    Returns:
+        List of topic strings
+    """
+    topics = []
+    in_topics_section = False
+
+    for line in plan_text.split("\n"):
+        line = line.strip()
+
+        # Detect topics section
+        if "## Research Topics" in line or "## Topics" in line:
+            in_topics_section = True
+            continue
+
+        # End of topics section
+        if in_topics_section and line.startswith("##"):
+            break
+
+        # Extract numbered items
+        if in_topics_section and line:
+            # Remove numbering (1., 2., -, *, etc.)
+            cleaned = line.lstrip("0123456789.-*• \t")
+            if cleaned:
+                topics.append(cleaned)
+
+    # If parsing failed, try simpler extraction
+    if not topics:
+        import re
+
+        pattern = r"^\d+\.\s+(.+)$"
+        for line in plan_text.split("\n"):
+            match = re.match(pattern, line.strip())
+            if match:
+                topics.append(match.group(1))
+
+    return topics
+
+
+def _get_max_topics_for_mode(mode: str) -> int:
+    """
+    Get maximum topics for research mode.
+
+    Args:
+        mode: Research mode
+
+    Returns:
+        Maximum number of topics
+    """
+    if mode == "speed":
+        return 2
+    elif mode == "balanced":
+        return 5
+    else:  # quality
+        return 8

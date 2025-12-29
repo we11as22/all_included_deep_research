@@ -1,0 +1,106 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: deep_research_postgres
+    environment:
+      POSTGRES_DB: deep_research
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_secure_password}
+      POSTGRES_INITDB_ARGS: "-E UTF8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - deep_research_network
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: deep_research_searxng
+    environment:
+      BASE_URL: http://localhost:8080
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-your_searxng_secret}
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - searxng_data:/etc/searxng
+    ports:
+      - "8080:8080"
+    networks:
+      - deep_research_network
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    container_name: deep_research_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: deep_research
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_secure_password}
+      MEMORY_DIR: /memory_files
+      SEARXNG_INSTANCE_URL: http://searxng:8080
+    env_file:
+      - ../backend/.env
+    volumes:
+      - ${MEMORY_HOST_PATH:-/home/asudakov/projects/memory_files}:/memory_files
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - deep_research_network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    container_name: deep_research_frontend
+    depends_on:
+      - backend
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    networks:
+      - deep_research_network
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: deep_research_ollama
+    profiles: ["local-embeddings"]
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    networks:
+      - deep_research_network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  searxng_data:
+    driver: local
+  ollama_data:
+    driver: local
+
+networks:
+  deep_research_network:
+    driver: bridge
