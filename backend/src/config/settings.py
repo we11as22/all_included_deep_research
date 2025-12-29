@@ -131,6 +131,7 @@ class Settings(BaseSettings):
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")
     sources_limit: int = Field(default=8, description="Max sources to include in prompts")
     search_content_max_chars: int = Field(default=6000, description="Max chars per source before summarization")
+    chat_history_limit: int = Field(default=2, description="Chat messages to include in prompts")
     simple_search_max_results: int = Field(default=5, description="Max results for simple search")
     simple_search_scrape_top_n: int = Field(default=2, description="Top results to scrape in simple search")
     deep_search_max_results: int = Field(default=10, description="Max results per query in deep search")

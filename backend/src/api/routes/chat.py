@@ -33,6 +33,8 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
     query = user_messages[-1].content
     raw_mode = request.model or "search"
     normalized = raw_mode.lower().replace("-", "_")
+    settings = app_request.app.state.settings
+    chat_history = _collect_chat_history(request.messages, settings.chat_history_limit)
 
     if normalized in {"speed"}:
         mode = "search"
@@ -62,9 +64,9 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
                 if mode in {"search", "deep_search"}:
                     chat_service = app_request.app.state.chat_service
                     if mode == "search":
-                        result = await chat_service.answer_web(query)
+                        result = await chat_service.answer_web(query, messages=chat_history)
                     else:
-                        result = await chat_service.answer_deep(query)
+                        result = await chat_service.answer_deep(query, messages=chat_history)
 
                     answer = _append_sources(result.answer, result.sources)
                     for chunk in _chunk_text(answer, size=120):
@@ -76,7 +78,7 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
                 # deep_research mode uses full workflow
                 workflow_factory = app_request.app.state.workflow_factory
                 workflow = workflow_factory.create_workflow("quality")
-                final_state = await workflow.run(query)
+                final_state = await workflow.run(query, messages=chat_history)
                 final_report = final_state.get("final_report", "")
                 if final_report:
                     for chunk in _chunk_text(final_report, size=120):
@@ -121,3 +123,19 @@ def _append_sources(answer: str, sources: list) -> str:
     for idx, source in enumerate(sources, 1):
         lines.append(f"[{idx}] {source.title} - {source.url}")
     return "\n".join(lines)
+
+
+def _collect_chat_history(messages: list, limit: int) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+    normalized = []
+    for msg in messages:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", "") or ""
+        if not content:
+            continue
+        role_value = role.value if hasattr(role, "value") else str(role or "user")
+        if role_value == "system":
+            continue
+        normalized.append({"role": role_value, "content": content})
+    return normalized[-limit:]

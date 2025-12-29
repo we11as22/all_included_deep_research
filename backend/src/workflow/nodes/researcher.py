@@ -15,6 +15,7 @@ from langchain_core.messages import HumanMessage
 from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.state import ResearchFinding, ResearcherState, SourceReference
+from src.utils.chat_history import format_chat_history
 
 logger = structlog.get_logger(__name__)
 
@@ -74,7 +75,9 @@ async def researcher_node(
     queries_per_round = max(1, state.get("queries_per_round", 3))
     memory_context = state.get("memory_context", [])
     existing_findings = state.get("existing_findings", [])
+    messages = state.get("messages", [])
     stream = state.get("stream")
+    chat_history = format_chat_history(messages, limit=len(messages))
 
     logger.info(
         "Researcher starting investigation",
@@ -95,6 +98,7 @@ async def researcher_node(
             memory_context,
             existing_findings,
             max_queries=queries_per_round,
+            chat_history=chat_history,
         )
         all_queries: list[str] = []
         all_sources: list[SourceReference] = []
@@ -109,6 +113,7 @@ async def researcher_node(
                     memory_context,
                     existing_findings,
                     max_queries=queries_per_round,
+                    chat_history=chat_history,
                 )
                 search_queries = _dedupe_queries(followups, all_queries)
 
@@ -181,6 +186,7 @@ async def researcher_node(
             scraped_content=scraped_content,
             memory_context=memory_context,
             existing_findings=existing_findings,
+            chat_history=chat_history,
         )
 
         logger.info(
@@ -222,6 +228,7 @@ async def _generate_search_queries(
     memory_context: list[Any],
     existing_findings: list[ResearchFinding],
     max_queries: int = 3,
+    chat_history: str | None = None,
 ) -> list[str]:
     """Generate effective search queries for the research topic."""
     memory_hint = ""
@@ -232,7 +239,9 @@ async def _generate_search_queries(
 
     existing_hint = _format_existing_findings(existing_findings)
 
+    history_block = chat_history or "Chat history: None."
     prompt = f"""Research Topic: {topic}
+{history_block}
 {memory_hint}
 {existing_hint}
 
@@ -268,6 +277,7 @@ async def _analyze_and_synthesize(
     scraped_content: list[dict],
     memory_context: list[Any],
     existing_findings: list[ResearchFinding],
+    chat_history: str | None = None,
 ) -> dict:
     """Analyze sources and synthesize findings."""
 
@@ -293,7 +303,9 @@ async def _analyze_and_synthesize(
 
     existing_text = _format_existing_findings(existing_findings)
 
+    history_block = chat_history or "Chat history: None."
     prompt = f"""Research Topic: {topic}
+{history_block}
 
 ## Sources Found
 {sources_text}
@@ -412,6 +424,7 @@ async def _generate_followup_queries(
     memory_context: list[Any],
     existing_findings: list[ResearchFinding],
     max_queries: int = 3,
+    chat_history: str | None = None,
 ) -> list[str]:
     if getattr(llm, "_llm_type", "") == "mock-chat":
         return []
@@ -428,7 +441,9 @@ async def _generate_followup_queries(
         [f"- {source.title}: {source.snippet[:180]}" for source in sources[:5]]
     )
 
+    history_block = chat_history or "Chat history: None."
     prompt = f"""Research Topic: {topic}
+{history_block}
 Existing Queries: {', '.join(existing_queries[-6:])}
 Sources Summary:
 {sources_hint}

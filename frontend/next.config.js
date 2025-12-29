@@ -2,6 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   swcMinify: true,
+  output: 'standalone',
   images: {
     domains: ['localhost'],
   },
@@ -18,4 +19,3 @@ const nextConfig = {
 };
 
 module.exports = nextConfig;
-

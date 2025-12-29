@@ -6,8 +6,8 @@ Comprehensive deep research system with memory integration, combining the best p
 
 ### 3 Chat Modes
 
-- **Simple Search**: Fast web lookup with citations
-- **Deep Search**: Multi-query search + reranking + source summaries
+- **Web Search**: Query rewriting + multi-query search with citations
+- **Deep Search**: Quality web search with extra iterations and broader sources
 - **Deep Research**: Full multi-agent report synthesis with planning and compression
 
 ### Advanced Memory System
@@ -17,6 +17,7 @@ Comprehensive deep research system with memory integration, combining the best p
 - **Smart Chunking**: Markdown-aware chunking with header context preservation
 - **Auto-sync**: Automatic synchronization between files and database
   - Memory files live at `/home/asudakov/projects/memory_files` by default
+- **Chat Context**: Agents receive the last N chat messages (`CHAT_HISTORY_LIMIT`)
 
 ### ⚙️ Flexible Configuration
 
@@ -56,6 +57,7 @@ cp .env.example .env
 # - TAVILY_API_KEY or SEARCH_PROVIDER=searxng (choose one)
 # - LLM_MODE=mock to run without external LLMs (for testing)
 # - SEARCH_PROVIDER=mock to run without external search (for testing)
+# - CHAT_HISTORY_LIMIT to control how many recent chat messages are injected
 
 # 3. Configure Docker environment (project root)
 cd ..
@@ -233,6 +235,16 @@ SEARXNG_INSTANCE_URL=http://localhost:8080
 # Adjust research depth
 BALANCED_MAX_ITERATIONS=10  # Default: 6
 QUALITY_MAX_CONCURRENT=8    # Default: 5
+
+# Include last N chat messages in prompts
+CHAT_HISTORY_LIMIT=2
+
+# Quality deep search tuning
+DEEP_SEARCH_QUALITY_MAX_RESULTS=16
+DEEP_SEARCH_QUALITY_QUERIES=6
+DEEP_SEARCH_QUALITY_SCRAPE_TOP_N=8
+DEEP_SEARCH_QUALITY_RERANK_TOP_K=12
+DEEP_SEARCH_QUALITY_ITERATIONS=3
 ```
 
 ### Frontend Configuration
@@ -252,7 +264,7 @@ Once the backend is running, visit:
 
 ### Key Endpoints
 
-- `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (model: `search`, `deep_search`, `deep_research`)
+- `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (model: `search`/`web_search`, `deep_search`, `deep_research`)
 - `POST /api/chat/stream` - Chat with progress events (SSE)
 - `POST /api/research` - Start a research session
 - `GET /api/memory` - List memory files

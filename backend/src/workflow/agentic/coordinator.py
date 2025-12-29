@@ -13,6 +13,7 @@ from src.workflow.agentic.models import SharedResearchMemory
 from src.workflow.agentic.researcher import AgenticResearcher
 from src.workflow.agentic.supervisor import AgenticSupervisor
 from src.workflow.state import ResearchFinding
+from src.utils.chat_history import format_chat_history
 
 logger = structlog.get_logger(__name__)
 
@@ -26,6 +27,7 @@ class AgenticResearchCoordinator:
         search_provider: SearchProvider,
         web_scraper: WebScraper,
         memory_context: list[Any],
+        chat_history: list[dict[str, str]] | None = None,
         stream: Any | None = None,
         max_rounds: int = 3,
         max_concurrent: int = 4,
@@ -35,6 +37,7 @@ class AgenticResearchCoordinator:
         self.search_provider = search_provider
         self.web_scraper = web_scraper
         self.memory_context = memory_context
+        self.chat_history = chat_history or []
         self.stream = stream
         self.max_rounds = max_rounds
         self.max_concurrent = max_concurrent
@@ -44,6 +47,7 @@ class AgenticResearchCoordinator:
             llm=llm,
             shared_memory=self.shared_memory,
             memory_context=memory_context,
+            chat_history=self.chat_history,
         )
         self.query = ""
 
@@ -90,6 +94,7 @@ class AgenticResearchCoordinator:
                     web_scraper=self.web_scraper,
                     shared_memory=self.shared_memory,
                     memory_context=self.memory_context,
+                    chat_history=self.chat_history,
                     stream=self.stream,
                     max_steps=6,
                     max_sources=self.max_sources,
@@ -141,12 +146,15 @@ class AgenticResearchCoordinator:
             llm=self.llm,
             shared_memory=self.shared_memory,
             memory_context=self.memory_context,
+            chat_history=self.chat_history,
         )
 
     def _build_assignment(self, topic: str) -> str:
         query = self.query or "unknown"
+        chat_block = format_chat_history(self.chat_history, limit=len(self.chat_history))
         return (
             f"Primary query: {query}\n"
             f"Your focus: {topic}\n"
+            f"{chat_block}\n"
             "Capture high-signal evidence with citations. Share notes that help other agents."
         )

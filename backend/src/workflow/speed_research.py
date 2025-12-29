@@ -112,7 +112,7 @@ class SpeedResearchWorkflow:
                 "queries_per_round": 2,
                 "memory_context": state.get("memory_context", []),
                 "existing_findings": [],
-                "messages": [],
+                "messages": state.get("messages", []),
                 "completed": False,
                 "stream": stream,
             }
@@ -156,7 +156,12 @@ class SpeedResearchWorkflow:
             llm=self.report_llm,
         )
 
-    async def run(self, query: str, stream: Any | None = None) -> dict:
+    async def run(
+        self,
+        query: str,
+        stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
+    ) -> dict:
         """
         Execute speed research workflow.
 
@@ -177,7 +182,7 @@ class SpeedResearchWorkflow:
             "memory_context": [],
             "research_plan": None,
             "research_topics": [],
-            "messages": [],
+            "messages": messages or [],
             "findings": [],
             "compressed_research": None,
             "final_report": None,

@@ -13,6 +13,7 @@ from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.agentic.models import AgentMemory, SharedResearchMemory
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
+from src.utils.chat_history import format_chat_history
 from src.workflow.state import ResearchFinding, SourceReference
 
 logger = structlog.get_logger(__name__)
@@ -59,6 +60,7 @@ class AgenticResearcher:
         web_scraper: WebScraper,
         shared_memory: SharedResearchMemory,
         memory_context: list[Any],
+        chat_history: list[dict[str, str]] | None = None,
         stream: Any | None = None,
         max_steps: int = 6,
         max_sources: int = 8,
@@ -68,6 +70,7 @@ class AgenticResearcher:
         self.web_scraper = web_scraper
         self.shared_memory = shared_memory
         self.memory_context = memory_context
+        self.chat_history = chat_history or []
         self.stream = stream
         self.max_steps = max_steps
         self.max_sources = max_sources
@@ -171,12 +174,15 @@ class AgenticResearcher:
     ) -> str:
         memory_block = format_memory_context_for_prompt(self.memory_context[:6])
         shared_notes = self.shared_memory.render_notes(limit=6)
+        chat_block = format_chat_history(self.chat_history, limit=len(self.chat_history))
         todo_block = self.agent_memory.render_todos(limit=8)
         notes_block = self.agent_memory.render_notes(limit=6)
         findings_block = _format_findings(existing_findings)
 
         return f"""Agent: {agent_id}
 Research topic: {topic}
+
+{chat_block}
 
 Memory context:
 {memory_block}

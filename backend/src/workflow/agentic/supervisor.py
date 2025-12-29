@@ -11,6 +11,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.workflow.agentic.models import SharedResearchMemory
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.workflow.state import ResearchFinding
+from src.utils.chat_history import format_chat_history
 
 logger = structlog.get_logger(__name__)
 
@@ -35,10 +36,12 @@ class AgenticSupervisor:
         llm: Any,
         shared_memory: SharedResearchMemory,
         memory_context: list[Any],
+        chat_history: list[dict[str, str]] | None = None,
     ) -> None:
         self.llm = llm
         self.shared_memory = shared_memory
         self.memory_context = memory_context
+        self.chat_history = chat_history or []
 
     async def initial_tasks(self, query: str, max_tasks: int = 5) -> list[str]:
         if getattr(self.llm, "_llm_type", "") == "mock-chat":
@@ -79,9 +82,12 @@ class AgenticSupervisor:
         memory_block = format_memory_context_for_prompt(self.memory_context[:6])
         shared_notes = self.shared_memory.render_notes(limit=8)
         findings_block = _format_findings(findings)
+        chat_block = format_chat_history(self.chat_history, limit=len(self.chat_history))
 
         return f"""Task: {title}
 Research query: {query}
+
+{chat_block}
 
 Memory context:
 {memory_block}

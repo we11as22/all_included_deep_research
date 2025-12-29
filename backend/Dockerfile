@@ -4,7 +4,7 @@ FROM python:3.11-slim-bookworm
 WORKDIR /app
 
 # Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     postgresql-client \

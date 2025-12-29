@@ -20,6 +20,7 @@ from src.search.factory import create_search_provider
 from src.search.models import ScrapedContent, SearchResult
 from src.search.reranker import SemanticReranker
 from src.search.scraper import WebScraper
+from src.utils.chat_history import format_chat_history
 
 logger = structlog.get_logger(__name__)
 
@@ -110,38 +111,53 @@ class ChatSearchService:
         self,
         query: str,
         stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
         """Answer with base web search (multi-query + refinement)."""
-        return await self.answer_web(query, stream=stream)
+        return await self.answer_web(query, stream=stream, messages=messages)
 
     async def answer_web(
         self,
         query: str,
         stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
         """Answer with base web search (rewrites + multiple queries)."""
         tuning = self._web_tuning()
-        return await self._run_multi_query_search(query, stream=stream, tuning=tuning)
+        return await self._run_multi_query_search(
+            query,
+            stream=stream,
+            tuning=tuning,
+            messages=messages,
+        )
 
     async def answer_deep(
         self,
         query: str,
         stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
         """Answer with quality deep search (more iterations and sources)."""
         tuning = self._deep_tuning()
-        return await self._run_multi_query_search(query, stream=stream, tuning=tuning)
+        return await self._run_multi_query_search(
+            query,
+            stream=stream,
+            tuning=tuning,
+            messages=messages,
+        )
 
     async def _run_multi_query_search(
         self,
         query: str,
         stream: Any | None,
         tuning: SearchTuning,
+        messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
         session_memory = SearchSessionMemory()
         try:
+            chat_history = format_chat_history(messages, self.settings.chat_history_limit)
             self._emit_status(stream, "Rewriting query...", "rewrite")
-            rewritten = await self._rewrite_query(query)
+            rewritten = await self._rewrite_query(query, chat_history=chat_history)
             self._emit_search_queries(stream, [rewritten], "rewrite")
 
             self._emit_status(stream, "Searching memory...", "memory")
@@ -152,6 +168,7 @@ class ChatSearchService:
                 rewritten,
                 tuning.queries,
                 memory_context=memory_context,
+                chat_history=chat_history,
             )
 
             results: list[SearchResult] = []
@@ -184,6 +201,7 @@ class ChatSearchService:
                         results=results,
                         memory_context=memory_context,
                         session_memory=session_memory,
+                        chat_history=chat_history,
                     )
                     queries = [item for item in followups if item.lower() not in {q.lower() for q in all_queries}]
 
@@ -201,6 +219,7 @@ class ChatSearchService:
                 scraped=summarized,
                 memory_context=memory_context,
                 mode=tuning.mode,
+                chat_history=chat_history,
             )
 
             self._emit_finding(stream, f"{tuning.mode}_search", answer)
@@ -230,15 +249,19 @@ class ChatSearchService:
             label="deep",
         )
 
-    async def _rewrite_query(self, query: str) -> str:
+    async def _rewrite_query(self, query: str, chat_history: str | None = None) -> str:
         if self.settings.llm_mode == "mock":
             return query
 
         prompt = (
             "Rewrite the user query into a concise web search query. "
+            "Use the chat history for context if needed. "
             "Return only the rewritten query."
         )
-        response = await self.chat_llm.ainvoke([SystemMessage(content=prompt), HumanMessage(content=query)])
+        history_block = chat_history or "Chat history: None."
+        response = await self.chat_llm.ainvoke(
+            [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
+        )
         text = response.content if hasattr(response, "content") else str(response)
         rewritten = text.strip().strip('"')
         return rewritten or query
@@ -248,6 +271,7 @@ class ChatSearchService:
         query: str,
         max_queries: int,
         memory_context: list[dict[str, Any]] | None = None,
+        chat_history: str | None = None,
     ) -> list[str]:
         if self.settings.llm_mode == "mock":
             return [
@@ -257,13 +281,17 @@ class ChatSearchService:
             ][:max_queries]
 
         memory_block = self._format_memory(memory_context or [])
+        history_block = chat_history or "Chat history: None."
         prompt = (
             "Generate concise web search queries for deeper research. "
             "Use memory context if relevant. "
             f"Return {max_queries} lines, one query per line."
         )
         response = await self.chat_llm.ainvoke(
-            [SystemMessage(content=prompt), HumanMessage(content=f"{query}\n\n{memory_block}")]
+            [
+                SystemMessage(content=prompt),
+                HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
+            ]
         )
         content = response.content if hasattr(response, "content") else str(response)
         queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
@@ -278,6 +306,7 @@ class ChatSearchService:
         results: list[SearchResult] | None = None,
         memory_context: list[dict[str, Any]] | None = None,
         session_memory: SearchSessionMemory | None = None,
+        chat_history: str | None = None,
     ) -> list[str]:
         if self.settings.llm_mode == "mock":
             return []
@@ -285,6 +314,7 @@ class ChatSearchService:
         results = results or []
         memory_block = self._format_memory(memory_context or [])
         session_block = session_memory.render() if session_memory else "Session Memory: None."
+        history_block = chat_history or "Chat history: None."
         results_block = "\n".join(
             [
                 f"- {item.title}: {item.snippet[:160]}"
@@ -302,7 +332,7 @@ class ChatSearchService:
                     content=(
                         f"Query: {query}\nQueries:\n"
                         + "\n".join(existing_queries)
-                        + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}"
+                        + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}\n\n{history_block}"
                     )
                 ),
             ]
@@ -437,9 +467,11 @@ class ChatSearchService:
         scraped: list[ScrapedContent],
         memory_context: list[dict[str, Any]],
         mode: str,
+        chat_history: str | None = None,
     ) -> str:
         sources_block = self._format_sources(sources, scraped)
         memory_block = self._format_memory(memory_context)
+        history_block = chat_history or "Chat history: None."
 
         system_prompt = (
             "You are a research assistant. Answer with clear, concise reasoning. "
@@ -450,6 +482,7 @@ class ChatSearchService:
             f"User question: {query}\n"
             f"Search query: {search_query}\n"
             f"Mode: {mode}\n\n"
+            f"{history_block}\n\n"
             f"{memory_block}\n\n"
             f"Sources:\n{sources_block}\n\n"
             "Answer with citations like [1], [2]."

@@ -112,6 +112,7 @@ class QualityResearchWorkflow:
             search_provider=self.search_provider,
             web_scraper=self.web_scraper,
             memory_context=state.get("memory_context", []),
+            chat_history=state.get("messages", []),
             stream=stream,
             max_rounds=3,
             max_concurrent=max_concurrent,
@@ -197,7 +198,12 @@ Keep the synthesis detailed but well-structured (aim for 800-1200 words)."""
             llm=self.report_llm,
         )
 
-    async def run(self, query: str, stream: Any | None = None) -> dict:
+    async def run(
+        self,
+        query: str,
+        stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
+    ) -> dict:
         """
         Execute quality research workflow.
 
@@ -218,7 +224,7 @@ Keep the synthesis detailed but well-structured (aim for 800-1200 words)."""
             "memory_context": [],
             "research_plan": None,
             "research_topics": [],
-            "messages": [],
+            "messages": messages or [],
             "findings": [],
             "compressed_research": None,
             "final_report": None,

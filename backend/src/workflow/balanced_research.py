@@ -125,7 +125,7 @@ class BalancedResearchWorkflow:
                         "queries_per_round": 3,
                         "memory_context": state.get("memory_context", []),
                         "existing_findings": findings,
-                        "messages": [],
+                        "messages": state.get("messages", []),
                         "completed": False,
                         "stream": stream,
                     }
@@ -209,7 +209,12 @@ class BalancedResearchWorkflow:
             llm=self.report_llm,
         )
 
-    async def run(self, query: str, stream: Any | None = None) -> dict:
+    async def run(
+        self,
+        query: str,
+        stream: Any | None = None,
+        messages: list[dict[str, str]] | None = None,
+    ) -> dict:
         """
         Execute balanced research workflow.
 
@@ -230,7 +235,7 @@ class BalancedResearchWorkflow:
             "memory_context": [],
             "research_plan": None,
             "research_topics": [],
-            "messages": [],
+            "messages": messages or [],
             "findings": [],
             "compressed_research": None,
             "final_report": None,

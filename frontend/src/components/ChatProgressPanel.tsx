@@ -187,8 +187,30 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
                     ))}
                   </div>
                   {notes.length > 0 && (
-                    <div className="mt-2 text-[10px] text-muted-foreground">
-                      Latest note: {notes[notes.length - 1]?.title}
+                    <div className="mt-2 space-y-2 border-t border-border/60 pt-2">
+                      {notes.slice(-2).map((note) => (
+                        <div key={note.title} className="rounded-md bg-white/80 p-2">
+                          <div className="text-[10px] font-semibold text-foreground">{note.title}</div>
+                          <div className="mt-1 line-clamp-2 text-[10px] text-muted-foreground">
+                            {note.summary}
+                          </div>
+                          {note.urls && note.urls.length > 0 && (
+                            <div className="mt-2 flex flex-wrap gap-2 text-[10px]">
+                              {note.urls.slice(0, 2).map((url) => (
+                                <a
+                                  key={url}
+                                  href={url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="max-w-[120px] truncate rounded-full border border-border/60 bg-background px-2 py-0.5 text-[9px] text-foreground/70 hover:text-foreground"
+                                >
+                                  source
+                                </a>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>

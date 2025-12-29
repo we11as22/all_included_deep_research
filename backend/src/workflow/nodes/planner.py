@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field
 
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.workflow.state import ResearchState
+from src.utils.chat_history import format_chat_history
 
 logger = structlog.get_logger(__name__)
 
@@ -49,6 +50,8 @@ PLANNING_USER_TEMPLATE = """Research Query: {query}
 
 Research Mode: {mode}
 
+{chat_history}
+
 {memory_context}
 
 Based on this information, create a strategic research plan.
@@ -89,6 +92,7 @@ async def plan_research_node(
     query = state.get("clarified_query") or state.get("query", "")
     mode = state.get("mode", "balanced")
     memory_context = state.get("memory_context", [])
+    messages = state.get("messages", [])
     stream = state.get("stream")
 
     logger.info("Creating research plan", query=query, mode=mode)
@@ -96,6 +100,8 @@ async def plan_research_node(
     try:
         # Format memory context
         memory_str = format_memory_context_for_prompt(memory_context)
+
+        chat_history = format_chat_history(messages, limit=len(messages))
 
         # Create planning prompt
         prompt = ChatPromptTemplate.from_messages(
@@ -105,6 +111,7 @@ async def plan_research_node(
                     content=PLANNING_USER_TEMPLATE.format(
                         query=query,
                         mode=mode,
+                        chat_history=chat_history,
                         memory_context=memory_str,
                     )
                 ),

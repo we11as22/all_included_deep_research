@@ -26,6 +26,8 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     query = user_messages[-1].content
     raw_mode = request.model or "search"
     normalized = raw_mode.lower().replace("-", "_")
+    settings = app_request.app.state.settings
+    chat_history = _collect_chat_history(request.messages, settings.chat_history_limit)
 
     if normalized in {"speed"}:
         mode = "search"
@@ -55,9 +57,9 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             if mode in {"search", "deep_search"}:
                 chat_service = app_request.app.state.chat_service
                 if mode == "search":
-                    result = await chat_service.answer_web(query, stream=stream_generator)
+                    result = await chat_service.answer_web(query, stream=stream_generator, messages=chat_history)
                 else:
-                    result = await chat_service.answer_deep(query, stream=stream_generator)
+                    result = await chat_service.answer_deep(query, stream=stream_generator, messages=chat_history)
 
                 stream_generator.emit_status("Drafting answer...", step="answer")
                 for chunk in _chunk_text(result.answer, size=180):
@@ -69,7 +71,7 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
             workflow_factory = app_request.app.state.workflow_factory
             workflow = workflow_factory.create_workflow("quality")
-            final_state = await workflow.run(query, stream=stream_generator)
+            final_state = await workflow.run(query, stream=stream_generator, messages=chat_history)
 
             final_report = final_state.get("final_report", "")
             if final_report:
@@ -119,3 +121,19 @@ def _generate_memory_path(query: str) -> str:
 
 def _format_memory_report(query: str, report: str) -> str:
     return f"# {query}\n\n{report}\n"
+
+
+def _collect_chat_history(messages: list, limit: int) -> list[dict[str, str]]:
+    if limit <= 0:
+        return []
+    normalized = []
+    for msg in messages:
+        role = getattr(msg, "role", None)
+        content = getattr(msg, "content", "") or ""
+        if not content:
+            continue
+        role_value = role.value if hasattr(role, "value") else str(role or "user")
+        if role_value == "system":
+            continue
+        normalized.append({"role": role_value, "content": content})
+    return normalized[-limit:]

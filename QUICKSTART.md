@@ -32,6 +32,7 @@ cp .env.example .env
 # TAVILY_API_KEY=tvly-your-key-here
 # LLM_MODE=mock  # для запуска без LLM
 # SEARCH_PROVIDER=mock  # для запуска без внешнего поиска
+# CHAT_HISTORY_LIMIT=2  # сколько последних сообщений передавать агентам
 
 # Настройте docker (в корне проекта)
 cd ..
@@ -59,7 +60,7 @@ docker compose up -d
 
 ### Шаг 5: Попробуйте исследование
 
-1. Выберите режим (Simple Search / Deep Search / Deep Research)
+1. Выберите режим (Web Search / Deep Search / Deep Research)
 2. Введите ваш запрос, например:
    - "Latest developments in quantum computing"
    - "Compare React vs Vue.js for enterprise applications"
@@ -171,6 +172,13 @@ QUALITY_MAX_ITERATIONS=30   # По умолчанию: 25
 # Увеличить количество параллельных исследователей
 BALANCED_MAX_CONCURRENT=5   # По умолчанию: 3
 QUALITY_MAX_CONCURRENT=8    # По умолчанию: 5
+
+# Настройка глубины deep search (quality web search)
+DEEP_SEARCH_QUALITY_MAX_RESULTS=16
+DEEP_SEARCH_QUALITY_QUERIES=6
+DEEP_SEARCH_QUALITY_SCRAPE_TOP_N=8
+DEEP_SEARCH_QUALITY_RERANK_TOP_K=12
+DEEP_SEARCH_QUALITY_ITERATIONS=3
 ```
 
 ## Что дальше?

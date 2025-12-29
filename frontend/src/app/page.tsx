@@ -22,8 +22,13 @@ const formatModeLabel = (mode: ChatMode) => {
   if (mode === 'search') return 'web search';
   if (mode === 'deep_search') return 'deep search';
   if (mode === 'deep_research') return 'deep research';
-  return mode.replace('_', ' ');
+  return 'search';
 };
+const suggestions = [
+  'Give me a fast landscape of EU AI regulation updates in 2024.',
+  'Summarize recent supply chain shocks for lithium batteries.',
+  'What are the top 3 competitors to Perplexity in 2024 and why?',
+];
 
 export default function HomePage() {
   const initialMode = (process.env.NEXT_PUBLIC_DEFAULT_MODE as ChatMode) || 'search';
@@ -185,11 +190,12 @@ export default function HomePage() {
   };
 
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top,_#fff5e7,_#f6f4ef_40%,_#f1f6fb_75%)]">
+    <main className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)]">
       <div className="pointer-events-none absolute inset-0">
-        <div className="absolute -top-20 left-10 h-64 w-64 rounded-full bg-amber-200/40 blur-3xl" />
-        <div className="absolute right-0 top-40 h-72 w-72 rounded-full bg-teal-200/30 blur-3xl" />
-        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-orange-200/30 blur-3xl" />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(15,23,42,0.04)_1px,transparent_1px),linear-gradient(180deg,rgba(15,23,42,0.04)_1px,transparent_1px)] bg-[size:56px_56px] opacity-40" />
+        <div className="absolute -top-20 left-10 h-64 w-64 rounded-full bg-amber-100/40 blur-3xl" />
+        <div className="absolute right-0 top-40 h-72 w-72 rounded-full bg-sky-100/40 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-rose-100/40 blur-3xl" />
       </div>
 
       <header className="relative z-10 border-b border-border/60 bg-background/70 backdrop-blur">
@@ -265,6 +271,18 @@ export default function HomePage() {
                     Try: “Give me a quick landscape of European AI regulation changes in 2024,” or
                     “Summarize recent supply chain shocks for lithium batteries.”
                   </p>
+                  <div className="flex flex-wrap gap-2">
+                    {suggestions.map((suggestion) => (
+                      <button
+                        key={suggestion}
+                        type="button"
+                        onClick={() => setInput(suggestion)}
+                        className="rounded-full border border-border/60 bg-white/90 px-3 py-1 text-xs text-foreground/80 transition hover:border-primary/50 hover:text-foreground"
+                      >
+                        {suggestion}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               ) : (
                 <div className="space-y-4">
@@ -275,7 +293,7 @@ export default function HomePage() {
                         'max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm animate-fade-rise',
                         message.role === 'user'
                           ? 'ml-auto bg-foreground text-background'
-                          : 'bg-white/80 text-foreground'
+                          : 'border border-border/60 bg-white/90 text-foreground'
                       )}
                       style={{ animationDelay: `${index * 40}ms` }}
                     >
