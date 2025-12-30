@@ -43,6 +43,9 @@ services:
     ports:
       - "8000:8000"
       - "8080:8080"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s

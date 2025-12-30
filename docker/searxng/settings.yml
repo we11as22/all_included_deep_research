@@ -12,21 +12,21 @@ search:
 server:
   secret_key: "change_me"
 
-# Increase timeout for engines
+# Increase timeout for engines to handle slow connections
 outgoing:
-  timeout: 10.0
+  timeout: 15.0
   max_redirects: 5
   pool_connections: 100
   pool_maxsize: 10
+  # User-Agent to avoid blocking
+  useragent_suffix: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
 # Engines configuration
-# With use_default_settings: true, all default engines are enabled
-# We can disable problematic engines here if needed
+# Keep only reliable engines that work with slow connections
 engines:
-  # Keep wolframalpha for calculations
   - name: wolframalpha
     disabled: false
-  # Disable engines that require API keys or are frequently blocked
+  # Disable engines that frequently timeout or require API keys
   - name: brave
     disabled: true
   - name: startpage
@@ -35,7 +35,12 @@ engines:
     disabled: true
   - name: torch
     disabled: true
-  # Disable duckduckgo if it keeps timing out
   - name: duckduckgo
+    disabled: true
+  # Disable other engines that may timeout
+  - name: google
     disabled: false
-    timeout: 10.0
+    timeout: 15.0
+  - name: bing
+    disabled: false
+    timeout: 15.0
