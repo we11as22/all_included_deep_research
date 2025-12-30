@@ -9,6 +9,8 @@ from fastapi.responses import StreamingResponse
 
 from src.api.models.chat import ChatCompletionRequest
 from src.streaming.sse import ResearchStreamingGenerator
+from src.utils.pdf_generator import markdown_to_pdf
+from fastapi.responses import Response
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 logger = structlog.get_logger(__name__)
@@ -85,6 +87,16 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     stream_generator.emit_report_chunk(chunk)
                     await asyncio.sleep(0.02)
                 stream_generator.emit_final_report(result.answer)
+                
+                # Store report for PDF generation
+                if not hasattr(app_request.app.state, "session_reports"):
+                    app_request.app.state.session_reports = {}
+                app_request.app.state.session_reports[session_id] = {
+                    "report": result.answer,
+                    "query": query,
+                    "mode": mode,
+                }
+                
                 stream_generator.emit_done()
                 return
 
@@ -92,8 +104,17 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             workflow = workflow_factory.create_workflow("quality")
             final_state = await workflow.run(query, stream=stream_generator, messages=chat_history)
 
-            final_report = final_state.get("final_report", "")
+            final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
             if final_report:
+                # Store final report in session for PDF generation
+                if not hasattr(app_request.app.state, "session_reports"):
+                    app_request.app.state.session_reports = {}
+                app_request.app.state.session_reports[session_id] = {
+                    "report": final_report,
+                    "query": query,
+                    "mode": mode,
+                }
+                
                 stream_generator.emit_status("Saving research to memory...", step="save_memory")
                 try:
                     memory_manager = app_request.app.state.memory_manager
@@ -104,7 +125,7 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                         title=query[:80],
                         content=content,
                     )
-                    embedding_dimension = app_request.app.state.get("embedding_dimension")
+                    embedding_dimension = getattr(app_request.app.state, "embedding_dimension", 1536)
                     await memory_manager.sync_file_to_db(file_path, embedding_dimension=embedding_dimension)
                 except Exception as exc:
                     stream_generator.emit_error(error=str(exc), details="Memory save failed")
@@ -190,6 +211,37 @@ async def cancel_chat(session_id: str, app_request: Request):
     logger.info("Chat session cancelled", session_id=session_id)
     
     return {"status": "cancelled", "session_id": session_id}
+
+
+@router.get("/stream/{session_id}/pdf")
+async def generate_pdf(session_id: str, app_request: Request):
+    """Generate PDF from final report for a completed research session."""
+    if not hasattr(app_request.app.state, "session_reports"):
+        raise HTTPException(status_code=404, detail="No reports found")
+    
+    session_reports = app_request.app.state.session_reports
+    if session_id not in session_reports:
+        raise HTTPException(status_code=404, detail="Report not found for this session")
+    
+    report_data = session_reports[session_id]
+    report = report_data["report"]
+    query = report_data["query"]
+    
+    try:
+        # Generate PDF
+        pdf_buffer = markdown_to_pdf(report, title=query[:80] or "Research Report")
+        
+        # Return PDF as response
+        return Response(
+            content=pdf_buffer.getvalue(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="research_report_{session_id[:8]}.pdf"',
+            },
+        )
+    except Exception as e:
+        logger.error("PDF generation failed", error=str(e), session_id=session_id)
+        raise HTTPException(status_code=500, detail=f"Failed to generate PDF: {str(e)}")
 
 
 def _collect_chat_history(messages: list, limit: int) -> list[dict[str, str]]:

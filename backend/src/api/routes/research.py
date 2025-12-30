@@ -50,7 +50,7 @@ async def start_research(research_request: ResearchRequest, app_request: Request
             final_state = await workflow.run(research_request.query, stream=stream_generator)
 
             # Save to memory if requested
-            final_report = final_state.get("final_report", "")
+            final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
             if research_request.save_to_memory and final_report:
                 stream_generator.emit_status("Saving research to memory...", step="save_memory")
                 try:
@@ -62,7 +62,7 @@ async def start_research(research_request: ResearchRequest, app_request: Request
                         title=research_request.query[:80],
                         content=content,
                     )
-                    embedding_dimension = app_request.app.state.get("embedding_dimension")
+                    embedding_dimension = getattr(app_request.app.state, "embedding_dimension", 1536)
                     await memory_manager.sync_file_to_db(file_path, embedding_dimension=embedding_dimension)
                 except Exception as exc:
                     stream_generator.emit_error(error=str(exc), details="Memory save failed")

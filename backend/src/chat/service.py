@@ -301,6 +301,13 @@ class ChatSearchService:
         )
 
     async def _rewrite_query(self, query: str, chat_history: str | None = None) -> str:
+        # Ensure input is a string, not a list/embedding
+        if isinstance(query, (list, tuple)):
+            logger.warning("Query was passed as list/embedding to _rewrite_query, using original query string", query_type=type(query).__name__)
+            return str(query) if query else ""
+        if not isinstance(query, str):
+            query = str(query) if query else ""
+        
         if self.settings.llm_mode == "mock":
             return query
 
@@ -319,7 +326,9 @@ class ChatSearchService:
                 [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
             )
             if isinstance(response, QueryRewrite):
-                return response.rewritten_query or query
+                rewritten = response.rewritten_query or query
+            else:
+                rewritten = query
         except Exception:
             # Fallback to text parsing
             response = await self.chat_llm.ainvoke(
@@ -327,7 +336,14 @@ class ChatSearchService:
             )
             text = response.content if hasattr(response, "content") else str(response)
             rewritten = text.strip().strip('"')
-            return rewritten or query
+            rewritten = rewritten or query
+        
+        # Final validation - ensure rewritten is always a string
+        if not isinstance(rewritten, str):
+            logger.warning("Rewritten query is not a string, converting", rewritten_type=type(rewritten).__name__)
+            rewritten = str(rewritten) if rewritten else query
+        
+        return rewritten
 
     async def _generate_search_queries(
         self,
@@ -456,6 +472,14 @@ class ChatSearchService:
 
     async def _search_memory(self, query: str, stream: Any | None = None) -> list[dict[str, Any]]:
         try:
+            # Ensure query is a string, not a list/embedding
+            if not isinstance(query, str):
+                if isinstance(query, (list, tuple)):
+                    logger.warning("Query was passed as list/embedding in _search_memory, converting to empty string", query_type=type(query).__name__)
+                    query = ""  # Use empty string to prevent SQL error
+                else:
+                    query = str(query) if query else ""
+            
             results = await self.search_engine.search(
                 query=query,
                 search_mode=SearchMode.HYBRID,

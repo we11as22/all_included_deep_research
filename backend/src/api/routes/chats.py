@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from sqlalchemy import select, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.database.schema import ChatModel, ChatMessageModel
+from src.database.schema import ChatModel, ChatMessageModel, MemoryFileModel
 from src.memory.models.search import SearchMode
 
 router = APIRouter(prefix="/api/chats", tags=["chats"])
@@ -93,8 +93,9 @@ async def get_chat(chat_id: str, app_request: Request):
 
 @router.delete("/{chat_id}")
 async def delete_chat(chat_id: str, app_request: Request):
-    """Delete a chat and all its messages."""
+    """Delete a chat and all its messages, including from memory."""
     session_factory = app_request.app.state.session_factory
+    memory_manager = app_request.app.state.memory_manager
     
     async with session_factory() as session:
         result = await session.execute(
@@ -105,6 +106,25 @@ async def delete_chat(chat_id: str, app_request: Request):
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
         
+        # Delete chat messages from memory
+        try:
+            # Search for memory files with path pattern: conversations/chat_{chat_id}/...
+            result = await session.execute(
+                select(MemoryFileModel).where(
+                    MemoryFileModel.file_path.like(f"conversations/chat_{chat_id}/%")
+                )
+            )
+            memory_files = result.scalars().all()
+            
+            # Delete each memory file (this will cascade to chunks)
+            for memory_file in memory_files:
+                await memory_manager.delete_file(memory_file.file_path)
+                logger.info("Deleted chat message from memory", file_path=memory_file.file_path, chat_id=chat_id)
+        except Exception as e:
+            logger.warning("Failed to delete chat messages from memory", error=str(e), chat_id=chat_id)
+            # Continue with database deletion even if memory deletion fails
+        
+        # Delete chat from database (cascades to messages)
         await session.delete(chat)
         await session.commit()
         
@@ -182,14 +202,13 @@ async def add_message(
             logger.warning("Failed to index message", chat_id=chat_id, message_id=msg_id, error=str(e))
             # Don't fail the request if indexing fails
         
-        # Decode content for logging
-        decoded_content = unquote(content) if content else ""
+        # Log message addition (content already decoded above)
         logger.info(
             "Message added", 
             chat_id=chat_id, 
             message_id=msg_id, 
             role=role,
-            content_preview=decoded_content[:100] if decoded_content else ""
+            content_preview=content[:100] if content else ""
         )
         return message.to_dict()
 

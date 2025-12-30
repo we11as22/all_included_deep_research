@@ -79,7 +79,7 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
                 workflow_factory = app_request.app.state.workflow_factory
                 workflow = workflow_factory.create_workflow("quality")
                 final_state = await workflow.run(query, messages=chat_history)
-                final_report = final_state.get("final_report", "")
+                final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
                 if final_report:
                     for chunk in _chunk_text(final_report, size=120):
                         stream_generator.add_chunk_from_str(chunk)

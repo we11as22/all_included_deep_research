@@ -30,12 +30,19 @@ async def search_memory_node(
     """
     query = state.get("clarified_query") or state.get("query", "")
     # Ensure query is a string, not a list/embedding
+    # CRITICAL: SQL queries expect string, not vector/list - use empty string if query is not a string
     if not isinstance(query, str):
         if isinstance(query, (list, tuple)):
-            logger.warning("Query was passed as list/embedding in state, converting to string", query_type=type(query).__name__)
-            query = str(query)
+            logger.error("Query was passed as list/embedding in state! This is invalid. Using empty string.", query_type=type(query).__name__, query_length=len(query) if hasattr(query, '__len__') else 'unknown')
+            query = ""  # Use empty string instead of str(query) to avoid passing vector as string
         else:
+            logger.warning("Query was not a string, converting", query_type=type(query).__name__)
             query = str(query) if query else ""
+    
+    # Final validation - query must be a string
+    if not isinstance(query, str):
+        logger.error("Query is still not a string after conversion! Using empty string.", query_type=type(query).__name__)
+        query = ""
     
     mode = state.get("mode", "balanced")
     stream = state.get("stream")
@@ -56,6 +63,11 @@ async def search_memory_node(
 
         if stream:
             stream.emit_status("Searching memory...", step="memory_search")
+
+        # Final validation before search - query MUST be a string
+        if not isinstance(query, str):
+            logger.error("Query is not a string before search execution! Using empty string.", query_type=type(query).__name__)
+            query = ""
 
         # Execute hybrid search
         search_results = await search_engine.search(

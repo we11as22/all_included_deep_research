@@ -8,8 +8,8 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { ArrowUpRight, Brain, Loader2, Search, X } from 'lucide-react';
-import { cancelChat, getChat, addMessage, createChat, type ChatMessage as DBChatMessage } from '@/lib/api';
+import { ArrowUpRight, Brain, Download, Loader2, Search, X } from 'lucide-react';
+import { cancelChat, getChat, addMessage, createChat, downloadPDF, type ChatMessage as DBChatMessage } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import Markdown from 'markdown-to-jsx';
 import { ChatSidebar } from '@/components/ChatSidebar';
@@ -49,6 +49,30 @@ export default function HomePage() {
   const [showChatSearch, setShowChatSearch] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Save progress to localStorage
+  useEffect(() => {
+    if (Object.keys(progressByMessage).length > 0) {
+      try {
+        localStorage.setItem('progressByMessage', JSON.stringify(progressByMessage));
+      } catch (e) {
+        console.error('Failed to save progress to localStorage:', e);
+      }
+    }
+  }, [progressByMessage]);
+
+  // Load progress from localStorage on mount
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('progressByMessage');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        setProgressByMessage(parsed);
+      }
+    } catch (e) {
+      console.error('Failed to load progress from localStorage:', e);
+    }
+  }, []);
 
   const messagePayload = useMemo(
     () => messages.map((message) => ({ role: message.role, content: message.content })),
@@ -366,11 +390,11 @@ export default function HomePage() {
         </div>
       </header>
 
-      <section className="relative z-10 container mx-auto px-4 py-4 flex-1 flex flex-col min-h-0">
-        <div className="grid gap-8 lg:grid-cols-[1fr_400px] flex-1 min-h-0">
+      <section className="relative z-10 container mx-auto px-4 py-4 flex-1 flex flex-col min-h-0 overflow-hidden">
+        <div className="grid gap-8 lg:grid-cols-[1fr_400px] flex-1 min-h-0 overflow-hidden">
           {/* Main Chat Area */}
-          <Card className="flex h-full flex-col border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur">
-            <div className="flex items-center justify-between border-b border-border/60 px-6 py-4">
+          <Card className="flex h-full flex-col border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur overflow-hidden">
+            <div className="flex items-center justify-between border-b border-border/60 px-6 py-4 flex-shrink-0">
               <div>
                 <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">Conversation</p>
                 <h2 className="text-lg font-semibold">Search &amp; research chat</h2>
@@ -380,7 +404,7 @@ export default function HomePage() {
               </Badge>
             </div>
 
-            <div className="flex-1 overflow-y-auto px-6 py-5">
+            <div className="flex-1 overflow-y-auto overflow-x-hidden px-6 py-5 min-h-0">
               {messages.length === 0 ? (
                 <div className="flex h-full flex-col items-start justify-center gap-4">
                   <h3 className="text-2xl font-semibold">Ask anything that needs proof.</h3>
@@ -441,7 +465,51 @@ export default function HomePage() {
                             },
                           }}
                         >
-                          {message.content}
+                          {(() => {
+                            // Make citations [1], [2] clickable by converting them to markdown links
+                            let processedContent = message.content;
+                            
+                            // Extract sources from the report (look for Sources section)
+                            const sourcesSection = processedContent.match(/##\s+Sources\s+([\s\S]*?)(?=##|$)/i);
+                            const sources: Record<number, string> = {};
+                            
+                            if (sourcesSection) {
+                              const sourcesText = sourcesSection[1];
+                              // Match patterns like [1] Title: URL or 1. Title: URL
+                              const sourceMatches = sourcesText.matchAll(/(?:\[(\d+)\]|(\d+)\.)\s+([^:]+):\s+(https?:\/\/[^\s\)]+)/gi);
+                              for (const match of sourceMatches) {
+                                const num = parseInt(match[1] || match[2]);
+                                const url = match[4];
+                                sources[num] = url;
+                              }
+                            }
+                            
+                            // Also try to find sources in the format [1] Title: URL anywhere in the text
+                            const inlineSourceMatches = processedContent.matchAll(/\[(\d+)\]\s+([^:]+):\s+(https?:\/\/[^\s\)]+)/gi);
+                            for (const match of inlineSourceMatches) {
+                              const num = parseInt(match[1]);
+                              const url = match[3];
+                              if (!sources[num]) {
+                                sources[num] = url;
+                              }
+                            }
+                            
+                            // Replace citations [1], [2] with clickable links if source found
+                            if (Object.keys(sources).length > 0) {
+                              processedContent = processedContent.replace(
+                                /\[(\d+)\](?!\s*[:\[])/g,
+                                (match, num) => {
+                                  const citationNum = parseInt(num);
+                                  if (sources[citationNum]) {
+                                    return `[${num}](${sources[citationNum]})`;
+                                  }
+                                  return match;
+                                }
+                              );
+                            }
+                            
+                            return processedContent;
+                          })()}
                         </Markdown>
                       </div>
                     </div>
@@ -513,15 +581,42 @@ export default function HomePage() {
             </form>
           </Card>
 
-          {/* Progress Panel - Right Side */}
-          {currentProgress && (
+          {/* Progress Panel - Right Side - Always show for deep_research when streaming or has progress */}
+          {(mode === 'deep_research' || mode === 'deep_search' || mode === 'search') && (isStreaming || currentProgress) && (
             <div className="lg:sticky lg:top-4 lg:h-[85vh] lg:overflow-y-auto">
-              <Card className="border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur">
-                <div className="border-b border-border/60 px-4 py-3">
+              <Card className="border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur h-full flex flex-col">
+                <div className="border-b border-border/60 px-4 py-3 flex items-center justify-between flex-shrink-0">
                   <h3 className="text-sm font-semibold">Research Progress</h3>
+                  {currentProgress?.isComplete && (mode === 'deep_research' || mode === 'deep_search' || mode === 'search') && currentSessionId && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        if (currentSessionId) {
+                          try {
+                            await downloadPDF(currentSessionId);
+                          } catch (err) {
+                            console.error('Failed to download PDF:', err);
+                            setError(err instanceof Error ? err.message : 'Failed to download PDF');
+                          }
+                        }
+                      }}
+                      className="h-7 gap-1.5"
+                    >
+                      <Download className="h-3.5 w-3.5" />
+                      PDF
+                    </Button>
+                  )}
                 </div>
-                <div className="p-4">
-                  <ChatProgressPanel progress={currentProgress} />
+                <div className="p-4 overflow-y-auto flex-1 min-h-0">
+                  {currentProgress ? (
+                    <ChatProgressPanel progress={currentProgress} />
+                  ) : (
+                    <div className="flex items-center justify-center h-full text-sm text-muted-foreground">
+                      <Loader2 className="h-4 w-4 animate-spin mr-2" />
+                      Initializing...
+                    </div>
+                  )}
                 </div>
               </Card>
             </div>

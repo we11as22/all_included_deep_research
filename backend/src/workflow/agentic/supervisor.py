@@ -40,14 +40,60 @@ Allowed actions:
 - write_note: {{"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."]}}
 - read_main: {{}}
 
-Rules:
-- You wake up after each action by subordinate agents.
-- You can read their files, update their todos, add notes to main.
-- Tasks must be short, specific research directions.
-- Avoid duplicating existing topics or findings.
-- If coverage is sufficient, set stop to true in plan_tasks.
-- Always consider the current date ({current_date}) when planning research tasks.
-- You can set agent character and preferences when creating them.
+CRITICAL RULES FOR DEEP RESEARCH SUPERVISION:
+1. **Active Monitoring**: You wake up after each action by subordinate agents. You MUST actively monitor their progress and depth of research.
+
+2. **Depth Assessment**: After each agent action, evaluate:
+   - Are agents digging deep enough? (checking multiple sources, exploring sub-topics, verifying claims)
+   - Are they updating their todos actively? (if not, update their todos for them)
+   - Are they stopping too early? (if yes, add more specific tasks to push them deeper)
+   - Are there gaps in coverage? (if yes, create new tasks to fill gaps)
+
+3. **Proactive Task Generation**: For REAL deep research, you MUST:
+   - Generate additional tasks when agents are not digging deep enough
+   - Break down broad topics into specific sub-topics that need investigation
+   - Add tasks for verification, cross-referencing, and exploring related areas
+   - Create tasks for exploring different perspectives, controversies, and expert opinions
+   - Add tasks for finding primary sources, not just secondary summaries
+   - Generate follow-up tasks based on what agents discover (don't wait for them to ask)
+
+4. **Todo Management**: Actively manage agent todos:
+   - Read agent files regularly to check their todo progress
+   - If an agent has many pending todos but isn't updating them, use update_agent_todo to push them
+   - If an agent is stuck on surface-level research, add specific deep-dive todos
+   - If an agent finishes too quickly, add more detailed investigation tasks
+
+5. **Gap Analysis**: Continuously identify research gaps:
+   - What angles haven't been explored yet?
+   - What sources haven't been checked?
+   - What sub-topics need more investigation?
+   - What claims need verification?
+   - What related areas should be explored?
+
+6. **Task Quality**: Tasks must be:
+   - Short and specific research directions
+   - Focused on deep investigation, not surface-level search
+   - Designed to push agents to explore multiple angles
+   - Include verification and cross-referencing requirements
+   - Avoid duplicating existing topics or findings (but allow different angles on same topic)
+
+7. **Stop Condition**: Only set stop to true when:
+   - All major angles have been thoroughly explored
+   - Information has been verified from multiple independent sources
+   - Sub-topics and related areas have been investigated
+   - Primary sources have been consulted
+   - Gaps have been identified and addressed
+   - Research is truly comprehensive, not just "good enough"
+
+8. **Always consider the current date ({current_date}) when planning research tasks.
+
+9. **You can set agent character and preferences when creating them.
+
+10. **Active Intervention**: Don't be passive - if agents aren't digging deep, actively intervene:
+    - Add specific deep-dive tasks
+    - Update their todos to push them deeper
+    - Create new agents for specialized sub-topics if needed
+    - Write notes to main.md about important findings or gaps
 """
 
 
@@ -86,7 +132,7 @@ class AgenticSupervisor:
         if getattr(self.llm, "_llm_type", "") == "mock-chat":
             return [query]
 
-        prompt = self._build_prompt(
+        prompt = await self._build_prompt(
             title="Initial task planning",
             query=query,
             findings=[],
@@ -103,7 +149,7 @@ class AgenticSupervisor:
         if getattr(self.llm, "_llm_type", "") == "mock-chat":
             return []
 
-        prompt = self._build_prompt(
+        prompt = await self._build_prompt(
             title="Gap analysis",
             query=query,
             findings=findings,
@@ -111,7 +157,7 @@ class AgenticSupervisor:
         )
         return await self._run_prompt(prompt, max_tasks)
 
-    def _build_prompt(
+    async def _build_prompt(
         self,
         title: str,
         query: str,
@@ -127,16 +173,24 @@ class AgenticSupervisor:
         main_content = ""
         if self.agent_memory_service:
             try:
-                import asyncio
-                main_content = asyncio.run(self.agent_memory_service.read_main_file())[:500]
+                main_content = await self.agent_memory_service.read_main_file()
+                main_content = main_content[:500] if main_content else ""
             except Exception:
-                pass
+                main_content = ""
 
         return f"""Task: {title}
 Research query: {query}
 Current date: {current_date}
 
 IMPORTANT: You must create EXACTLY {max_tasks} tasks or fewer. Do not exceed this limit.
+
+CRITICAL: For DEEP RESEARCH, tasks must push agents to:
+- Explore multiple angles and perspectives
+- Verify information from multiple sources
+- Investigate sub-topics and related areas
+- Find primary sources, not just summaries
+- Check for controversies, limitations, alternatives
+- Dig deeper into every interesting lead
 
 {chat_block}
 
@@ -151,6 +205,15 @@ Shared notes from researchers:
 
 Existing findings:
 {findings_block}
+
+ANALYSIS REQUIRED:
+1. What angles haven't been explored yet?
+2. What sources need verification?
+3. What sub-topics need deeper investigation?
+4. What gaps exist in current research?
+5. What related areas should be explored?
+
+Generate tasks that address these gaps and push for REAL deep research, not surface-level coverage.
 
 Provide up to {max_tasks} tasks in JSON only."""
 
@@ -268,18 +331,10 @@ Provide up to {max_tasks} tasks in JSON only."""
         main_content = ""
         if self.agent_memory_service:
             try:
-                # Try to get main content synchronously
-                import asyncio
-                try:
-                    loop = asyncio.get_event_loop()
-                    if loop.is_running():
-                        main_content = ""  # Skip if loop is running
-                    else:
-                        main_content = asyncio.run(self.agent_memory_service.read_main_file())
-                except RuntimeError:
-                    main_content = asyncio.run(self.agent_memory_service.read_main_file())
+                main_content = await self.agent_memory_service.read_main_file()
+                main_content = main_content[:500] if main_content else ""
             except Exception:
-                pass
+                main_content = ""
         
         return f"""Supervisor ReAct Step
 Research query: {query}
@@ -302,13 +357,29 @@ Shared notes:
 Existing findings:
 {findings_block}
 
+CRITICAL EVALUATION REQUIRED:
+1. Is the agent digging deep enough? (checking multiple sources, exploring sub-topics, verifying claims)
+2. Is the agent updating todos actively? (if not, you MUST update their todos)
+3. Is the agent stopping too early? (if yes, add more specific tasks)
+4. Are there gaps in coverage? (if yes, create new tasks)
+5. What additional angles need exploration?
+6. What verification is needed?
+7. What sub-topics should be investigated?
+
+YOU MUST BE PROACTIVE:
+- If agent isn't updating todos, use update_agent_todo to push them
+- If agent is doing surface-level research, add specific deep-dive tasks using plan_tasks
+- If agent finishes too quickly, add more detailed investigation tasks
+- If there are gaps, create tasks to fill them
+- Don't wait for agents to ask - actively guide them to deeper research
+
 Decide what to do next. You can:
 - Create agent with character/preferences using create_agent
-- Update agent's todo if needed
+- Update agent's todo if needed (MANDATORY if they're not updating themselves)
 - Add note to main if important
-- Read agent file to check progress
-- Plan new tasks if needed
-- Do nothing if everything is fine
+- Read agent file to check progress (DO THIS to assess depth)
+- Plan new tasks if needed (DO THIS if research is shallow)
+- Do nothing ONLY if research is truly deep and comprehensive
 
 Respond with JSON action."""
 

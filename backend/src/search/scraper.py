@@ -83,7 +83,11 @@ class WebScraper:
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True)
+                # Use chromium headless shell for better performance in Docker
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                )
                 context = await browser.new_context(
                     user_agent=self.user_agent,
                     viewport={"width": 1920, "height": 1080},

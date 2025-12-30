@@ -19,25 +19,10 @@ services:
     networks:
       - deep_research_network
 
-  searxng:
-    image: searxng/searxng:latest
-    container_name: deep_research_searxng
-    environment:
-      BASE_URL: http://localhost:8080
-      SEARXNG_SECRET: ${SEARXNG_SECRET:-your_searxng_secret}
-    volumes:
-      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
-      - searxng_data:/etc/searxng
-    ports:
-      - "8080:8080"
-    networks:
-      - deep_research_network
-    restart: unless-stopped
-
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./backend/Dockerfile
     container_name: deep_research_backend
     depends_on:
       postgres:
@@ -49,13 +34,15 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_secure_password}
       MEMORY_DIR: /memory_files
-      SEARXNG_INSTANCE_URL: http://searxng:8080
+      SEARXNG_INSTANCE_URL: http://localhost:8080
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change_me_secret_key_please_change_in_production}
     env_file:
       - ./backend/.env
     volumes:
       - ${MEMORY_HOST_PATH:-/home/asudakov/projects/memory_files}:/memory_files
     ports:
       - "8000:8000"
+      - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -96,8 +83,6 @@ services:
 
 volumes:
   postgres_data:
-    driver: local
-  searxng_data:
     driver: local
   ollama_data:
     driver: local

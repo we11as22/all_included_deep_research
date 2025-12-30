@@ -69,6 +69,14 @@ class AgenticResearchCoordinator:
             tasks = seed_tasks[:self.max_concurrent]
         else:
             tasks = await self.supervisor.initial_tasks(query, max_tasks=self.max_concurrent)
+        
+        # Emit research plan if available
+        if self.stream and tasks:
+            # Create a plan description from tasks
+            plan_text = f"Research Plan:\n\n"
+            plan_text += "\n".join([f"{i+1}. {task}" for i, task in enumerate(tasks)])
+            plan_text += f"\n\nTotal tasks: {len(tasks)}"
+            self.stream.emit_research_plan(plan_text, tasks)
 
         try:
             round_id = 0
