@@ -65,12 +65,14 @@ class AgenticSupervisor:
     ) -> None:
         # Apply structured output for task planning
         try:
-            self.llm_planning = llm.with_structured_output(SupervisorTasks)
+            # Use function_calling method for better OpenAI compatibility
+            self.llm_planning = llm.with_structured_output(SupervisorTasks, method="function_calling")
         except Exception:
             self.llm_planning = llm
         # Apply structured output for ReAct actions
         try:
-            self.llm_react = llm.with_structured_output(SupervisorAction)
+            # Use function_calling method for better OpenAI compatibility
+            self.llm_react = llm.with_structured_output(SupervisorAction, method="function_calling")
         except Exception:
             self.llm_react = llm
         self.llm = llm  # Keep original for fallback

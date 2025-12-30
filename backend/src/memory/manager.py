@@ -141,7 +141,17 @@ This section maintains an index of all specialized memory files with description
     def _category_from_path(self, file_path: str) -> str:
         parts = file_path.split("/")
         if len(parts) > 1:
-            return parts[0].rstrip("s")
+            category = parts[0]
+            # Handle special case: chat_{id} -> chat (old format)
+            if category.startswith("chat_"):
+                return "chat"
+            # Handle conversations folder: conversations/chat_{id}/... -> chat
+            if category == "conversations" and len(parts) > 1:
+                # Check if second part starts with chat_
+                if parts[1].startswith("chat_"):
+                    return "chat"
+            # Remove trailing 's' for plural forms (conversations -> conversation, etc.)
+            return category.rstrip("s")
         return "other"
 
     async def create_file(
@@ -173,7 +183,7 @@ This section maintains an index of all specialized memory files with description
         logger.info("memory_file_created", file_path=file_path)
         return {"file_path": file_path, "title": description}
 
-    async def sync_file_to_db(self, file_path: str, force: bool = False) -> int:
+    async def sync_file_to_db(self, file_path: str, force: bool = False, embedding_dimension: int | None = None) -> int:
         """Sync a single file to the database."""
         async with self.session_factory() as session:
             sync_service = FileSyncService(
@@ -182,6 +192,7 @@ This section maintains an index of all specialized memory files with description
                 chunker=self.chunker,
                 embedding_provider=self.embedding_provider,
                 batch_size=self.embedding_batch_size,
+                embedding_dimension=embedding_dimension or self.embedding_provider.get_dimension(),
             )
             file_id = await sync_service.sync_file(file_path=file_path, force=force)
             await session.commit()

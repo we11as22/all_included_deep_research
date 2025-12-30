@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -35,7 +36,8 @@ You must respond with a single JSON object:
 
 Allowed actions:
 - web_search: {{"queries": ["..."], "max_results": 5}}
-- scrape_urls: {{"urls": ["..."]}}
+- scrape_urls: {{"urls": ["..."], "scroll": false}}
+- scroll_page: {{"url": "...", "scrolls": 3, "pause": 1.0}}
 - write_note: {{"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true}}
 - update_note: {{"file_path": "...", "summary": "...", "urls": ["..."]}}
 - read_note: {{"file_path": "items/..."}}
@@ -44,13 +46,17 @@ Allowed actions:
 - complete_todo: {{"titles": ["..."]}}
 - read_shared_notes: {{"keyword": "...", "limit": 5}}
 - read_agent_file: {{"agent_id": "..."}}
+- read_main: {{}}
 - finish: {{}}
 
 Rules:
 - Prefer web_search first if you need sources.
 - Use scrape_urls on the most promising links.
+- Use scroll_page to load dynamic content on pages that require scrolling (e.g., infinite scroll, lazy loading).
+- After scrolling, you can scrape_urls again to get the updated content.
 - Write notes for anything worth reusing later, include URLs.
 - Share only high-signal notes.
+- Read main.md using read_main to see project status and shared knowledge.
 - When the todo list is mostly done and you have enough evidence, use finish.
 - Always consider the current date ({current_date}) when evaluating information recency and relevance.
 """
@@ -84,7 +90,8 @@ class AgenticResearcher:
         # Apply structured output to LLM
         if not hasattr(llm, "_structured_output") or llm._structured_output is None:
             try:
-                self.llm = llm.with_structured_output(AgentAction)
+                # Use function_calling method for better OpenAI compatibility
+                self.llm = llm.with_structured_output(AgentAction, method="function_calling")
             except Exception:
                 # Fallback if structured output not supported
                 self.llm = llm
@@ -265,7 +272,8 @@ class AgenticResearcher:
                         status_section = main_content[status_start:status_end]
                     persistent_memory_block += f"### Current Project Status:\n{status_section}\n\n"
                 
-                persistent_memory_block += f"### Main Index (summary):\n{main_content[:800]}...\n\n"
+                persistent_memory_block += f"### Main Index (full content available via read_main tool):\n{main_content[:1000]}...\n\n"
+                persistent_memory_block += "**Note:** Use read_main action to read the full main.md file.\n\n"
                 if items:
                     persistent_memory_block += f"### Available Items ({len(items)} total, showing last 8):\n"
                     for item in items[-8:]:
@@ -319,6 +327,8 @@ Choose the next action (JSON only)."""
             return await self._tool_web_search(args, agent_id)
         if action == "scrape_urls":
             return await self._tool_scrape_urls(args)
+        if action == "scroll_page":
+            return await self._tool_scroll_page(args)
         if action == "write_note":
             return await self._tool_write_note(args, agent_id)
         if action == "add_todo":
@@ -335,6 +345,8 @@ Choose the next action (JSON only)."""
             return await self._tool_update_todo(args, agent_id)
         if action == "read_agent_file":
             return await self._tool_read_agent_file(args)
+        if action == "read_main":
+            return await self._tool_read_main()
 
         return "Unknown action."
 
@@ -373,6 +385,7 @@ Choose the next action (JSON only)."""
 
     async def _tool_scrape_urls(self, args: dict[str, Any]) -> str:
         urls = args.get("urls") or []
+        scroll = args.get("scroll", False)
         if isinstance(urls, str):
             urls = [urls]
         if not urls:
@@ -381,12 +394,107 @@ Choose the next action (JSON only)."""
         snippets = []
         for url in urls[:3]:
             try:
-                content = await self.web_scraper.scrape(url)
+                content = await self.web_scraper.scrape(url, scroll=scroll)
                 snippets.append(f"{content.title}: {content.content[:400]}")
             except Exception as exc:
                 snippets.append(f"{url}: scrape failed ({exc})")
 
         return "Scraped content: " + " | ".join(snippets)
+
+    async def _tool_scroll_page(self, args: dict[str, Any]) -> str:
+        """Scroll page to load dynamic content."""
+        url = str(args.get("url") or "")
+        scrolls = int(args.get("scrolls") or 3)
+        pause = float(args.get("pause") or 1.0)
+        
+        if not url:
+            return "No URL provided for scrolling."
+        
+        # Check if Playwright is available
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            return "Playwright not available. Install with: pip install playwright && playwright install chromium"
+        
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True)
+                context = await browser.new_context(
+                    user_agent=self.web_scraper.user_agent,
+                    viewport={"width": 1920, "height": 1080},
+                )
+                page = await context.new_page()
+                
+                logger.info("Scrolling page", url=url, scrolls=scrolls)
+                await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_load_state("networkidle", timeout=5000)
+                
+                # Get initial height
+                initial_height = await page.evaluate("document.body.scrollHeight")
+                
+                # Scroll down multiple times
+                previous_height = initial_height
+                total_scrolled = 0
+                
+                for i in range(scrolls):
+                    # Scroll to bottom
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await asyncio.sleep(pause)
+                    
+                    # Wait for new content
+                    try:
+                        await page.wait_for_load_state("networkidle", timeout=2000)
+                    except Exception:
+                        pass
+                    
+                    # Check new height
+                    new_height = await page.evaluate("document.body.scrollHeight")
+                    
+                    if new_height == previous_height:
+                        logger.info("No new content after scroll", scroll_count=i + 1)
+                        break
+                    
+                    previous_height = new_height
+                    total_scrolled += 1
+                
+                # Get visible content in viewport after scrolling (at bottom)
+                viewport_content = await page.evaluate("""
+                    () => {
+                        const elements = document.querySelectorAll('p, div, article, section, main, span');
+                        let text = '';
+                        const seen = new Set();
+                        for (const el of elements) {
+                            const rect = el.getBoundingClientRect();
+                            // Check if element is visible in viewport (after scrolling to bottom)
+                            if (rect.top >= 0 && rect.top < window.innerHeight && rect.width > 0 && rect.height > 0) {
+                                const textContent = el.textContent?.trim();
+                                if (textContent && textContent.length > 20 && !seen.has(textContent)) {
+                                    seen.add(textContent);
+                                    text += textContent + '\\n\\n';
+                                }
+                            }
+                        }
+                        return text.slice(0, 2000); // Limit to 2000 chars
+                    }
+                """)
+                
+                # Get page title
+                page_title = await page.title()
+                
+                await browser.close()
+                
+                logger.info("Page scrolling completed", url=url, scrolls=total_scrolled, height_increase=new_height - initial_height)
+                
+                result = f"Scrolled {total_scrolled} times on '{page_title}'. Page height increased from {initial_height} to {new_height}px."
+                if viewport_content:
+                    result += f"\n\nViewport content (visible after scrolling):\n{viewport_content[:1000]}..."
+                else:
+                    result += "\n\nNo visible content captured in viewport."
+                
+                return result
+        except Exception as e:
+            logger.error("Scroll page failed", url=url, error=str(e))
+            return f"Scroll failed: {str(e)}"
 
     async def _tool_write_note(self, args: dict[str, Any], agent_id: str) -> str:
         title = str(args.get("title") or "Note")
@@ -598,6 +706,19 @@ Choose the next action (JSON only)."""
         except Exception as e:
             logger.warning("Failed to read agent file", agent_id=target_agent_id, error=str(e))
             return f"Failed to read agent file: {str(e)}"
+
+    async def _tool_read_main(self) -> str:
+        """Read main.md file (all agents can read main.md)."""
+        if not self.agent_memory_service:
+            return "Memory service not available."
+        
+        try:
+            content = await self.agent_memory_service.read_main_file()
+            # Return full content, not truncated
+            return f"Main memory file content:\n\n{content}"
+        except Exception as e:
+            logger.warning("Failed to read main file", error=str(e))
+            return f"Failed to read main file: {str(e)}"
 
     def _synthesize_finding(self, agent_id: str, topic: str) -> ResearchFinding:
         notes = self.agent_memory.notes[-5:]

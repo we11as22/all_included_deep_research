@@ -8,7 +8,7 @@ from src.config.settings import get_settings
 def main():
     """Start the FastAPI server."""
     settings = get_settings()
-
+    
     uvicorn.run(
         "src.api.app:app",
         host=settings.api_host,

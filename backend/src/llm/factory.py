@@ -82,7 +82,12 @@ def create_chat_model(
         
         # Apply structured output if requested
         if structured_output:
-            llm = llm.with_structured_output(structured_output)
+            try:
+                # Use function_calling method for better OpenAI compatibility
+                llm = llm.with_structured_output(structured_output, method="function_calling")
+            except TypeError:
+                # Fallback if method parameter not supported
+                llm = llm.with_structured_output(structured_output)
             logger.debug("applied_structured_output", schema=structured_output.__name__)
         
         return llm
@@ -101,7 +106,12 @@ def create_chat_model(
         
         # Apply structured output if requested
         if structured_output:
-            llm = llm.with_structured_output(structured_output)
+            try:
+                # Use function_calling method for better OpenAI compatibility
+                llm = llm.with_structured_output(structured_output, method="function_calling")
+            except TypeError:
+                # Fallback if method parameter not supported
+                llm = llm.with_structured_output(structured_output)
             logger.debug("applied_structured_output", schema=structured_output.__name__)
         
         return llm

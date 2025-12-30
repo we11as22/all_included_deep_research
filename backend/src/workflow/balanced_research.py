@@ -46,7 +46,13 @@ class BalancedResearchWorkflow:
 
         # Initialize providers
         self.search_provider = create_search_provider(settings)
-        self.web_scraper = WebScraper()
+        self.web_scraper = WebScraper(
+            timeout=settings.scraper_timeout,
+            use_playwright=settings.scraper_use_playwright,
+            scroll_enabled=settings.scraper_scroll_enabled,
+            scroll_pause=settings.scraper_scroll_pause,
+            max_scrolls=settings.scraper_max_scrolls,
+        )
 
         # Build workflow graph
         self.graph = self._build_graph()

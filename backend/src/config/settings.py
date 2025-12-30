@@ -91,6 +91,13 @@ class Settings(BaseSettings):
 
     # Search Settings
     search_provider: Literal["tavily", "searxng", "mock"] = Field(default="tavily", description="Search provider")
+    
+    # Web Scraper Settings
+    scraper_timeout: int = Field(default=30, description="Web scraper timeout in seconds")
+    scraper_use_playwright: bool = Field(default=False, description="Use Playwright for JavaScript rendering")
+    scraper_scroll_enabled: bool = Field(default=False, description="Enable automatic scrolling to load dynamic content")
+    scraper_scroll_pause: float = Field(default=1.0, description="Pause between scrolls in seconds")
+    scraper_max_scrolls: int = Field(default=5, description="Maximum number of scroll operations")
 
     # Tavily
     tavily_api_key: Optional[str] = Field(default=None, description="Tavily API key")

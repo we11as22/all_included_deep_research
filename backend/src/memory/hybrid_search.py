@@ -38,7 +38,7 @@ class HybridSearchEngine:
         Search memory with specified mode.
 
         Args:
-            query: Search query
+            query: Search query (must be a string, not a list/embedding)
             search_mode: Search mode (hybrid, vector, fulltext)
             limit: Maximum results
             category_filter: Filter by category
@@ -48,6 +48,14 @@ class HybridSearchEngine:
         Returns:
             List of search results
         """
+        # Ensure query is a string, not a list/embedding
+        if not isinstance(query, str):
+            if isinstance(query, (list, tuple)):
+                logger.warning("Query was passed as list/embedding, converting to string", query_type=type(query).__name__)
+                query = str(query)
+            else:
+                query = str(query) if query else ""
+        
         if search_mode == SearchMode.HYBRID:
             return await self._hybrid_search(query, limit, category_filter, tag_filter, file_path)
         elif search_mode == SearchMode.VECTOR:
@@ -98,8 +106,19 @@ class HybridSearchEngine:
         file_path: str | None,
     ) -> list[SearchResult]:
         """Hybrid search with RRF combining vector and fulltext."""
+        # Ensure query is a string, not a list
+        if not isinstance(query, str):
+            query = str(query) if query else ""
+        
         # Generate query embedding
         query_embedding = await self.embedding_provider.embed_text(query)
+        
+        # Normalize embedding to 1536 dimensions (database schema requirement)
+        # Pad or truncate as needed
+        if len(query_embedding) < 1536:
+            query_embedding = list(query_embedding) + [0.0] * (1536 - len(query_embedding))
+        elif len(query_embedding) > 1536:
+            query_embedding = query_embedding[:1536]
 
         async with self.db_pool.acquire() as conn:
             # Build filters
@@ -173,6 +192,9 @@ class HybridSearchEngine:
             # Pass parameters explicitly: embedding (vector), query (str), rrf_k (int), limit (int), then filter params
             # asyncpg requires vector to be passed as list[float], which it will convert to vector type
             # Build complete params list to avoid issues with *filter_params unpacking
+            # Ensure query is a string, not a list
+            if not isinstance(query, str):
+                query = str(query)
             all_params = [query_embedding, query, self.rrf_k, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 
@@ -204,7 +226,18 @@ class HybridSearchEngine:
         file_path: str | None,
     ) -> list[SearchResult]:
         """Vector-only semantic search."""
+        # Ensure query is a string
+        if not isinstance(query, str):
+            query = str(query) if query else ""
+        
         query_embedding = await self.embedding_provider.embed_text(query)
+        
+        # Normalize embedding to 1536 dimensions (database schema requirement)
+        # Pad or truncate as needed
+        if len(query_embedding) < 1536:
+            query_embedding = list(query_embedding) + [0.0] * (1536 - len(query_embedding))
+        elif len(query_embedding) > 1536:
+            query_embedding = query_embedding[:1536]
 
         async with self.db_pool.acquire() as conn:
             filters = []
@@ -323,6 +356,9 @@ class HybridSearchEngine:
 
             # Pass parameters explicitly: query (str), limit (int), then filter params
             # Build complete params list to avoid issues with *filter_params unpacking
+            # Ensure query is a string, not a list
+            if not isinstance(query, str):
+                query = str(query)
             all_params = [query, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 

@@ -29,13 +29,15 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     settings = app_request.app.state.settings
     chat_history = _collect_chat_history(request.messages, settings.chat_history_limit)
 
-    if normalized in {"speed"}:
+    if normalized in {"chat", "simple", "conversation"}:
+        mode = "chat"
+    elif normalized in {"speed"}:
         mode = "search"
     elif normalized in {"balanced"}:
         mode = "deep_search"
     elif normalized in {"quality"}:
         mode = "deep_research"
-    elif normalized in {"search", "simple", "web", "web_search"}:
+    elif normalized in {"search", "web", "web_search"}:
         mode = "search"
     elif normalized in {"deep_search", "deep"}:
         mode = "deep_search"
@@ -59,7 +61,19 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             stream_generator.emit_init(mode=mode)
             stream_generator.emit_status("Starting chat workflow...", step="init")
 
-            if mode in {"search", "deep_search"}:
+            if mode == "chat":
+                # Simple chat mode - no web search
+                chat_service = app_request.app.state.chat_service
+                result = await chat_service.answer_simple(query, stream=stream_generator, messages=chat_history)
+                
+                stream_generator.emit_status("Drafting answer...", step="answer")
+                for chunk in _chunk_text(result.answer, size=180):
+                    stream_generator.emit_report_chunk(chunk)
+                    await asyncio.sleep(0.02)
+                stream_generator.emit_final_report(result.answer)
+                stream_generator.emit_done()
+                return
+            elif mode in {"search", "deep_search"}:
                 chat_service = app_request.app.state.chat_service
                 if mode == "search":
                     result = await chat_service.answer_web(query, stream=stream_generator, messages=chat_history)
@@ -90,7 +104,8 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                         title=query[:80],
                         content=content,
                     )
-                    await memory_manager.sync_file_to_db(file_path)
+                    embedding_dimension = app_request.app.state.get("embedding_dimension")
+                    await memory_manager.sync_file_to_db(file_path, embedding_dimension=embedding_dimension)
                 except Exception as exc:
                     stream_generator.emit_error(error=str(exc), details="Memory save failed")
             stream_generator.emit_done()

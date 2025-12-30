@@ -59,8 +59,9 @@ huggingface = [
     "sentence-transformers>=2.3.0",
     "torch>=2.1.0",
 ]
+playwright = ["playwright>=1.40.0"]
 all = [
-    "all-included-deep-research[ollama,cohere,huggingface]"
+    "all-included-deep-research[ollama,cohere,huggingface,playwright]"
 ]
 dev = [
     "pytest>=7.4.0",

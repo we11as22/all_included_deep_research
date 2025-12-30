@@ -1,18 +1,20 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ModeSelector, ChatMode } from '@/components/ModeSelector';
+import { ModeSelectorDropdown, ChatMode } from '@/components/ModeSelectorDropdown';
 import { streamChatProgress } from '@/lib/api';
 import { ChatProgressPanel, ProgressState } from '@/components/ChatProgressPanel';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { ArrowUpRight, Brain, Loader2, X } from 'lucide-react';
-import { cancelChat, getChat, addMessage, createChat, type ChatMessage as DBChatMessage, type StreamChatMessage } from '@/lib/api';
+import { ArrowUpRight, Brain, Loader2, Search, X } from 'lucide-react';
+import { cancelChat, getChat, addMessage, createChat, type ChatMessage as DBChatMessage } from '@/lib/api';
 import { cn } from '@/lib/utils';
 import Markdown from 'markdown-to-jsx';
 import { ChatSidebar } from '@/components/ChatSidebar';
+import { ThemeToggle } from '@/components/ThemeToggle';
+import { ChatSearch } from '@/components/ChatSearch';
 
 type LocalChatMessage = {
   id: string;
@@ -22,6 +24,7 @@ type LocalChatMessage = {
 
 const makeId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 const formatModeLabel = (mode: ChatMode) => {
+  if (mode === 'chat') return 'chat';
   if (mode === 'search') return 'web search';
   if (mode === 'deep_search') return 'deep search';
   if (mode === 'deep_research') return 'deep research';
@@ -43,16 +46,27 @@ export default function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
+  const [showChatSearch, setShowChatSearch] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   const messagePayload = useMemo(
     () => messages.map((message) => ({ role: message.role, content: message.content })),
     [messages]
   );
 
+  // Get current progress for the latest assistant message
+  const currentProgress = useMemo(() => {
+    const assistantMessages = messages.filter(m => m.role === 'assistant');
+    if (assistantMessages.length === 0) return null;
+    const latestMessage = assistantMessages[assistantMessages.length - 1];
+    return progressByMessage[latestMessage.id] || null;
+  }, [messages, progressByMessage]);
+
   useEffect(() => {
     scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isStreaming]);
+
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -105,9 +119,12 @@ export default function HomePage() {
 
     let sessionId: string | null = null;
     try {
+      // Map frontend mode to backend mode
+      const backendMode = mode === 'chat' ? 'chat' : mode === 'search' ? 'search' : mode === 'deep_search' ? 'deep_search' : 'deep_research';
+      
       for await (const event of streamChatProgress(
         [...messagePayload, { role: 'user' as const, content: userMessage.content }],
-        mode
+        backendMode as any
       )) {
         // Capture session ID from first event
         if (event.sessionId && !sessionId) {
@@ -188,7 +205,6 @@ export default function HomePage() {
             case 'error':
               next.error = event.data.error;
               next.isComplete = true;
-              // Also add error to message content for visibility
               setMessages((prev) =>
                 prev.map((msg) =>
                   msg.id === assistantMessage.id
@@ -236,12 +252,22 @@ export default function HomePage() {
         }
       }
     } catch (err) {
-      const message = err instanceof Error ? err.message : 'Chat request failed';
-      setError(message);
+      let errorMessage = 'Chat request failed';
+      if (err instanceof Error) {
+        errorMessage = err.message;
+      } else if (typeof err === 'string') {
+        errorMessage = err;
+      } else if (err && typeof err === 'object') {
+        // Try to extract error message from object
+        errorMessage = (err as any).message || (err as any).error || JSON.stringify(err);
+      }
+      
+      console.error('Chat stream error:', err);
+      setError(errorMessage);
       setMessages((prev) =>
         prev.map((message) =>
           message.id === assistantMessage.id
-            ? { ...message, content: `${message.content}\n\nError: ${message}` }
+            ? { ...message, content: `${message.content}\n\n❌ **Ошибка:** ${errorMessage}` }
             : message
         )
       );
@@ -251,12 +277,13 @@ export default function HomePage() {
           ...prev[assistantMessage.id],
           status: 'Error',
           step: 'error',
-          error: message,
+          error: errorMessage,
           isComplete: true,
         },
       }));
     } finally {
       setIsStreaming(false);
+      setCurrentSessionId(null);
     }
   };
 
@@ -286,21 +313,21 @@ export default function HomePage() {
   };
 
   return (
-    <div className="flex min-h-screen bg-background">
+    <div className="flex h-screen bg-background overflow-hidden">
       <ChatSidebar
         currentChatId={currentChatId}
         onChatSelect={handleChatSelect}
         onNewChat={handleNewChat}
       />
-      <main className="flex-1 relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)]">
+      <main className="flex-1 relative flex flex-col min-h-0 overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)] dark:bg-[radial-gradient(circle_at_top,_#0f172a,_#1e293b_50%,_#334155_100%)]">
       <div className="pointer-events-none absolute inset-0">
-        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(15,23,42,0.04)_1px,transparent_1px),linear-gradient(180deg,rgba(15,23,42,0.04)_1px,transparent_1px)] bg-[size:56px_56px] opacity-40" />
-        <div className="absolute -top-20 left-10 h-64 w-64 rounded-full bg-amber-100/40 blur-3xl" />
-        <div className="absolute right-0 top-40 h-72 w-72 rounded-full bg-sky-100/40 blur-3xl" />
-        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-rose-100/40 blur-3xl" />
+        <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(15,23,42,0.04)_1px,transparent_1px),linear-gradient(180deg,rgba(15,23,42,0.04)_1px,transparent_1px)] bg-[size:56px_56px] opacity-40 dark:opacity-20" />
+        <div className="absolute -top-20 left-10 h-64 w-64 rounded-full bg-amber-100/40 dark:bg-amber-900/20 blur-3xl" />
+        <div className="absolute right-0 top-40 h-72 w-72 rounded-full bg-sky-100/40 dark:bg-sky-900/20 blur-3xl" />
+        <div className="absolute bottom-0 left-1/3 h-64 w-64 rounded-full bg-rose-100/40 dark:bg-rose-900/20 blur-3xl" />
       </div>
 
-      <header className="relative z-10 border-b border-border/60 bg-background/70 backdrop-blur">
+      <header className="relative z-10 border-b border-border/60 bg-background/70 dark:bg-background/90 backdrop-blur">
         <div className="container mx-auto px-4 py-5">
           <div className="flex flex-wrap items-center justify-between gap-4">
             <div className="flex items-center gap-3">
@@ -316,6 +343,16 @@ export default function HomePage() {
               <Badge variant="outline" className="bg-background/80">
                 Memory + Web
               </Badge>
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={() => setShowChatSearch(true)}
+                className="h-9 w-9"
+                title="Search chats"
+              >
+                <Search className="h-4 w-4" />
+              </Button>
+              <ThemeToggle />
               <a
                 href="https://github.com"
                 target="_blank"
@@ -329,32 +366,10 @@ export default function HomePage() {
         </div>
       </header>
 
-      <section className="relative z-10 container mx-auto px-4 py-10">
-        <div className="grid gap-8 lg:grid-cols-[320px_1fr]">
-          <aside className="space-y-6">
-            <Card className="border-border/60 bg-background/80 p-5 shadow-sm">
-              <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">Mode</p>
-              <h2 className="mt-2 text-lg font-semibold">Choose a search lane</h2>
-              <p className="mt-2 text-sm text-muted-foreground">
-                Each lane changes how aggressively the agent searches, reranks, and synthesizes.
-              </p>
-              <div className="mt-4">
-                <ModeSelector selected={mode} onChange={setMode} />
-              </div>
-            </Card>
-
-            <Card className="border-border/60 bg-background/80 p-5 shadow-sm">
-              <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">Capabilities</p>
-              <div className="mt-3 space-y-3 text-sm text-muted-foreground">
-                <p>Hybrid memory + web retrieval with inline citations.</p>
-                <p>Web search expands queries and summarizes long sources.</p>
-                <p>Deep search runs more iterations with broader sources.</p>
-                <p>Deep research orchestrates multi-agent synthesis.</p>
-              </div>
-            </Card>
-          </aside>
-
-          <Card className="flex min-h-[600px] max-h-[85vh] flex-col border-border/60 bg-background/85 shadow-lg backdrop-blur">
+      <section className="relative z-10 container mx-auto px-4 py-4 flex-1 flex flex-col min-h-0">
+        <div className="grid gap-8 lg:grid-cols-[1fr_400px] flex-1 min-h-0">
+          {/* Main Chat Area */}
+          <Card className="flex h-full flex-col border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur">
             <div className="flex items-center justify-between border-b border-border/60 px-6 py-4">
               <div>
                 <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">Conversation</p>
@@ -370,8 +385,8 @@ export default function HomePage() {
                 <div className="flex h-full flex-col items-start justify-center gap-4">
                   <h3 className="text-2xl font-semibold">Ask anything that needs proof.</h3>
                   <p className="max-w-md text-sm text-muted-foreground">
-                    Try: “Give me a quick landscape of European AI regulation changes in 2024,” or
-                    “Summarize recent supply chain shocks for lithium batteries.”
+                    Try: "Give me a quick landscape of European AI regulation changes in 2024," or
+                    "Summarize recent supply chain shocks for lithium batteries."
                   </p>
                   <div className="flex flex-wrap gap-2">
                     {suggestions.map((suggestion) => (
@@ -379,7 +394,7 @@ export default function HomePage() {
                         key={suggestion}
                         type="button"
                         onClick={() => setInput(suggestion)}
-                        className="rounded-full border border-border/60 bg-white/90 px-3 py-1 text-xs text-foreground/80 transition hover:border-primary/50 hover:text-foreground"
+                        className="rounded-full border border-border/60 bg-white/90 dark:bg-background/80 px-3 py-1 text-xs text-foreground/80 transition hover:border-primary/50 hover:text-foreground"
                       >
                         {suggestion}
                       </button>
@@ -394,14 +409,11 @@ export default function HomePage() {
                       className={cn(
                         'max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm animate-fade-rise',
                         message.role === 'user'
-                          ? 'ml-auto bg-foreground text-background'
-                          : 'border border-border/60 bg-white/90 text-foreground'
+                          ? 'ml-auto bg-primary text-primary-foreground dark:bg-primary dark:text-primary-foreground'
+                          : 'border border-border/60 bg-white/90 dark:bg-background/80 text-foreground'
                       )}
                       style={{ animationDelay: `${index * 40}ms` }}
                     >
-                      {message.role === 'assistant' && progressByMessage[message.id] && (
-                        <ChatProgressPanel progress={progressByMessage[message.id]} />
-                      )}
                       <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-a:text-primary prose-a:underline prose-ul:my-2 prose-ol:my-2 prose-li:my-1">
                         <Markdown
                           options={{
@@ -471,29 +483,58 @@ export default function HomePage() {
             </div>
 
             <form onSubmit={handleSubmit} className="border-t border-border/60 px-6 py-4">
-              <div className="flex flex-col gap-3 sm:flex-row sm:items-end">
-                <div className="flex-1">
-                  <Textarea
-                    value={input}
-                    onChange={(event) => setInput(event.target.value)}
-                    placeholder="Type your question, include any constraints or sources to prioritize."
-                    className="min-h-[90px] resize-none border-border/60 bg-background/80"
-                  />
+              <div className="relative">
+                <Textarea
+                  ref={textareaRef}
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  placeholder="Type your question, include any constraints or sources to prioritize."
+                  className="min-h-[90px] resize-none border-border/60 bg-background/80 dark:bg-background/90 pr-24"
+                />
+                <div className="absolute bottom-3 right-3">
+                  <Button
+                    type="submit"
+                    size="sm"
+                    className="h-8 gap-2 rounded-full px-4"
+                    disabled={isStreaming || !input.trim()}
+                  >
+                    {isStreaming ? 'Sending' : 'Send'}
+                    <ArrowUpRight className="h-3.5 w-3.5" />
+                  </Button>
                 </div>
-                <Button
-                  type="submit"
-                  className="h-12 gap-2 rounded-full px-6"
-                  disabled={isStreaming || !input.trim()}
-                >
-                  {isStreaming ? 'Searching' : 'Send'}
-                  <ArrowUpRight className="h-4 w-4" />
-                </Button>
+              </div>
+              {/* Mode selector at bottom left */}
+              <div className="mt-2">
+                <ModeSelectorDropdown 
+                  selected={mode} 
+                  onChange={setMode}
+                />
               </div>
             </form>
           </Card>
+
+          {/* Progress Panel - Right Side */}
+          {currentProgress && (
+            <div className="lg:sticky lg:top-4 lg:h-[85vh] lg:overflow-y-auto">
+              <Card className="border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur">
+                <div className="border-b border-border/60 px-4 py-3">
+                  <h3 className="text-sm font-semibold">Research Progress</h3>
+                </div>
+                <div className="p-4">
+                  <ChatProgressPanel progress={currentProgress} />
+                </div>
+              </Card>
+            </div>
+          )}
         </div>
       </section>
       </main>
+      {showChatSearch && (
+        <ChatSearch
+          onChatSelect={handleChatSelect}
+          onClose={() => setShowChatSearch(false)}
+        />
+      )}
     </div>
   );
 }

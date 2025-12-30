@@ -2,10 +2,12 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from urllib.parse import unquote, parse_qs, urlencode
 
 import structlog
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config.settings import get_settings
 from src.chat.service import ChatSearchService
@@ -27,6 +29,36 @@ from src.api.routes import (
 )
 
 logger = structlog.get_logger(__name__)
+
+
+class URLDecodeMiddleware(BaseHTTPMiddleware):
+    """Middleware to decode URL-encoded query parameters for logging."""
+    
+    async def dispatch(self, request: Request, call_next):
+        # Decode query parameters for logging
+        if request.query_params:
+            decoded_params = {}
+            for key, value in request.query_params.multi_items():
+                try:
+                    decoded_key = unquote(key)
+                    decoded_value = unquote(value)
+                    decoded_params[decoded_key] = decoded_value
+                except Exception:
+                    decoded_params[key] = value
+            
+            # Log decoded URL if it contains non-ASCII characters
+            if any(ord(c) > 127 for c in str(request.url)):
+                decoded_path = unquote(str(request.url.path))
+                decoded_query = "&".join([f"{k}={v}" for k, v in decoded_params.items()])
+                logger.debug(
+                    "Request URL decoded",
+                    method=request.method,
+                    path=decoded_path,
+                    query=decoded_query if decoded_query else None,
+                )
+        
+        response = await call_next(request)
+        return response
 
 
 @asynccontextmanager
@@ -53,7 +85,10 @@ async def lifespan(app: FastAPI):
     # Initialize embedding provider
     logger.info("Initializing embedding provider...", provider=settings.embedding_provider)
     embedding_provider = create_embedding_provider(settings)
+    embedding_dimension = embedding_provider.get_dimension()
+    logger.info("Embedding dimension detected", dimension=embedding_dimension, provider=settings.embedding_provider)
     app.state.embedding_provider = embedding_provider
+    app.state.embedding_dimension = embedding_dimension
 
     # Initialize hybrid search engine
     logger.info("Initializing hybrid search engine...")
@@ -143,6 +178,9 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    
+    # Add URL decode middleware for better logging
+    app.add_middleware(URLDecodeMiddleware)
 
     # Include routers
     app.include_router(health_router)

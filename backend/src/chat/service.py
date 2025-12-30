@@ -93,7 +93,13 @@ class ChatSearchService:
         self.search_engine = search_engine
         self.embedding_provider = embedding_provider
         self.search_provider = create_search_provider(settings)
-        self.scraper = WebScraper()
+        self.scraper = WebScraper(
+            timeout=settings.scraper_timeout,
+            use_playwright=settings.scraper_use_playwright,
+            scroll_enabled=settings.scraper_scroll_enabled,
+            scroll_pause=settings.scraper_scroll_pause,
+            max_scrolls=settings.scraper_max_scrolls,
+        )
         self.reranker = SemanticReranker(embedding_provider)
 
         self.chat_llm = create_chat_model(
@@ -115,8 +121,51 @@ class ChatSearchService:
         stream: Any | None = None,
         messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
-        """Answer with base web search (multi-query + refinement)."""
-        return await self.answer_web(query, stream=stream, messages=messages)
+        """Answer with simple LLM conversation (no web search)."""
+        self._emit_status(stream, "Generating response...", step="chat")
+        
+        chat_history = format_chat_history(messages, self.settings.chat_history_limit) if messages else None
+        current_date = get_current_date()
+        
+        system_prompt = (
+            f"You are a helpful AI assistant. Provide clear, accurate, and helpful responses. "
+            f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs."
+        )
+        
+        history_block = chat_history or "Chat history: None."
+        user_prompt = (
+            f"User question: {query}\n"
+            f"Current date: {current_date}\n\n"
+            f"{history_block}\n\n"
+            "Please provide a helpful and accurate response."
+        )
+        
+        try:
+            # Use structured output if available
+            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
+            response = await structured_llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            if isinstance(response, SynthesizedAnswer):
+                answer = response.answer.strip()
+            else:
+                answer = response.content if hasattr(response, "content") else str(response)
+                answer = answer.strip()
+        except Exception:
+            # Fallback to regular LLM call
+            response = await self.chat_llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            answer = response.content if hasattr(response, "content") else str(response)
+            answer = answer.strip()
+        
+        self._emit_status(stream, "Response generated", step="complete")
+        
+        return ChatSearchResult(
+            answer=answer,
+            sources=[],
+            memory_context=[],
+        )
 
     async def answer_web(
         self,
@@ -265,7 +314,7 @@ class ChatSearchService:
         history_block = chat_history or "Chat history: None."
         try:
             # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(QueryRewrite)
+            structured_llm = self.chat_llm.with_structured_output(QueryRewrite, method="function_calling")
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
             )
@@ -305,7 +354,7 @@ class ChatSearchService:
         )
         try:
             # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(SearchQueries)
+            structured_llm = self.chat_llm.with_structured_output(SearchQueries, method="function_calling")
             response = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=prompt),
@@ -360,7 +409,7 @@ class ChatSearchService:
         )
         try:
             # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(FollowupQueries)
+            structured_llm = self.chat_llm.with_structured_output(FollowupQueries, method="function_calling")
             response = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=prompt),
@@ -503,7 +552,7 @@ class ChatSearchService:
             )
             try:
                 # Try structured output first
-                structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent)
+                structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent, method="function_calling")
                 response = await structured_llm.ainvoke(
                     [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
                 )
@@ -565,7 +614,7 @@ class ChatSearchService:
 
         try:
             # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer)
+            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )

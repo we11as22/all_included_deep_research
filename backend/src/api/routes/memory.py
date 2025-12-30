@@ -83,7 +83,8 @@ async def create_memory_file(memory_request: MemoryCreateRequest, app_request: R
         )
 
         # Sync to database
-        file_id = await memory_manager.sync_file_to_db(memory_request.file_path)
+        embedding_dimension = app_request.app.state.get("embedding_dimension")
+        file_id = await memory_manager.sync_file_to_db(memory_request.file_path, embedding_dimension=embedding_dimension)
         file_record = await memory_manager.get_file_by_path(memory_request.file_path)
 
         logger.info("Memory file created", file_path=memory_request.file_path)

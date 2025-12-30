@@ -1,15 +1,18 @@
 """Pydantic schemas for structured LLM outputs."""
 
 from typing import Literal, Optional, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class AgentAction(BaseModel):
     """Structured output for agent actions."""
     
+    model_config = ConfigDict(extra='forbid')
+    
     action: Literal[
         "web_search",
         "scrape_urls",
+        "scroll_page",
         "write_note",
         "update_note",
         "read_note",
@@ -18,6 +21,7 @@ class AgentAction(BaseModel):
         "complete_todo",
         "read_shared_notes",
         "read_agent_file",
+        "read_main",
         "finish"
     ] = Field(..., description="Action to perform")
     
@@ -29,6 +33,8 @@ class AgentAction(BaseModel):
 
 class SupervisorAction(BaseModel):
     """Structured output for supervisor ReAct actions."""
+    
+    model_config = ConfigDict(extra='forbid')
     
     action: Literal[
         "plan_tasks",

@@ -23,6 +23,7 @@ class FileSyncService:
         chunker: MarkdownChunker,
         embedding_provider: EmbeddingProvider,
         batch_size: int = 100,
+        embedding_dimension: int | None = None,
     ):
         """
         Initialize file sync service.
@@ -33,12 +34,14 @@ class FileSyncService:
             chunker: Markdown chunker instance
             embedding_provider: Embedding provider
             batch_size: Batch size for embeddings
+            embedding_dimension: Expected embedding dimension (if None, will get from provider)
         """
         self.repository = MemoryRepository(session)
         self.file_manager = file_manager
         self.chunker = chunker
         self.embedding_provider = embedding_provider
         self.batch_size = batch_size
+        self.embedding_dimension = embedding_dimension or embedding_provider.get_dimension()
 
     async def sync_file(self, file_path: str, force: bool = False) -> int:
         """
@@ -116,7 +119,22 @@ class FileSyncService:
         for i in range(0, len(chunk_texts), self.batch_size):
             batch = chunk_texts[i : i + self.batch_size]
             embeddings = await self.embedding_provider.embed_batch(batch)
-            all_embeddings.extend(embeddings)
+            
+            # Normalize embedding dimensions to match database schema (1536)
+            # Database uses Vector(1536), so we need to normalize to this size
+            db_dimension = 1536
+            normalized_embeddings = []
+            for emb in embeddings:
+                emb_list = list(emb) if not isinstance(emb, list) else emb
+                if len(emb_list) < db_dimension:
+                    # Pad with zeros if smaller
+                    emb_list = emb_list + [0.0] * (db_dimension - len(emb_list))
+                elif len(emb_list) > db_dimension:
+                    # Truncate if larger
+                    emb_list = emb_list[:db_dimension]
+                normalized_embeddings.append(emb_list)
+            
+            all_embeddings.extend(normalized_embeddings)
 
         # Create chunk objects
         chunk_creates = [

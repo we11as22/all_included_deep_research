@@ -121,7 +121,7 @@ async def plan_research_node(
         # Generate plan with structured output
         try:
             # Try structured output first
-            structured_llm = llm.with_structured_output(ResearchPlan)
+            structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
             plan_obj = await structured_llm.ainvoke(
                 [SystemMessage(content=PLANNING_SYSTEM_PROMPT), HumanMessage(
                     content=PLANNING_USER_TEMPLATE.format(

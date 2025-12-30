@@ -208,6 +208,8 @@ class AgenticResearchCoordinator:
             shared_memory=self.shared_memory,
             memory_context=self.memory_context,
             chat_history=self.chat_history,
+            agent_memory_service=self.agent_memory_service,
+            agent_file_service=self.agent_file_service,
         )
 
     def _build_assignment(self, topic: str) -> str:
@@ -219,3 +221,32 @@ class AgenticResearchCoordinator:
             f"{chat_block}\n"
             "Capture high-signal evidence with citations. Share notes that help other agents."
         )
+    
+    async def _get_agent_character_preferences(self, agent_id: str, topic: str) -> tuple[str, str]:
+        """
+        Get agent character and preferences from supervisor if available.
+        
+        Args:
+            agent_id: Agent ID
+            topic: Research topic
+            
+        Returns:
+            Tuple of (character, preferences) strings
+        """
+        if not self.agent_file_service:
+            return "", ""
+        
+        # Use supervisor's react_step to decide character/preferences
+        # This is a simplified example, a full implementation would involve a more complex prompt
+        # and parsing of the supervisor's response.
+        # For now, we'll just check if an agent file exists and return its character/preferences.
+        try:
+            agent_file_content = await self.agent_file_service.read_agent_file(agent_id)
+            character = agent_file_content.get("character", "")
+            preferences = agent_file_content.get("preferences", "")
+            return character, preferences
+        except FileNotFoundError:
+            return "", ""
+        except Exception as e:
+            logger.warning("Failed to get agent character/preferences", agent_id=agent_id, error=str(e))
+            return "", ""

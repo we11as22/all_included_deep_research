@@ -29,10 +29,18 @@ async def search_memory_node(
         State update with memory_context
     """
     query = state.get("clarified_query") or state.get("query", "")
+    # Ensure query is a string, not a list/embedding
+    if not isinstance(query, str):
+        if isinstance(query, (list, tuple)):
+            logger.warning("Query was passed as list/embedding in state, converting to string", query_type=type(query).__name__)
+            query = str(query)
+        else:
+            query = str(query) if query else ""
+    
     mode = state.get("mode", "balanced")
     stream = state.get("stream")
 
-    logger.info("Searching memory", query=query, mode=mode)
+    logger.info("Searching memory", query=query[:100] if isinstance(query, str) else "non-string", mode=mode)
 
     try:
         # Adjust search depth based on mode

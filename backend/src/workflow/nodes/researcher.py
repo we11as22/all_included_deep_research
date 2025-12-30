@@ -265,7 +265,7 @@ Respond with just the queries, one per line, without numbering."""
     try:
         # Try structured output first
         try:
-            structured_llm = llm.with_structured_output(SearchQueries)
+            structured_llm = llm.with_structured_output(SearchQueries, method="function_calling")
             response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
             if isinstance(response, SearchQueries):
                 queries = response.queries[:max_queries]
@@ -352,7 +352,7 @@ Format your response as:
     try:
         # Try structured output first
         try:
-            structured_llm = llm.with_structured_output(ResearchAnalysis)
+            structured_llm = llm.with_structured_output(ResearchAnalysis, method="function_calling")
             response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
             if isinstance(response, ResearchAnalysis):
                 return {
@@ -494,7 +494,7 @@ Rules:
     try:
         # Try structured output first
         try:
-            structured_llm = llm.with_structured_output(FollowupQueries)
+            structured_llm = llm.with_structured_output(FollowupQueries, method="function_calling")
             response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
             if isinstance(response, FollowupQueries):
                 return [q.strip() for q in response.queries if q.strip()][:max_queries]
