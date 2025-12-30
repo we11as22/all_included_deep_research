@@ -16,6 +16,7 @@ from src.workflow.nodes.planner import plan_research_node
 from src.workflow.nodes.reporter import generate_final_report_node
 from src.workflow.agentic.coordinator import AgenticResearchCoordinator
 from src.workflow.state import ResearchFinding, ResearchState
+from src.workflow.agentic.schemas import CompressedFindings
 
 logger = structlog.get_logger(__name__)
 
@@ -107,6 +108,14 @@ class QualityResearchWorkflow:
             max_concurrent=max_concurrent,
         )
 
+        # Get agent memory and file services from stream if available
+        agent_memory_service = None
+        agent_file_service = None
+        stream = state.get("stream")
+        if stream and hasattr(stream, "app_state"):
+            agent_memory_service = stream.app_state.get("agent_memory_service")
+            agent_file_service = stream.app_state.get("agent_file_service")
+        
         coordinator = AgenticResearchCoordinator(
             llm=self.llm,
             search_provider=self.search_provider,
@@ -117,9 +126,13 @@ class QualityResearchWorkflow:
             max_rounds=3,
             max_concurrent=max_concurrent,
             max_sources=10,
+            agent_memory_service=agent_memory_service,
+            agent_file_service=agent_file_service,
         )
 
-        findings = await coordinator.run(query=state.get("query", ""), seed_tasks=research_topics)
+        # Limit research topics to max_concurrent to prevent too many agents
+        limited_topics = research_topics[:max_concurrent] if research_topics else None
+        findings = await coordinator.run(query=state.get("query", ""), seed_tasks=limited_topics)
 
         logger.info("Agentic deep research completed", findings_count=len(findings))
 
@@ -173,8 +186,18 @@ Create a comprehensive synthesis that:
 
 Keep the synthesis detailed but well-structured (aim for 800-1200 words)."""
 
-            response = await self.compression_llm.ainvoke([HumanMessage(content=prompt)])
-            compressed = response.content if hasattr(response, "content") else str(response)
+            try:
+                # Try structured output first
+                structured_llm = self.compression_llm.with_structured_output(CompressedFindings)
+                response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+                if isinstance(response, CompressedFindings):
+                    compressed = response.compressed_summary
+                else:
+                    compressed = response.content if hasattr(response, "content") else str(response)
+            except Exception:
+                # Fallback to text parsing
+                response = await self.compression_llm.ainvoke([HumanMessage(content=prompt)])
+                compressed = response.content if hasattr(response, "content") else str(response)
 
             logger.info("Findings compressed successfully", compressed_length=len(compressed))
 

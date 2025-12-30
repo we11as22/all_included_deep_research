@@ -118,12 +118,28 @@ async def plan_research_node(
             ]
         )
 
-        # Generate plan
-        chain = prompt | llm | StrOutputParser()
-        plan_text = await chain.ainvoke({})
-
-        # Parse topics from plan
-        topics = _extract_topics_from_plan(plan_text)
+        # Generate plan with structured output
+        try:
+            # Try structured output first
+            structured_llm = llm.with_structured_output(ResearchPlan)
+            plan_obj = await structured_llm.ainvoke(
+                [SystemMessage(content=PLANNING_SYSTEM_PROMPT), HumanMessage(
+                    content=PLANNING_USER_TEMPLATE.format(
+                        query=query,
+                        mode=mode,
+                        chat_history=chat_history,
+                        memory_context=memory_str,
+                    )
+                )]
+            )
+            topics = plan_obj.topics
+            plan_text = f"## Overview\n\n{plan_obj.overview}\n\n## Research Topics\n\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(topics)) + f"\n\n## Rationale\n\n{plan_obj.rationale}"
+        except Exception as e:
+            logger.warning("Structured output failed, falling back to text parsing", error=str(e))
+            # Fallback to text parsing
+            chain = prompt | llm | StrOutputParser()
+            plan_text = await chain.ainvoke({})
+            topics = _extract_topics_from_plan(plan_text)
 
         # Limit topics based on mode
         max_topics = _get_max_topics_for_mode(mode)

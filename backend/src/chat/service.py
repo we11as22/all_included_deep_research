@@ -21,6 +21,8 @@ from src.search.models import ScrapedContent, SearchResult
 from src.search.reranker import SemanticReranker
 from src.search.scraper import WebScraper
 from src.utils.chat_history import format_chat_history
+from src.utils.date import get_current_date
+from src.workflow.agentic.schemas import QueryRewrite, SearchQueries, FollowupQueries, SummarizedContent, SynthesizedAnswer
 
 logger = structlog.get_logger(__name__)
 
@@ -253,18 +255,30 @@ class ChatSearchService:
         if self.settings.llm_mode == "mock":
             return query
 
+        current_date = get_current_date()
         prompt = (
-            "Rewrite the user query into a concise web search query. "
-            "Use the chat history for context if needed. "
-            "Return only the rewritten query."
+            f"Rewrite the user query into a concise web search query. "
+            f"Use the chat history for context if needed. "
+            f"Current date: {current_date} - consider this when rewriting queries about recent events. "
+            f"Return only the rewritten query."
         )
         history_block = chat_history or "Chat history: None."
-        response = await self.chat_llm.ainvoke(
-            [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
-        )
-        text = response.content if hasattr(response, "content") else str(response)
-        rewritten = text.strip().strip('"')
-        return rewritten or query
+        try:
+            # Try structured output first
+            structured_llm = self.chat_llm.with_structured_output(QueryRewrite)
+            response = await structured_llm.ainvoke(
+                [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
+            )
+            if isinstance(response, QueryRewrite):
+                return response.rewritten_query or query
+        except Exception:
+            # Fallback to text parsing
+            response = await self.chat_llm.ainvoke(
+                [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
+            )
+            text = response.content if hasattr(response, "content") else str(response)
+            rewritten = text.strip().strip('"')
+            return rewritten or query
 
     async def _generate_search_queries(
         self,
@@ -282,22 +296,38 @@ class ChatSearchService:
 
         memory_block = self._format_memory(memory_context or [])
         history_block = chat_history or "Chat history: None."
+        current_date = get_current_date()
         prompt = (
-            "Generate concise web search queries for deeper research. "
-            "Use memory context if relevant. "
+            f"Generate concise web search queries for deeper research. "
+            f"Use memory context if relevant. "
+            f"Current date: {current_date} - consider this when generating queries about recent events. "
             f"Return {max_queries} lines, one query per line."
         )
-        response = await self.chat_llm.ainvoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
-            ]
-        )
-        content = response.content if hasattr(response, "content") else str(response)
-        queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
-        if not queries:
-            return [query]
-        return queries[:max_queries]
+        try:
+            # Try structured output first
+            structured_llm = self.chat_llm.with_structured_output(SearchQueries)
+            response = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
+                ]
+            )
+            if isinstance(response, SearchQueries):
+                queries = response.queries[:max_queries]
+                return queries if queries else [query]
+        except Exception:
+            # Fallback to text parsing
+            response = await self.chat_llm.ainvoke(
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
+                ]
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+            queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
+            if not queries:
+                return [query]
+            return queries[:max_queries]
 
     async def _generate_followup_queries(
         self,
@@ -321,24 +351,54 @@ class ChatSearchService:
                 for item in results[:6]
             ]
         )
+        current_date = get_current_date()
         prompt = (
-            "Given the original query and existing search queries, propose 2-3 follow-up queries "
-            "that would fill gaps or validate key claims. Return each query on its own line."
+            f"Given the original query and existing search queries, propose 2-3 follow-up queries "
+            f"that would fill gaps or validate key claims. "
+            f"Current date: {current_date} - consider this when proposing queries about recent events. "
+            f"Return each query on its own line."
         )
-        response = await self.chat_llm.ainvoke(
-            [
-                SystemMessage(content=prompt),
-                HumanMessage(
-                    content=(
-                        f"Query: {query}\nQueries:\n"
-                        + "\n".join(existing_queries)
-                        + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}\n\n{history_block}"
-                    )
-                ),
-            ]
-        )
-        content = response.content if hasattr(response, "content") else str(response)
-        queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
+        try:
+            # Try structured output first
+            structured_llm = self.chat_llm.with_structured_output(FollowupQueries)
+            response = await structured_llm.ainvoke(
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(
+                        content=(
+                            f"Query: {query}\n"
+                            f"Current date: {current_date}\n"
+                            f"Queries:\n"
+                            + "\n".join(existing_queries)
+                            + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}\n\n{history_block}"
+                        )
+                    ),
+                ]
+            )
+            if isinstance(response, FollowupQueries):
+                queries = response.queries
+            else:
+                content = response.content if hasattr(response, "content") else str(response)
+                queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
+        except Exception:
+            # Fallback to text parsing
+            response = await self.chat_llm.ainvoke(
+                [
+                    SystemMessage(content=prompt),
+                    HumanMessage(
+                        content=(
+                            f"Query: {query}\n"
+                            f"Current date: {current_date}\n"
+                            f"Queries:\n"
+                            + "\n".join(existing_queries)
+                            + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}\n\n{history_block}"
+                        )
+                    ),
+                ]
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+            queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
+        
         deduped = []
         for item in queries:
             if item.lower() not in {q.lower() for q in existing_queries}:
@@ -441,10 +501,22 @@ class ChatSearchService:
                 "Summarize the following source for a research assistant. "
                 "Focus on facts relevant to the query. Keep it under 200 words."
             )
-            response = await self.summarizer_llm.ainvoke(
-                [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
-            )
-            summary = response.content if hasattr(response, "content") else str(response)
+            try:
+                # Try structured output first
+                structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent)
+                response = await structured_llm.ainvoke(
+                    [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
+                )
+                if isinstance(response, SummarizedContent):
+                    summary = response.summary
+                else:
+                    summary = response.content if hasattr(response, "content") else str(response)
+            except Exception:
+                # Fallback to text parsing
+                response = await self.summarizer_llm.ainvoke(
+                    [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
+                )
+                summary = response.content if hasattr(response, "content") else str(response)
             if stream:
                 self._emit_status(stream, f"Summarized {content.title}", "summarize")
             return ScrapedContent(
@@ -473,26 +545,42 @@ class ChatSearchService:
         memory_block = self._format_memory(memory_context)
         history_block = chat_history or "Chat history: None."
 
+        current_date = get_current_date()
         system_prompt = (
-            "You are a research assistant. Answer with clear, concise reasoning. "
-            "Use the provided sources and cite them with [number] references. "
-            "If information is missing, say so."
+            f"You are a research assistant. Answer with clear, concise reasoning. "
+            f"Use the provided sources and cite them with [number] references. "
+            f"If information is missing, say so. "
+            f"Current date: {current_date} - always consider this when evaluating information recency and relevance."
         )
         user_prompt = (
             f"User question: {query}\n"
             f"Search query: {search_query}\n"
-            f"Mode: {mode}\n\n"
+            f"Mode: {mode}\n"
+            f"Current date: {current_date}\n\n"
             f"{history_block}\n\n"
             f"{memory_block}\n\n"
             f"Sources:\n{sources_block}\n\n"
             "Answer with citations like [1], [2]."
         )
 
-        response = await self.chat_llm.ainvoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-        )
-        answer = response.content if hasattr(response, "content") else str(response)
-        return answer.strip()
+        try:
+            # Try structured output first
+            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer)
+            response = await structured_llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            if isinstance(response, SynthesizedAnswer):
+                return response.answer.strip()
+            else:
+                answer = response.content if hasattr(response, "content") else str(response)
+                return answer.strip()
+        except Exception:
+            # Fallback to text parsing
+            response = await self.chat_llm.ainvoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            )
+            answer = response.content if hasattr(response, "content") else str(response)
+            return answer.strip()
 
     def _format_sources(self, sources: list[SearchResult], scraped: list[ScrapedContent]) -> str:
         scraped_map = {item.url: item for item in scraped}

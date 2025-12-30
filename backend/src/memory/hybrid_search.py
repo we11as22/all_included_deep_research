@@ -104,23 +104,23 @@ class HybridSearchEngine:
         async with self.db_pool.acquire() as conn:
             # Build filters
             filters = []
-            params = [query_embedding, query, self.rrf_k, limit]
-            param_idx = 5
+            filter_params = []
+            param_idx = 5  # Start after $1-$4 which are: embedding, query, rrf_k, limit
 
             if category_filter:
                 filters.append(f"mf.category = ${param_idx}")
-                params.append(category_filter)
+                filter_params.append(category_filter)
                 param_idx += 1
 
             if tag_filter:
                 for tag in tag_filter:
                     filters.append(f"${param_idx} = ANY(mf.tags)")
-                    params.append(tag)
+                    filter_params.append(tag)
                     param_idx += 1
 
             if file_path:
                 filters.append(f"mf.file_path = ${param_idx}")
-                params.append(file_path)
+                filter_params.append(file_path)
                 param_idx += 1
 
             filter_clause = f"AND {' AND '.join(filters)}" if filters else ""
@@ -143,12 +143,12 @@ class HybridSearchEngine:
                     mc.id, mc.content, mc.header_path, mc.section_level,
                     mf.id as file_id, mf.file_path, mf.title, mf.category,
                     ROW_NUMBER() OVER (
-                        ORDER BY ts_rank(to_tsvector('english', mc.content), websearch_to_tsquery('english', $2)) DESC
+                        ORDER BY ts_rank(to_tsvector('english', mc.content), plainto_tsquery('english', $2)) DESC
                     ) AS rank
                 FROM memory_chunks mc
                 JOIN memory_files mf ON mc.file_id = mf.id
-                WHERE to_tsvector('english', mc.content) @@ websearch_to_tsquery('english', $2) {filter_clause}
-                ORDER BY ts_rank(to_tsvector('english', mc.content), websearch_to_tsquery('english', $2)) DESC
+                WHERE to_tsvector('english', mc.content) @@ plainto_tsquery('english', $2) {filter_clause}
+                ORDER BY ts_rank(to_tsvector('english', mc.content), plainto_tsquery('english', $2)) DESC
                 LIMIT $4
             ),
             combined AS (
@@ -170,7 +170,11 @@ class HybridSearchEngine:
             LIMIT $4;
             """
 
-            rows = await conn.fetch(sql, *params)
+            # Pass parameters explicitly: embedding (vector), query (str), rrf_k (int), limit (int), then filter params
+            # asyncpg requires vector to be passed as list[float], which it will convert to vector type
+            # Build complete params list to avoid issues with *filter_params unpacking
+            all_params = [query_embedding, query, self.rrf_k, limit] + filter_params
+            rows = await conn.fetch(sql, *all_params)
 
             results = [
                 SearchResult(
@@ -204,23 +208,23 @@ class HybridSearchEngine:
 
         async with self.db_pool.acquire() as conn:
             filters = []
-            params = [query_embedding, limit]
-            param_idx = 3
+            filter_params = []
+            param_idx = 3  # Start after $1 (embedding) and $2 (limit)
 
             if category_filter:
                 filters.append(f"mf.category = ${param_idx}")
-                params.append(category_filter)
+                filter_params.append(category_filter)
                 param_idx += 1
 
             if tag_filter:
                 for tag in tag_filter:
                     filters.append(f"${param_idx} = ANY(mf.tags)")
-                    params.append(tag)
+                    filter_params.append(tag)
                     param_idx += 1
 
             if file_path:
                 filters.append(f"mf.file_path = ${param_idx}")
-                params.append(file_path)
+                filter_params.append(file_path)
                 param_idx += 1
 
             filter_clause = f"AND {' AND '.join(filters)}" if filters else ""
@@ -243,7 +247,10 @@ class HybridSearchEngine:
             LIMIT $2;
             """
 
-            rows = await conn.fetch(sql, *params)
+            # Pass parameters explicitly: embedding (vector), limit (int), then filter params
+            # Build complete params list to avoid issues with *filter_params unpacking
+            all_params = [query_embedding, limit] + filter_params
+            rows = await conn.fetch(sql, *all_params)
 
             results = [
                 SearchResult(
@@ -275,23 +282,23 @@ class HybridSearchEngine:
         """Fulltext keyword search."""
         async with self.db_pool.acquire() as conn:
             filters = []
-            params = [query, limit]
-            param_idx = 3
+            filter_params = []
+            param_idx = 3  # Start after $1 (query) and $2 (limit)
 
             if category_filter:
                 filters.append(f"mf.category = ${param_idx}")
-                params.append(category_filter)
+                filter_params.append(category_filter)
                 param_idx += 1
 
             if tag_filter:
                 for tag in tag_filter:
                     filters.append(f"${param_idx} = ANY(mf.tags)")
-                    params.append(tag)
+                    filter_params.append(tag)
                     param_idx += 1
 
             if file_path:
                 filters.append(f"mf.file_path = ${param_idx}")
-                params.append(file_path)
+                filter_params.append(file_path)
                 param_idx += 1
 
             filter_clause = f"AND {' AND '.join(filters)}" if filters else ""
@@ -306,15 +313,18 @@ class HybridSearchEngine:
                 mc.content,
                 mc.header_path,
                 mc.section_level,
-                ts_rank(to_tsvector('english', mc.content), websearch_to_tsquery('english', $1)) AS rank_score
+                ts_rank(to_tsvector('english', mc.content), plainto_tsquery('english', $1)) AS rank_score
             FROM memory_chunks mc
             JOIN memory_files mf ON mc.file_id = mf.id
-            WHERE to_tsvector('english', mc.content) @@ websearch_to_tsquery('english', $1) {filter_clause}
+            WHERE to_tsvector('english', mc.content) @@ plainto_tsquery('english', $1) {filter_clause}
             ORDER BY rank_score DESC
             LIMIT $2;
             """
 
-            rows = await conn.fetch(sql, *params)
+            # Pass parameters explicitly: query (str), limit (int), then filter params
+            # Build complete params list to avoid issues with *filter_params unpacking
+            all_params = [query, limit] + filter_params
+            rows = await conn.fetch(sql, *all_params)
 
             results = [
                 SearchResult(

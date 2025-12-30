@@ -35,9 +35,10 @@ class StreamEventType(str, Enum):
 class StreamingGenerator:
     """Base streaming generator with async queue."""
 
-    def __init__(self):
+    def __init__(self, app_state: dict[str, Any] | None = None):
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._finished = False
+        self.app_state = app_state or {}
 
     def add(self, data: str) -> None:
         """Add data to stream."""
@@ -116,8 +117,8 @@ class OpenAIStreamingGenerator(StreamingGenerator):
 class ResearchStreamingGenerator(StreamingGenerator):
     """Research-specific streaming with structured events."""
 
-    def __init__(self, session_id: str | None = None):
-        super().__init__()
+    def __init__(self, session_id: str | None = None, app_state: dict[str, Any] | None = None):
+        super().__init__(app_state=app_state)
         self.session_id = session_id or f"research_{int(time.time())}"
 
     def _create_event(self, event_type: StreamEventType, data: Any) -> str:

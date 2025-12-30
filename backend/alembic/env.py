@@ -4,7 +4,7 @@ import asyncio
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import pool, text as sa_text
 from sqlalchemy.engine import Connection
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
@@ -41,6 +41,10 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
+    # Create pgvector extension before migrations (outside transaction)
+    connection.execute(sa_text('CREATE EXTENSION IF NOT EXISTS vector'))
+    connection.commit()
+    
     context.configure(connection=connection, target_metadata=target_metadata)
 
     with context.begin_transaction():

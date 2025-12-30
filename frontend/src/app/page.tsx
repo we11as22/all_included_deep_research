@@ -8,10 +8,13 @@ import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { Badge } from '@/components/ui/badge';
-import { ArrowUpRight, Brain, Loader2 } from 'lucide-react';
+import { ArrowUpRight, Brain, Loader2, X } from 'lucide-react';
+import { cancelChat, getChat, addMessage, createChat, type ChatMessage as DBChatMessage, type StreamChatMessage } from '@/lib/api';
 import { cn } from '@/lib/utils';
+import Markdown from 'markdown-to-jsx';
+import { ChatSidebar } from '@/components/ChatSidebar';
 
-type ChatMessage = {
+type LocalChatMessage = {
   id: string;
   role: 'user' | 'assistant';
   content: string;
@@ -33,11 +36,13 @@ const suggestions = [
 export default function HomePage() {
   const initialMode = (process.env.NEXT_PUBLIC_DEFAULT_MODE as ChatMode) || 'search';
   const [mode, setMode] = useState<ChatMode>(initialMode);
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [messages, setMessages] = useState<LocalChatMessage[]>([]);
   const [progressByMessage, setProgressByMessage] = useState<Record<string, ProgressState>>({});
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const messagePayload = useMemo(
@@ -54,9 +59,30 @@ export default function HomePage() {
     if (!input.trim() || isStreaming) return;
 
     setError(null);
-    const userMessage: ChatMessage = { id: makeId(), role: 'user', content: input.trim() };
-    const assistantMessage: ChatMessage = { id: makeId(), role: 'assistant', content: '' };
+    const userMessage: LocalChatMessage = { id: makeId(), role: 'user', content: input.trim() };
+    const assistantMessage: LocalChatMessage = { id: makeId(), role: 'assistant', content: '' };
     const nextMessages = [...messages, userMessage];
+
+    // Create chat if it doesn't exist
+    let chatId = currentChatId;
+    if (!chatId) {
+      try {
+        const newChat = await createChat(input.trim().slice(0, 80) || 'New Chat');
+        chatId = newChat.id;
+        setCurrentChatId(chatId);
+      } catch (err) {
+        console.error('Failed to create chat:', err);
+      }
+    }
+
+    // Save user message to DB if chat exists
+    if (chatId) {
+      try {
+        await addMessage(chatId, 'user', userMessage.content, userMessage.id);
+      } catch (err) {
+        console.error('Failed to save user message:', err);
+      }
+    }
 
     setMessages([...nextMessages, assistantMessage]);
     setProgressByMessage((prev) => ({
@@ -77,11 +103,17 @@ export default function HomePage() {
     setInput('');
     setIsStreaming(true);
 
+    let sessionId: string | null = null;
     try {
       for await (const event of streamChatProgress(
-        [...messagePayload, { role: 'user', content: userMessage.content }],
+        [...messagePayload, { role: 'user' as const, content: userMessage.content }],
         mode
       )) {
+        // Capture session ID from first event
+        if (event.sessionId && !sessionId) {
+          sessionId = event.sessionId;
+          setCurrentSessionId(sessionId);
+        }
         setProgressByMessage((prev) => {
           const existing = prev[assistantMessage.id];
           if (!existing) return prev;
@@ -107,26 +139,47 @@ export default function HomePage() {
               next.topics = event.data.topics || [];
               break;
             case 'source_found':
-              next.sources = [...next.sources, event.data];
+              if (event.data.url || event.data.title) {
+                next.sources = [...next.sources, {
+                  url: event.data.url,
+                  title: event.data.title,
+                  researcher_id: event.data.researcher_id,
+                }];
+              }
               break;
             case 'finding':
-              next.findings = [...next.findings, event.data];
+              if (event.data.topic || event.data.summary) {
+                next.findings = [...next.findings, {
+                  topic: event.data.topic,
+                  summary: event.data.summary,
+                  findings_count: event.data.findings_count,
+                  researcher_id: event.data.researcher_id,
+                }];
+              }
               break;
             case 'agent_todo': {
               const researcherId = event.data.researcher_id || 'agent';
+              const todos = (event.data.todos || []).map((todo: { id?: string; task?: string; title?: string; status: string; note?: string | null; url?: string | null }) => ({
+                title: todo.task || todo.title || 'Task',
+                status: todo.status,
+                note: todo.note || null,
+                url: todo.url || null,
+              }));
               next.agentTodos = {
                 ...next.agentTodos,
-                [researcherId]: event.data.todos || [],
+                [researcherId]: todos,
               };
               break;
             }
             case 'agent_note': {
               const researcherId = event.data.researcher_id || 'agent';
-              const existingNotes = next.agentNotes[researcherId] || [];
-              next.agentNotes = {
-                ...next.agentNotes,
-                [researcherId]: [...existingNotes, event.data.note],
-              };
+              if (event.data.note) {
+                const existingNotes = next.agentNotes[researcherId] || [];
+                next.agentNotes = {
+                  ...next.agentNotes,
+                  [researcherId]: [...existingNotes, event.data.note],
+                };
+              }
               break;
             }
             case 'final_report':
@@ -135,6 +188,14 @@ export default function HomePage() {
             case 'error':
               next.error = event.data.error;
               next.isComplete = true;
+              // Also add error to message content for visibility
+              setMessages((prev) =>
+                prev.map((msg) =>
+                  msg.id === assistantMessage.id
+                    ? { ...msg, content: msg.content + `\n\n❌ **Ошибка:** ${event.data.error}` }
+                    : msg
+                )
+              );
               break;
             case 'done':
               next.isComplete = true;
@@ -155,13 +216,23 @@ export default function HomePage() {
         }
 
         if (event.type === 'final_report') {
+          const finalContent = event.data.report || '';
           setMessages((prev) =>
             prev.map((message) =>
               message.id === assistantMessage.id
-                ? { ...message, content: event.data.report || message.content }
+                ? { ...message, content: finalContent }
                 : message
             )
           );
+          
+          // Save assistant message to DB if chat exists
+          if (currentChatId && finalContent) {
+            try {
+              await addMessage(currentChatId, 'assistant', finalContent, assistantMessage.id);
+            } catch (err) {
+              console.error('Failed to save assistant message:', err);
+            }
+          }
         }
       }
     } catch (err) {
@@ -189,8 +260,39 @@ export default function HomePage() {
     }
   };
 
+  const handleChatSelect = async (chatId: string) => {
+    try {
+      const chatData = await getChat(chatId);
+      setCurrentChatId(chatId);
+      const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
+      setMessages(
+        dbMessages.map((msg) => ({
+          id: msg.message_id,
+          role: msg.role as 'user' | 'assistant',
+          content: msg.content,
+        }))
+      );
+      setProgressByMessage({});
+    } catch (error) {
+      console.error('Failed to load chat:', error);
+    }
+  };
+
+  const handleNewChat = () => {
+    setCurrentChatId(null);
+    setMessages([]);
+    setProgressByMessage({});
+    setInput('');
+  };
+
   return (
-    <main className="relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)]">
+    <div className="flex min-h-screen bg-background">
+      <ChatSidebar
+        currentChatId={currentChatId}
+        onChatSelect={handleChatSelect}
+        onNewChat={handleNewChat}
+      />
+      <main className="flex-1 relative min-h-screen overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)]">
       <div className="pointer-events-none absolute inset-0">
         <div className="absolute inset-0 bg-[linear-gradient(90deg,rgba(15,23,42,0.04)_1px,transparent_1px),linear-gradient(180deg,rgba(15,23,42,0.04)_1px,transparent_1px)] bg-[size:56px_56px] opacity-40" />
         <div className="absolute -top-20 left-10 h-64 w-64 rounded-full bg-amber-100/40 blur-3xl" />
@@ -252,7 +354,7 @@ export default function HomePage() {
             </Card>
           </aside>
 
-          <Card className="flex h-[70vh] flex-col border-border/60 bg-background/85 shadow-lg backdrop-blur">
+          <Card className="flex min-h-[600px] max-h-[85vh] flex-col border-border/60 bg-background/85 shadow-lg backdrop-blur">
             <div className="flex items-center justify-between border-b border-border/60 px-6 py-4">
               <div>
                 <p className="text-xs uppercase tracking-[0.3em] text-muted-foreground">Conversation</p>
@@ -300,15 +402,66 @@ export default function HomePage() {
                       {message.role === 'assistant' && progressByMessage[message.id] && (
                         <ChatProgressPanel progress={progressByMessage[message.id]} />
                       )}
-                      <div className="whitespace-pre-wrap leading-relaxed">{message.content}</div>
+                      <div className="prose prose-sm dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-a:text-primary prose-a:underline prose-ul:my-2 prose-ol:my-2 prose-li:my-1">
+                        <Markdown
+                          options={{
+                            overrides: {
+                              a: {
+                                component: ({ href, children, ...props }) => (
+                                  <a
+                                    href={href}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-primary hover:underline font-medium"
+                                    {...props}
+                                  >
+                                    {children}
+                                  </a>
+                                ),
+                              },
+                              p: {
+                                component: ({ children, ...props }) => (
+                                  <p className="leading-relaxed" {...props}>
+                                    {children}
+                                  </p>
+                                ),
+                              },
+                            },
+                          }}
+                        >
+                          {message.content}
+                        </Markdown>
+                      </div>
                     </div>
                   ))}
                 </div>
               )}
               {isStreaming && (
-                <div className="mt-4 flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Searching and drafting...
+                <div className="mt-4 flex items-center justify-between">
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Searching and drafting...
+                  </div>
+                  {currentSessionId && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={async () => {
+                        if (currentSessionId) {
+                          try {
+                            await cancelChat(currentSessionId);
+                            setIsStreaming(false);
+                            setCurrentSessionId(null);
+                          } catch (err) {
+                            console.error('Failed to cancel:', err);
+                          }
+                        }
+                      }}
+                    >
+                      <X className="h-4 w-4 mr-1" />
+                      Cancel
+                    </Button>
+                  )}
                 </div>
               )}
               {error && (
@@ -340,6 +493,7 @@ export default function HomePage() {
           </Card>
         </div>
       </section>
-    </main>
+      </main>
+    </div>
   );
 }

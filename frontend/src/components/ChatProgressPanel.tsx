@@ -18,14 +18,16 @@ const getAgentAccent = (agentId: string) => {
 };
 
 export type ProgressFinding = {
-  topic: string;
-  summary: string;
+  topic?: string;
+  summary?: string;
   findings_count?: number;
+  researcher_id?: string;
 };
 
 export type ProgressSource = {
-  url: string;
-  title: string;
+  url?: string;
+  title?: string;
+  researcher_id?: string;
 };
 
 export type AgentTodoItem = {
@@ -133,8 +135,8 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
           <div className="mt-2 space-y-2">
             {progress.findings.map((finding, idx) => (
               <div key={idx} className="rounded-lg border border-border/60 bg-white/70 p-2">
-                <div className="font-semibold text-foreground">{finding.topic}</div>
-                <div className="mt-1 line-clamp-2 text-[11px]">{finding.summary}</div>
+                <div className="font-semibold text-foreground">{finding.topic || 'Finding'}</div>
+                <div className="mt-1 line-clamp-2 text-[11px]">{finding.summary || ''}</div>
               </div>
             ))}
           </div>
@@ -146,9 +148,15 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
           <div className="text-xs font-semibold text-foreground">Sources</div>
           <div className="mt-2 space-y-1">
             {progress.sources.slice(0, 6).map((source, idx) => (
-              <div key={idx} className="truncate">
-                {source.title}
-              </div>
+              <a
+                key={idx}
+                href={source.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="block truncate text-xs text-primary hover:underline"
+              >
+                {source.title || source.url || 'Source'}
+              </a>
             ))}
             {progress.sources.length > 6 && (
               <div className="text-[10px]">+{progress.sources.length - 6} more</div>
@@ -177,10 +185,10 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
                     </span>
                   </div>
                   <div className="mt-2 space-y-1">
-                    {todos.slice(0, 3).map((todo) => (
-                      <div key={todo.title} className="flex items-start gap-2 text-[10px]">
-                        <span className={todo.status === 'done' ? 'text-emerald-600' : 'text-muted-foreground'}>
-                          {todo.status === 'done' ? '●' : '○'}
+                    {todos.map((todo, idx) => (
+                      <div key={`${todo.title}-${idx}`} className="flex items-start gap-2 text-[10px]">
+                        <span className={todo.status === 'done' ? 'text-emerald-600' : todo.status === 'in_progress' ? 'text-amber-600' : 'text-muted-foreground'}>
+                          {todo.status === 'done' ? '●' : todo.status === 'in_progress' ? '◐' : '○'}
                         </span>
                         <span className="flex-1">{todo.title}</span>
                       </div>
@@ -201,10 +209,11 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
                                   key={url}
                                   href={url}
                                   target="_blank"
-                                  rel="noreferrer"
-                                  className="max-w-[120px] truncate rounded-full border border-border/60 bg-background px-2 py-0.5 text-[9px] text-foreground/70 hover:text-foreground"
+                                  rel="noopener noreferrer"
+                                  className="max-w-[120px] truncate rounded-full border border-border/60 bg-background px-2 py-0.5 text-[9px] text-primary hover:underline"
+                                  title={url}
                                 >
-                                  source
+                                  {url.replace(/^https?:\/\//, '').replace(/^www\./, '').split('/')[0].slice(0, 15)}
                                 </a>
                               ))}
                             </div>

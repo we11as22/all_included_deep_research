@@ -122,3 +122,67 @@ class ResearchSessionModel(Base):
             "final_report": self.final_report,
             "metadata": self.session_metadata or {},
         }
+
+
+class ChatModel(Base):
+    """Chat conversation model."""
+
+    __tablename__ = "chats"
+
+    id = Column(String(64), primary_key=True)
+    title = Column(String(256), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    chat_metadata = Column("metadata", JSONB, default=dict)
+
+    # Relationships
+    messages = relationship("ChatMessageModel", back_populates="chat", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_chats_created", "created_at"),
+        Index("idx_chats_updated", "updated_at"),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "title": self.title,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "metadata": self.chat_metadata or {},
+        }
+
+
+class ChatMessageModel(Base):
+    """Chat message model."""
+
+    __tablename__ = "chat_messages"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False, index=True)
+    message_id = Column(String(64), nullable=False, index=True)
+    role = Column(String(16), nullable=False)  # user, assistant, system
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    message_metadata = Column("metadata", JSONB, default=dict)
+
+    # Relationships
+    chat = relationship("ChatModel", back_populates="messages")
+
+    __table_args__ = (
+        Index("idx_chat_messages_chat_id", "chat_id"),
+        Index("idx_chat_messages_created", "created_at"),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "chat_id": self.chat_id,
+            "message_id": self.message_id,
+            "role": self.role,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "metadata": self.message_metadata or {},
+        }

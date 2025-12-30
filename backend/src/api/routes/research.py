@@ -29,7 +29,12 @@ async def start_research(research_request: ResearchRequest, app_request: Request
     )
 
     session_id = str(uuid4())
-    stream_generator = ResearchStreamingGenerator(session_id=session_id)
+    # Pass app state to stream generator for agent memory service
+    app_state = {
+        "agent_memory_service": app_request.app.state.agent_memory_service,
+        "agent_file_service": app_request.app.state.agent_file_service,
+    }
+    stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
     async def run_research():
         try:
@@ -64,13 +69,21 @@ async def start_research(research_request: ResearchRequest, app_request: Request
             stream_generator.emit_status("Research completed!", step="done")
             stream_generator.emit_done()
 
+        except asyncio.CancelledError:
+            logger.info("Research task cancelled", session_id=session_id)
+            stream_generator.emit_status("Research cancelled by user", step="cancelled")
+            stream_generator.emit_done()
         except Exception as e:
             logger.error("Research workflow failed", error=str(e), exc_info=True)
             stream_generator.emit_error(error=str(e), details="Workflow execution failed")
             stream_generator.emit_done()
+        finally:
+            # Remove task from active tasks
+            app_request.app.state.active_tasks.pop(session_id, None)
 
-    # Start background task
-    asyncio.create_task(run_research())
+    # Start background task and store it
+    task = asyncio.create_task(run_research())
+    app_request.app.state.active_tasks[session_id] = task
 
     # Return streaming response
     return StreamingResponse(
@@ -95,7 +108,39 @@ def _format_memory_report(query: str, report: str) -> str:
     return f"# {query}\n\n{report}\n"
 
 
+@router.post("/research/{session_id}/cancel")
+async def cancel_research(session_id: str, app_request: Request):
+    """Cancel an active research session."""
+    active_tasks = app_request.app.state.active_tasks
+    
+    if session_id not in active_tasks:
+        raise HTTPException(status_code=404, detail="Research session not found or already completed")
+    
+    task = active_tasks[session_id]
+    if task.done():
+        active_tasks.pop(session_id, None)
+        raise HTTPException(status_code=400, detail="Research session already completed")
+    
+    task.cancel()
+    active_tasks.pop(session_id, None)
+    logger.info("Research session cancelled", session_id=session_id)
+    
+    return {"status": "cancelled", "session_id": session_id}
+
+
 @router.get("/research/{session_id}", response_model=ResearchResponse)
-async def get_research_status(session_id: str):
-    """Get research session status (not implemented yet)."""
-    raise HTTPException(status_code=501, detail="Not implemented yet")
+async def get_research_status(session_id: str, app_request: Request):
+    """Get research session status."""
+    active_tasks = app_request.app.state.active_tasks
+    
+    if session_id not in active_tasks:
+        raise HTTPException(status_code=404, detail="Research session not found")
+    
+    task = active_tasks[session_id]
+    status = "running" if not task.done() else ("completed" if task.exception() is None else "failed")
+    
+    return ResearchResponse(
+        session_id=session_id,
+        status=status,
+        mode="unknown",
+    )

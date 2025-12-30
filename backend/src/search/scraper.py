@@ -46,7 +46,27 @@ class WebScraper:
             async with aiohttp.ClientSession(timeout=self.timeout, headers=self.headers) as session:
                 async with session.get(url) as response:
                     response.raise_for_status()
-                    html = await response.text()
+                    
+                    # Check if it's a PDF file
+                    content_type = response.headers.get("Content-Type", "").lower()
+                    if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+                        return await self._scrape_pdf(url, response)
+                    
+                    # Try to read as text, but handle encoding errors
+                    try:
+                        html = await response.text()
+                    except UnicodeDecodeError as e:
+                        # If text decoding fails, log and return empty content
+                        logger.warning("Failed to decode response as text", url=url, error=str(e))
+                        return ScrapedContent(
+                            url=url,
+                            title="Unable to decode content",
+                            content="",
+                            markdown=None,
+                            html=None,
+                            images=[],
+                            links=[],
+                        )
 
             soup = BeautifulSoup(html, "html.parser")
 
@@ -197,6 +217,80 @@ class WebScraper:
         text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
 
         return text.strip()
+
+    async def _scrape_pdf(self, url: str, response: aiohttp.ClientResponse) -> ScrapedContent:
+        """
+        Scrape PDF file content.
+        
+        Args:
+            url: PDF URL
+            response: HTTP response
+            
+        Returns:
+            ScrapedContent with PDF text
+        """
+        try:
+            # Read PDF as bytes
+            pdf_bytes = await response.read()
+            
+            # Try to extract text from PDF using PyPDF2 or pypdf
+            try:
+                import io
+                try:
+                    from PyPDF2 import PdfReader
+                except ImportError:
+                    try:
+                        from pypdf import PdfReader
+                    except ImportError:
+                        logger.warning("PDF libraries not available, skipping PDF extraction", url=url)
+                        return ScrapedContent(
+                            url=url,
+                            title=url.split("/")[-1],
+                            content="[PDF file - text extraction not available]",
+                            markdown=None,
+                            html=None,
+                            images=[],
+                            links=[],
+                        )
+                
+                pdf_file = io.BytesIO(pdf_bytes)
+                reader = PdfReader(pdf_file)
+                
+                # Extract text from all pages
+                text_content = ""
+                for page in reader.pages:
+                    text_content += page.extract_text() + "\n"
+                
+                # Extract title from first page or filename
+                title = url.split("/")[-1].replace(".pdf", "")
+                if reader.metadata and reader.metadata.title:
+                    title = reader.metadata.title
+                
+                logger.info("PDF scraping completed", url=url, pages=len(reader.pages), content_length=len(text_content))
+                
+                return ScrapedContent(
+                    url=url,
+                    title=title,
+                    content=text_content.strip(),
+                    markdown=None,
+                    html=None,
+                    images=[],
+                    links=[],
+                )
+            except Exception as e:
+                logger.warning("PDF text extraction failed", url=url, error=str(e))
+                return ScrapedContent(
+                    url=url,
+                    title=url.split("/")[-1],
+                    content="[PDF file - text extraction failed]",
+                    markdown=None,
+                    html=None,
+                    images=[],
+                    links=[],
+                )
+        except Exception as e:
+            logger.error("PDF scraping failed", url=url, error=str(e))
+            raise
 
 
 class ChunkedScraper(WebScraper):

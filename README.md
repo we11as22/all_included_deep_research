@@ -16,14 +16,14 @@ Comprehensive deep research system with memory integration, combining the best p
 - **Hybrid Search**: RRF (Reciprocal Rank Fusion) combining vector and fulltext search
 - **Smart Chunking**: Markdown-aware chunking with header context preservation
 - **Auto-sync**: Automatic synchronization between files and database
-  - Memory files live at `/home/asudakov/projects/memory_files` by default
+  - Memory files location configurable via `MEMORY_DIR` (default: `/home/asudakov/projects/memory_files`)
 - **Chat Context**: Agents receive the last N chat messages (`CHAT_HISTORY_LIMIT`)
 
 ### ⚙️ Flexible Configuration
 
 - **Search Providers**: Tavily or SearXNG (self-hosted)
 - **Embedding Providers**: OpenAI, Ollama (local), Cohere, or HuggingFace
-- **LLM Models**: OpenAI GPT-4, Anthropic Claude, and others
+- **LLM Models**: OpenAI GPT-4, Anthropic Claude, OpenRouter, and any OpenAI-compatible API
 - **Fully Configurable**: All settings via `.env` files
 
 ### 🛠 Modern Tech Stack
@@ -46,7 +46,7 @@ Comprehensive deep research system with memory integration, combining the best p
 
 ```bash
 # 1. Navigate to project directory
-cd /home/asudakov/projects/all_included_search/all_included_deep_research
+cd /root/asudakov/projects/all_included_deep_research
 
 # 2. Configure backend environment
 cd backend
@@ -77,6 +77,8 @@ docker compose down
 ```
 
 **First-time setup takes 2-3 minutes** while Docker builds images and initializes the database.
+
+**Note**: The Docker build process has been optimized - source code is now copied before package installation to ensure proper package setup.
 
 ### Option 2: Manual Setup (Development)
 
@@ -205,12 +207,43 @@ OPENAI_API_KEY=sk-your-openai-api-key
 TAVILY_API_KEY=tvly-your-tavily-api-key
 ```
 
+### OpenAI-Compatible APIs (OpenRouter, 302.AI, etc.)
+
+You can use any OpenAI-compatible API by setting the base URL:
+
+```bash
+# Use OpenRouter instead of OpenAI
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_API_KEY=sk-or-v1-your-openrouter-key
+
+# Optional: Custom headers for OpenRouter
+OPENAI_API_HTTP_REFERER=https://github.com/your-org/your-repo
+OPENAI_API_X_TITLE=Your App Name
+
+# Use any other OpenAI-compatible API
+OPENAI_BASE_URL=https://api.302.ai/v1
+OPENAI_API_KEY=your-api-key
+```
+
+**Note**: For OpenRouter, default headers are automatically added if not specified. For other APIs, you may need to set custom headers if required.
+
 ### Optional Settings
 
 ```bash
 # Use Anthropic Claude instead of GPT
 ANTHROPIC_API_KEY=sk-ant-your-key
 RESEARCH_MODEL=anthropic:claude-3-5-sonnet-20241022
+
+# Use OpenRouter or other OpenAI-compatible APIs
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_API_KEY=sk-or-v1-your-key
+# Configure models to use OpenRouter models:
+CHAT_MODEL=openai:gpt-4o-mini
+RESEARCH_MODEL=openai:gpt-4o
+# Or use other models available on OpenRouter:
+# RESEARCH_MODEL=openai:qwen/qwen-2.5-72b-instruct
+# RESEARCH_MODEL=openai:anthropic/claude-3.5-sonnet
+# See https://openrouter.ai/models for all available models
 
 # Use local Ollama for embeddings (free!)
 # Start the container with: docker compose --profile local-embeddings up -d
@@ -336,7 +369,7 @@ User Query → Memory Search → Research Planning
 
 ### Memory System
 
-1. **Markdown Files**: Human-readable research notes in `/home/asudakov/projects/memory_files/`
+1. **Markdown Files**: Human-readable research notes (location configurable via `MEMORY_DIR`)
 2. **Vector Database**: PostgreSQL + pgvector for semantic search
 3. **Hybrid Search**: Combines vector similarity + fulltext search with RRF
 4. **Auto-sync**: Changes to files automatically update the database

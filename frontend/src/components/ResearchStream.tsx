@@ -62,8 +62,8 @@ export function ResearchStream({ query, mode, onComplete, onError }: ResearchStr
                 break;
 
               case 'status':
-                newState.status = event.data.message;
-                newState.step = event.data.step;
+                newState.status = event.data.message || newState.status;
+                newState.step = event.data.step || newState.step;
                 break;
 
               case 'memory_search':
@@ -223,8 +223,8 @@ export function ResearchStream({ query, mode, onComplete, onError }: ResearchStr
             <div className="space-y-4">
               {state.findings.map((finding, idx) => (
                 <div key={idx} className="border-l-2 border-primary pl-4">
-                  <h4 className="font-medium text-sm mb-1">{finding.topic}</h4>
-                  <p className="text-sm text-muted-foreground">{finding.summary}</p>
+                  <h4 className="font-medium text-sm mb-1">{finding.topic || 'Finding'}</h4>
+                  <p className="text-sm text-muted-foreground">{finding.summary || ''}</p>
                   <div className="mt-2">
                     <Badge variant="secondary" className="text-xs">
                       {finding.findings_count} key findings
@@ -250,14 +250,18 @@ export function ResearchStream({ query, mode, onComplete, onError }: ResearchStr
             <div className="space-y-2">
               {state.sources.slice(0, 10).map((source, idx) => (
                 <div key={idx} className="text-sm">
-                  <a
-                    href={source.url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-primary hover:underline"
-                  >
-                    {source.title}
-                  </a>
+                  {source.url ? (
+                    <a
+                      href={source.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-primary hover:underline"
+                    >
+                      {source.title || source.url || 'Source'}
+                    </a>
+                  ) : (
+                    <span>{source.title || 'Source'}</span>
+                  )}
                 </div>
               ))}
               {state.sources.length > 10 && (

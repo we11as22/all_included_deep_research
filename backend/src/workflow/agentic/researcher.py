@@ -12,26 +12,39 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.agentic.models import AgentMemory, SharedResearchMemory
+from src.workflow.agentic.schemas import AgentAction
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.utils.chat_history import format_chat_history
+from src.utils.date import get_current_date
 from src.workflow.state import ResearchFinding, SourceReference
+from src.memory.agent_memory_service import AgentMemoryService
+from src.memory.agent_file_service import AgentFileService
 
 logger = structlog.get_logger(__name__)
 
 
-AGENTIC_SYSTEM_PROMPT = """You are a research agent with tools and a personal todo list.
+def get_agentic_system_prompt() -> str:
+    """Get agentic system prompt with current date."""
+    current_date = get_current_date()
+    return f"""You are a research agent with tools and a personal todo list.
+
+Current date: {current_date}
 
 You must respond with a single JSON object:
-{"action": "<tool_name or finish>", "args": {...}}
+{{"action": "<tool_name or finish>", "args": {{...}}}}
 
 Allowed actions:
-- web_search: {"queries": ["..."], "max_results": 5}
-- scrape_urls: {"urls": ["..."]}
-- write_note: {"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true}
-- add_todo: {"items": [{"title": "...", "note": "...", "url": "..."}, "..."]}
-- complete_todo: {"titles": ["..."]}
-- read_shared_notes: {"keyword": "...", "limit": 5}
-- finish: {}
+- web_search: {{"queries": ["..."], "max_results": 5}}
+- scrape_urls: {{"urls": ["..."]}}
+- write_note: {{"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true}}
+- update_note: {{"file_path": "...", "summary": "...", "urls": ["..."]}}
+- read_note: {{"file_path": "items/..."}}
+- add_todo: {{"items": [{{"title": "...", "note": "...", "url": "..."}}, "..."]}}
+- update_todo: {{"title": "...", "status": "pending|in_progress|done", "note": "..."}}
+- complete_todo: {{"titles": ["..."]}}
+- read_shared_notes: {{"keyword": "...", "limit": 5}}
+- read_agent_file: {{"agent_id": "..."}}
+- finish: {{}}
 
 Rules:
 - Prefer web_search first if you need sources.
@@ -39,6 +52,7 @@ Rules:
 - Write notes for anything worth reusing later, include URLs.
 - Share only high-signal notes.
 - When the todo list is mostly done and you have enough evidence, use finish.
+- Always consider the current date ({current_date}) when evaluating information recency and relevance.
 """
 
 
@@ -64,8 +78,18 @@ class AgenticResearcher:
         stream: Any | None = None,
         max_steps: int = 6,
         max_sources: int = 8,
+        agent_memory_service: AgentMemoryService | None = None,
+        agent_file_service: AgentFileService | None = None,
     ) -> None:
-        self.llm = llm
+        # Apply structured output to LLM
+        if not hasattr(llm, "_structured_output") or llm._structured_output is None:
+            try:
+                self.llm = llm.with_structured_output(AgentAction)
+            except Exception:
+                # Fallback if structured output not supported
+                self.llm = llm
+        else:
+            self.llm = llm
         self.search_provider = search_provider
         self.web_scraper = web_scraper
         self.shared_memory = shared_memory
@@ -75,6 +99,8 @@ class AgenticResearcher:
         self.max_steps = max_steps
         self.max_sources = max_sources
         self.agent_memory = AgentMemory()
+        self.agent_memory_service = agent_memory_service
+        self.agent_file_service = agent_file_service
         self.sources: list[SourceReference] = []
         self.current_topic: str | None = None
 
@@ -84,11 +110,35 @@ class AgenticResearcher:
         topic: str,
         existing_findings: list[ResearchFinding],
         assignment: str | None = None,
+        character: str | None = None,
+        preferences: str | None = None,
     ) -> AgenticResearchResult:
         self.current_topic = topic
+        
+        # Load or create agent's personal file
+        if self.agent_file_service:
+            agent_file = await self.agent_file_service.read_agent_file(agent_id)
+            # Use character/preferences from file or provided
+            if character:
+                await self.agent_file_service.write_agent_file(agent_id, character=character)
+            if preferences:
+                await self.agent_file_service.write_agent_file(agent_id, preferences=preferences)
+            # Load todos from file if they exist
+            file_todos = agent_file.get("todos", [])
+            if file_todos:
+                self.agent_memory.todos = file_todos
+        
         if assignment:
             self._seed_assignment(agent_id, assignment)
-        self._seed_todos(topic)
+        
+        # Only seed todos if agent file is empty
+        if not self.agent_memory.todos:
+            self._seed_todos(topic)
+        
+        # Save initial todos to agent file
+        if self.agent_file_service and self.agent_memory.todos:
+            await self.agent_file_service.write_agent_file(agent_id, todos=self.agent_memory.todos)
+        
         last_tool_result = "None"
 
         if self.stream:
@@ -122,17 +172,34 @@ class AgenticResearcher:
             )
 
         for step in range(self.max_steps):
-            prompt = self._build_prompt(
+            prompt = await self._build_prompt(
                 agent_id=agent_id,
                 topic=topic,
                 existing_findings=existing_findings,
                 last_tool_result=last_tool_result,
             )
-            response = await self.llm.ainvoke(
-                [SystemMessage(content=AGENTIC_SYSTEM_PROMPT), HumanMessage(content=prompt)]
-            )
-            content = response.content if hasattr(response, "content") else str(response)
-            action, args = self._parse_action(content)
+            
+            # Use structured output
+            try:
+                response = await self.llm.ainvoke(
+                    [SystemMessage(content=get_agentic_system_prompt()), HumanMessage(content=prompt)]
+                )
+                # If structured output is applied, response is already AgentAction
+                if isinstance(response, AgentAction):
+                    action = response.action
+                    args = response.args
+                else:
+                    # Fallback to parsing
+                    content = response.content if hasattr(response, "content") else str(response)
+                    action, args = self._parse_action(content)
+            except Exception as e:
+                logger.warning("Structured output failed, falling back to parsing", error=str(e))
+                response = await self.llm.ainvoke(
+                    [SystemMessage(content=get_agentic_system_prompt()), HumanMessage(content=prompt)]
+                )
+                content = response.content if hasattr(response, "content") else str(response)
+                action, args = self._parse_action(content)
+            
             if action == "finish":
                 break
 
@@ -165,7 +232,7 @@ class AgenticResearcher:
         self.agent_memory.add_todo("Extract key facts and evidence")
         self.agent_memory.add_todo("Check for gaps or conflicting claims")
 
-    def _build_prompt(
+    async def _build_prompt(
         self,
         agent_id: str,
         topic: str,
@@ -178,9 +245,51 @@ class AgenticResearcher:
         todo_block = self.agent_memory.render_todos(limit=8)
         notes_block = self.agent_memory.render_notes(limit=6)
         findings_block = _format_findings(existing_findings)
+        current_date = get_current_date()
+
+        # Load persistent memory files for agent context
+        persistent_memory_block = ""
+        if self.agent_memory_service:
+            try:
+                main_content = await self.agent_memory_service.read_main_file()
+                items = await self.agent_memory_service.list_items()
+                persistent_memory_block = "\n\n## Persistent Agent Memory Files\n\n"
+                
+                # Extract project status section if it exists
+                if "## Project Status" in main_content:
+                    status_start = main_content.find("## Project Status")
+                    status_end = main_content.find("\n## ", status_start + len("## Project Status"))
+                    if status_end == -1:
+                        status_section = main_content[status_start:]
+                    else:
+                        status_section = main_content[status_start:status_end]
+                    persistent_memory_block += f"### Current Project Status:\n{status_section}\n\n"
+                
+                persistent_memory_block += f"### Main Index (summary):\n{main_content[:800]}...\n\n"
+                if items:
+                    persistent_memory_block += f"### Available Items ({len(items)} total, showing last 8):\n"
+                    for item in items[-8:]:
+                        persistent_memory_block += f"- **{item['title']}** ({item['file_path']}): {item['summary'][:100]}...\n"
+                persistent_memory_block += "\nYou can reference these items and add new ones using write_note action.\n"
+            except Exception as e:
+                logger.warning("Failed to load persistent memory files", error=str(e), agent_id=agent_id)
+        
+        # Load agent's personal file
+        agent_file_block = ""
+        if self.agent_file_service:
+            try:
+                agent_file = await self.agent_file_service.read_agent_file(agent_id)
+                agent_file_block = "\n\n## Your Personal Agent File\n\n"
+                if agent_file.get("character"):
+                    agent_file_block += f"**Character:** {agent_file['character'][:200]}\n\n"
+                if agent_file.get("preferences"):
+                    agent_file_block += f"**Preferences:** {agent_file['preferences'][:200]}\n\n"
+            except Exception as e:
+                logger.warning("Failed to load agent file", error=str(e), agent_id=agent_id)
 
         return f"""Agent: {agent_id}
 Research topic: {topic}
+Current date: {current_date}
 
 {chat_block}
 
@@ -189,7 +298,8 @@ Memory context:
 
 Shared notes:
 {shared_notes}
-
+{persistent_memory_block}
+{agent_file_block}
 Your todo list:
 {todo_block}
 
@@ -210,13 +320,21 @@ Choose the next action (JSON only)."""
         if action == "scrape_urls":
             return await self._tool_scrape_urls(args)
         if action == "write_note":
-            return self._tool_write_note(args, agent_id)
+            return await self._tool_write_note(args, agent_id)
         if action == "add_todo":
             return self._tool_add_todo(args, agent_id)
         if action == "complete_todo":
             return self._tool_complete_todo(args, agent_id)
         if action == "read_shared_notes":
             return self._tool_read_shared_notes(args)
+        if action == "read_note":
+            return await self._tool_read_note(args)
+        if action == "update_note":
+            return await self._tool_update_note(args, agent_id)
+        if action == "update_todo":
+            return await self._tool_update_todo(args, agent_id)
+        if action == "read_agent_file":
+            return await self._tool_read_agent_file(args)
 
         return "Unknown action."
 
@@ -270,7 +388,7 @@ Choose the next action (JSON only)."""
 
         return "Scraped content: " + " | ".join(snippets)
 
-    def _tool_write_note(self, args: dict[str, Any], agent_id: str) -> str:
+    async def _tool_write_note(self, args: dict[str, Any], agent_id: str) -> str:
         title = str(args.get("title") or "Note")
         summary = str(args.get("summary") or "")
         urls = args.get("urls") or []
@@ -280,6 +398,14 @@ Choose the next action (JSON only)."""
         note = self.agent_memory.add_note(title=title, summary=summary, urls=urls, tags=tags)
         if share:
             self.shared_memory.add_note(note)
+
+        # Save to persistent memory if service is available
+        if self.agent_memory_service:
+            try:
+                file_path = await self.agent_memory_service.save_agent_note(note, agent_id)
+                logger.info("Agent note saved to file", file_path=file_path, agent_id=agent_id)
+            except Exception as e:
+                logger.warning("Failed to save agent note to file", error=str(e), agent_id=agent_id)
 
         if self.stream:
             self.stream.emit_agent_note(
@@ -338,6 +464,140 @@ Choose the next action (JSON only)."""
         return "\n".join(
             [f"- {note.title}: {note.summary} (urls: {', '.join(note.urls[:2])})" for note in matches[:limit]]
         )
+
+    async def _tool_read_note(self, args: dict[str, Any]) -> str:
+        """Read a specific note file."""
+        file_path = str(args.get("file_path") or "")
+        if not file_path:
+            return "No file_path provided."
+        
+        if not self.agent_memory_service:
+            return "Memory service not available."
+        
+        try:
+            content = await self.agent_memory_service.file_manager.read_file(file_path)
+            # Extract summary for quick reference
+            summary = self.agent_memory_service._extract_summary_from_content(content)
+            return f"Note content:\n\n{content}\n\nSummary: {summary}"
+        except FileNotFoundError:
+            return f"Note file not found: {file_path}"
+        except Exception as e:
+            logger.warning("Failed to read note", file_path=file_path, error=str(e))
+            return f"Failed to read note: {str(e)}"
+
+    async def _tool_update_note(self, args: dict[str, Any], agent_id: str) -> str:
+        """Update own note (only if created by this agent)."""
+        file_path = str(args.get("file_path") or "")
+        if not file_path:
+            return "No file_path provided."
+        
+        if not self.agent_memory_service:
+            return "Memory service not available."
+        
+        try:
+            content = await self.agent_memory_service.file_manager.read_file(file_path)
+            # Check if note was created by this agent
+            created_by = self.agent_memory_service._extract_agent_from_content(content)
+            if created_by != agent_id:
+                return f"Cannot update note: created by {created_by}, not {agent_id}"
+            
+            # Update content
+            summary = str(args.get("summary") or "")
+            urls = args.get("urls") or []
+            
+            # Update summary section
+            if summary:
+                if "## Summary" in content:
+                    parts = content.split("## Summary", 1)
+                    next_section = parts[1].find("\n## ")
+                    if next_section != -1:
+                        content = parts[0] + "## Summary\n\n" + summary + "\n" + parts[1][next_section:]
+                    else:
+                        content = parts[0] + "## Summary\n\n" + summary + "\n"
+                else:
+                    content += f"\n\n## Summary\n\n{summary}\n"
+            
+            # Update URLs
+            if urls:
+                if "## Sources" in content:
+                    parts = content.split("## Sources", 1)
+                    next_section = parts[1].find("\n## ")
+                    if next_section != -1:
+                        sources_section = "## Sources\n\n" + "\n".join([f"- {url}" for url in urls]) + "\n"
+                        content = parts[0] + sources_section + parts[1][next_section:]
+                    else:
+                        content = parts[0] + "## Sources\n\n" + "\n".join([f"- {url}" for url in urls]) + "\n"
+                else:
+                    content += f"\n\n## Sources\n\n" + "\n".join([f"- {url}" for url in urls]) + "\n"
+            
+            await self.agent_memory_service.file_manager.write_file(file_path, content)
+            return f"Note updated: {file_path}"
+        except Exception as e:
+            logger.warning("Failed to update note", file_path=file_path, error=str(e))
+            return f"Failed to update note: {str(e)}"
+
+    async def _tool_update_todo(self, args: dict[str, Any], agent_id: str) -> str:
+        """Update own todo item."""
+        title = str(args.get("title") or "")
+        if not title:
+            return "No title provided."
+        
+        status = args.get("status")
+        note = args.get("note")
+        
+        # Update in-memory todo
+        updated = False
+        for todo in self.agent_memory.todos:
+            if todo.title == title:
+                if status:
+                    todo.status = status
+                if note is not None:
+                    todo.note = note
+                updated = True
+                break
+        
+        # Update in agent file
+        if self.agent_file_service:
+            await self.agent_file_service.update_agent_todo(agent_id, title, status, note)
+        
+        if self.stream:
+            self.stream.emit_agent_todo(agent_id, self._todo_payload())
+        
+        if updated:
+            return f"Todo updated: {title}"
+        return f"Todo not found: {title}"
+
+    async def _tool_read_agent_file(self, args: dict[str, Any]) -> str:
+        """Read agent's personal file."""
+        target_agent_id = str(args.get("agent_id") or "")
+        if not target_agent_id:
+            return "No agent_id provided."
+        
+        if not self.agent_file_service:
+            return "Agent file service not available."
+        
+        try:
+            agent_file = await self.agent_file_service.read_agent_file(target_agent_id)
+            todos = agent_file.get("todos", [])
+            notes = agent_file.get("notes", [])
+            character = agent_file.get("character", "")
+            preferences = agent_file.get("preferences", "")
+            
+            result = f"Agent file for {target_agent_id}:\n\n"
+            if character:
+                result += f"Character: {character}\n\n"
+            if preferences:
+                result += f"Preferences: {preferences}\n\n"
+            result += "Todo List:\n"
+            for todo in todos:
+                result += f"- [{todo.status}] {todo.title}\n"
+            result += "\nNotes:\n"
+            for note in notes:
+                result += f"- {note}\n"
+            return result
+        except Exception as e:
+            logger.warning("Failed to read agent file", agent_id=target_agent_id, error=str(e))
+            return f"Failed to read agent file: {str(e)}"
 
     def _synthesize_finding(self, agent_id: str, topic: str) -> ResearchFinding:
         notes = self.agent_memory.notes[-5:]

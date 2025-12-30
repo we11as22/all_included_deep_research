@@ -1,5 +1,6 @@
 """FastAPI application initialization and configuration."""
 
+import asyncio
 from contextlib import asynccontextmanager
 
 import structlog
@@ -18,6 +19,7 @@ from src.workflow.factory import WorkflowFactory
 from src.api.routes import (
     chat_router,
     chat_stream_router,
+    chats_router,
     config_router,
     health_router,
     memory_router,
@@ -74,6 +76,15 @@ async def lifespan(app: FastAPI):
     )
     app.state.memory_manager = memory_manager
 
+    # Initialize agent memory service for persistent agent notes
+    logger.info("Initializing agent memory service...")
+    from src.memory.agent_memory_service import AgentMemoryService
+    from src.memory.agent_file_service import AgentFileService
+    agent_memory_service = AgentMemoryService(file_manager=memory_manager.file_manager)
+    agent_file_service = AgentFileService(file_manager=memory_manager.file_manager)
+    app.state.agent_memory_service = agent_memory_service
+    app.state.agent_file_service = agent_file_service
+
     # Initialize workflow factory
     logger.info("Initializing workflow factory...")
     workflow_factory = WorkflowFactory(
@@ -91,6 +102,9 @@ async def lifespan(app: FastAPI):
     )
     app.state.chat_service = chat_service
     app.state.settings = settings
+    
+    # Initialize active tasks storage for cancellation
+    app.state.active_tasks: dict[str, asyncio.Task] = {}
 
     logger.info(
         "All-Included Deep Research API started successfully",
@@ -134,6 +148,7 @@ def create_app() -> FastAPI:
     app.include_router(health_router)
     app.include_router(chat_router)
     app.include_router(chat_stream_router)
+    app.include_router(chats_router)
     app.include_router(research_router)
     app.include_router(memory_router)
     app.include_router(config_router)

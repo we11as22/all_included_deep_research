@@ -12,16 +12,16 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
     curl \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 
-# Copy requirements
+# Copy requirements and source code for package installation
 COPY pyproject.toml ./
+COPY src ./src
 
 # Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -e . && \
     pip install --no-cache-dir -e .[huggingface]
 
-# Copy application code
-COPY src ./src
+# Copy application code (alembic)
 COPY alembic.ini ./
 COPY alembic ./alembic
 

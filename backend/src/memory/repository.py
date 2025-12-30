@@ -52,7 +52,20 @@ class MemoryRepository:
 
         logger.info("Memory file created", file_id=db_file.id, file_path=file_create.file_path)
 
-        return MemoryFile.model_validate(db_file)
+        # Ensure metadata is a dict, not MetaData object
+        file_dict = {
+            "id": db_file.id,
+            "file_path": db_file.file_path,
+            "title": db_file.title,
+            "category": db_file.category,
+            "tags": db_file.tags or [],
+            "metadata": dict(db_file.file_metadata) if db_file.file_metadata else {},
+            "created_at": db_file.created_at,
+            "updated_at": db_file.updated_at,
+            "file_hash": db_file.file_hash,
+            "word_count": db_file.word_count,
+        }
+        return MemoryFile.model_validate(file_dict)
 
     async def get_file_by_id(self, file_id: int) -> MemoryFile | None:
         """Get memory file by ID."""
@@ -60,7 +73,20 @@ class MemoryRepository:
         db_file = result.scalar_one_or_none()
 
         if db_file:
-            return MemoryFile.model_validate(db_file)
+            # Ensure metadata is a dict, not MetaData object
+            file_dict = {
+                "id": db_file.id,
+                "file_path": db_file.file_path,
+                "title": db_file.title,
+                "category": db_file.category,
+                "tags": db_file.tags or [],
+                "metadata": dict(db_file.file_metadata) if db_file.file_metadata else {},
+                "created_at": db_file.created_at,
+                "updated_at": db_file.updated_at,
+                "file_hash": db_file.file_hash,
+                "word_count": db_file.word_count,
+            }
+            return MemoryFile.model_validate(file_dict)
         return None
 
     async def get_file_by_path(self, file_path: str) -> MemoryFile | None:
@@ -69,7 +95,20 @@ class MemoryRepository:
         db_file = result.scalar_one_or_none()
 
         if db_file:
-            return MemoryFile.model_validate(db_file)
+            # Ensure metadata is a dict, not MetaData object
+            file_dict = {
+                "id": db_file.id,
+                "file_path": db_file.file_path,
+                "title": db_file.title,
+                "category": db_file.category,
+                "tags": db_file.tags or [],
+                "metadata": dict(db_file.file_metadata) if db_file.file_metadata else {},
+                "created_at": db_file.created_at,
+                "updated_at": db_file.updated_at,
+                "file_hash": db_file.file_hash,
+                "word_count": db_file.word_count,
+            }
+            return MemoryFile.model_validate(file_dict)
         return None
 
     async def update_file(self, file_id: int, file_update: MemoryFileUpdate) -> MemoryFile | None:
@@ -85,7 +124,20 @@ class MemoryRepository:
 
         if db_file:
             logger.info("Memory file updated", file_id=file_id)
-            return MemoryFile.model_validate(db_file)
+            # Ensure metadata is a dict, not MetaData object
+            file_dict = {
+                "id": db_file.id,
+                "file_path": db_file.file_path,
+                "title": db_file.title,
+                "category": db_file.category,
+                "tags": db_file.tags or [],
+                "metadata": dict(db_file.file_metadata) if db_file.file_metadata else {},
+                "created_at": db_file.created_at,
+                "updated_at": db_file.updated_at,
+                "file_hash": db_file.file_hash,
+                "word_count": db_file.word_count,
+            }
+            return MemoryFile.model_validate(file_dict)
         return None
 
     async def delete_file(self, file_id: int) -> bool:
@@ -120,7 +172,23 @@ class MemoryRepository:
         result = await self.session.execute(query)
         db_files = result.scalars().all()
 
-        return [MemoryFile.model_validate(f) for f in db_files]
+        # Ensure metadata is a dict for each file
+        files = []
+        for db_file in db_files:
+            file_dict = {
+                "id": db_file.id,
+                "file_path": db_file.file_path,
+                "title": db_file.title,
+                "category": db_file.category,
+                "tags": db_file.tags or [],
+                "metadata": dict(db_file.file_metadata) if db_file.file_metadata else {},
+                "created_at": db_file.created_at,
+                "updated_at": db_file.updated_at,
+                "file_hash": db_file.file_hash,
+                "word_count": db_file.word_count,
+            }
+            files.append(MemoryFile.model_validate(file_dict))
+        return files
 
     async def insert_chunks(self, chunks: list[ChunkCreate]) -> list[int]:
         """Insert multiple chunks."""

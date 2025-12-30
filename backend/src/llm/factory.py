@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from typing import Optional, Type
+
 import structlog
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from src.config.settings import Settings
 from src.llm.mock import MockChatModel
@@ -18,6 +21,7 @@ def create_chat_model(
     settings: Settings,
     max_tokens: int,
     temperature: float = 0.7,
+    structured_output: Optional[Type[BaseModel]] = None,
 ) -> BaseChatModel:
     """Create a chat model from provider:model string."""
     if settings.llm_mode == "mock" or model_str.startswith("mock"):
@@ -31,8 +35,8 @@ def create_chat_model(
         model_name = model_str
 
     if provider == "openai":
-        if not settings.openai_api_key:
-            raise ValueError("OpenAI API key not configured")
+        if not settings.openai_api_key or not settings.openai_api_key.strip():
+            raise ValueError("OpenAI API key not configured. Please set OPENAI_API_KEY in backend/.env file")
 
         llm_kwargs = {
             "model": model_name,
@@ -41,27 +45,65 @@ def create_chat_model(
             "temperature": temperature,
         }
 
+        # Support for any OpenAI-compatible API (OpenRouter, 302.AI, etc.)
         if settings.openai_base_url:
             llm_kwargs["base_url"] = settings.openai_base_url
-            if "openrouter.ai" in settings.openai_base_url:
-                llm_kwargs["default_headers"] = {
-                    "HTTP-Referer": "https://github.com/all-included-deep-research",
-                    "X-Title": "All-Included Deep Research",
-                }
+            
+            # Build headers for OpenAI-compatible APIs
+            headers = {}
+            
+            # Use explicit header settings if provided
+            if settings.openai_api_http_referer:
+                headers["HTTP-Referer"] = settings.openai_api_http_referer
+            elif "openrouter.ai" in settings.openai_base_url:
+                # Default headers for OpenRouter if not explicitly set
+                headers["HTTP-Referer"] = "https://github.com/all-included-deep-research"
+            
+            if settings.openai_api_x_title:
+                headers["X-Title"] = settings.openai_api_x_title
+            elif "openrouter.ai" in settings.openai_base_url:
+                # Default headers for OpenRouter if not explicitly set
+                headers["X-Title"] = "All-Included Deep Research"
+            
+            if headers:
+                llm_kwargs["default_headers"] = headers
+                logger.debug(
+                    "using_openai_compatible_api",
+                    base_url=settings.openai_base_url,
+                    headers=list(headers.keys()),
+                )
 
-        logger.debug("creating_openai_model", model=model_name)
-        return ChatOpenAI(**llm_kwargs)
+        logger.debug(
+            "creating_openai_model",
+            model=model_name,
+            base_url=settings.openai_base_url or "default (api.openai.com)",
+        )
+        llm = ChatOpenAI(**llm_kwargs)
+        
+        # Apply structured output if requested
+        if structured_output:
+            llm = llm.with_structured_output(structured_output)
+            logger.debug("applied_structured_output", schema=structured_output.__name__)
+        
+        return llm
 
     if provider in {"anthropic", "claude"}:
         if not settings.anthropic_api_key:
             raise ValueError("Anthropic API key not configured")
 
         logger.debug("creating_anthropic_model", model=model_name)
-        return ChatAnthropic(
+        llm = ChatAnthropic(
             model=model_name,
             api_key=settings.anthropic_api_key,
             max_tokens=max_tokens,
             temperature=temperature,
         )
+        
+        # Apply structured output if requested
+        if structured_output:
+            llm = llm.with_structured_output(structured_output)
+            logger.debug("applied_structured_output", schema=structured_output.__name__)
+        
+        return llm
 
     raise ValueError(f"Unsupported LLM provider: {provider}")

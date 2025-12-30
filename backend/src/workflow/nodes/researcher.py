@@ -16,11 +16,15 @@ from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.state import ResearchFinding, ResearcherState, SourceReference
 from src.utils.chat_history import format_chat_history
+from src.utils.date import get_current_date
+from src.workflow.agentic.schemas import SearchQueries, ResearchAnalysis, FollowupQueries
 
 logger = structlog.get_logger(__name__)
 
 
 RESEARCHER_SYSTEM_PROMPT = """You are a specialized research agent conducting in-depth investigation.
+
+Current date: {current_date}
 
 Your assignment: {research_topic}
 
@@ -46,6 +50,7 @@ Guidelines:
 - Be critical of source quality and bias
 - Extract specific facts, examples, and insights
 - Synthesize don't just summarize
+- Always consider the current date ({current_date}) when evaluating information recency and relevance
 
 Maximum sources to analyze: {max_sources}"""
 
@@ -240,7 +245,9 @@ async def _generate_search_queries(
     existing_hint = _format_existing_findings(existing_findings)
 
     history_block = chat_history or "Chat history: None."
+    current_date = get_current_date()
     prompt = f"""Research Topic: {topic}
+Current date: {current_date}
 {history_block}
 {memory_hint}
 {existing_hint}
@@ -256,14 +263,20 @@ Requirements:
 Respond with just the queries, one per line, without numbering."""
 
     try:
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        content = response.content if hasattr(response, "content") else str(response)
-
-        # Parse queries
-        queries = [q.strip() for q in content.split("\n") if q.strip()]
-        queries = queries[:max_queries]
-
-        return queries if queries else [topic]
+        # Try structured output first
+        try:
+            structured_llm = llm.with_structured_output(SearchQueries)
+            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            if isinstance(response, SearchQueries):
+                queries = response.queries[:max_queries]
+                return queries if queries else [topic]
+        except Exception:
+            # Fallback to text parsing
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            content = response.content if hasattr(response, "content") else str(response)
+            queries = [q.strip() for q in content.split("\n") if q.strip()]
+            queries = queries[:max_queries]
+            return queries if queries else [topic]
 
     except Exception as e:
         logger.warning("Query generation failed, using topic as query", error=str(e))
@@ -304,7 +317,9 @@ async def _analyze_and_synthesize(
     existing_text = _format_existing_findings(existing_findings)
 
     history_block = chat_history or "Chat history: None."
+    current_date = get_current_date()
     prompt = f"""Research Topic: {topic}
+Current date: {current_date}
 {history_block}
 
 ## Sources Found
@@ -335,6 +350,20 @@ Format your response as:
 [low/medium/high] - [brief justification]"""
 
     try:
+        # Try structured output first
+        try:
+            structured_llm = llm.with_structured_output(ResearchAnalysis)
+            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            if isinstance(response, ResearchAnalysis):
+                return {
+                    "summary": response.summary,
+                    "key_findings": response.key_findings,
+                    "confidence": response.confidence,
+                }
+        except Exception as e:
+            logger.warning("Structured output failed, falling back to text parsing", error=str(e))
+        
+        # Fallback to text parsing
         response = await llm.ainvoke([HumanMessage(content=prompt)])
         content = response.content if hasattr(response, "content") else str(response)
 
@@ -442,7 +471,9 @@ async def _generate_followup_queries(
     )
 
     history_block = chat_history or "Chat history: None."
+    current_date = get_current_date()
     prompt = f"""Research Topic: {topic}
+Current date: {current_date}
 {history_block}
 Existing Queries: {', '.join(existing_queries[-6:])}
 Sources Summary:
@@ -461,13 +492,21 @@ Rules:
 """
 
     try:
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        content = response.content if hasattr(response, "content") else str(response)
-        payload = json.loads(_extract_json(content))
-        if not payload.get("should_continue", False):
-            return []
-        queries = payload.get("queries") or []
-        return [query.strip() for query in queries if query.strip()][:max_queries]
+        # Try structured output first
+        try:
+            structured_llm = llm.with_structured_output(FollowupQueries)
+            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            if isinstance(response, FollowupQueries):
+                return [q.strip() for q in response.queries if q.strip()][:max_queries]
+        except Exception:
+            # Fallback to JSON parsing
+            response = await llm.ainvoke([HumanMessage(content=prompt)])
+            content = response.content if hasattr(response, "content") else str(response)
+            payload = json.loads(_extract_json(content))
+            if not payload.get("should_continue", False):
+                return []
+            queries = payload.get("queries") or []
+            return [query.strip() for query in queries if query.strip()][:max_queries]
     except Exception as exc:
         logger.warning("Followup query generation failed", error=str(exc))
         return []

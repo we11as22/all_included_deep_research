@@ -47,7 +47,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     logger.info("Chat stream request", mode=mode, query=query[:100])
 
     session_id = str(uuid4())
-    stream_generator = ResearchStreamingGenerator(session_id=session_id)
+    # Pass app state to stream generator for agent memory service
+    app_state = {
+        "agent_memory_service": app_request.app.state.agent_memory_service,
+        "agent_file_service": app_request.app.state.agent_file_service,
+    }
+    stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
     async def run_task():
         try:
@@ -90,12 +95,41 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     stream_generator.emit_error(error=str(exc), details="Memory save failed")
             stream_generator.emit_done()
 
-        except Exception as exc:
-            logger.error("Chat stream failed", error=str(exc), exc_info=True)
-            stream_generator.emit_error(error=str(exc), details="Chat stream failed")
+        except asyncio.CancelledError:
+            logger.info("Chat task cancelled", session_id=session_id)
+            stream_generator.emit_status("Chat cancelled by user", step="cancelled")
             stream_generator.emit_done()
+        except Exception as exc:
+            error_str = str(exc)
+            error_details = "Chat stream failed"
+            
+            # Handle authentication errors specifically
+            if "401" in error_str or "AuthenticationError" in error_str or "User not found" in error_str:
+                error_details = (
+                    "API ключ не настроен или неверен. "
+                    "Пожалуйста, добавьте ваш OpenRouter API ключ в файл backend/.env: "
+                    "OPENAI_API_KEY=sk-or-v1-ваш-ключ-здесь"
+                )
+                logger.error("Authentication error", error=error_str)
+            elif "API key not configured" in error_str or "not configured" in error_str:
+                error_details = (
+                    "API ключ не настроен. "
+                    "Пожалуйста, добавьте ваш OpenRouter API ключ в файл backend/.env: "
+                    "OPENAI_API_KEY=sk-or-v1-ваш-ключ-здесь"
+                )
+                logger.error("API key missing", error=error_str)
+            else:
+                logger.error("Chat stream failed", error=error_str, exc_info=True)
+            
+            stream_generator.emit_error(error=error_details, details="Chat stream failed")
+            stream_generator.emit_done()
+        finally:
+            # Remove task from active tasks
+            app_request.app.state.active_tasks.pop(session_id, None)
 
-    asyncio.create_task(run_task())
+    # Start background task and store it
+    task = asyncio.create_task(run_task())
+    app_request.app.state.active_tasks[session_id] = task
 
     return StreamingResponse(
         stream_generator.stream(),
@@ -121,6 +155,26 @@ def _generate_memory_path(query: str) -> str:
 
 def _format_memory_report(query: str, report: str) -> str:
     return f"# {query}\n\n{report}\n"
+
+
+@router.post("/stream/{session_id}/cancel")
+async def cancel_chat(session_id: str, app_request: Request):
+    """Cancel an active chat session."""
+    active_tasks = app_request.app.state.active_tasks
+    
+    if session_id not in active_tasks:
+        raise HTTPException(status_code=404, detail="Chat session not found or already completed")
+    
+    task = active_tasks[session_id]
+    if task.done():
+        active_tasks.pop(session_id, None)
+        raise HTTPException(status_code=400, detail="Chat session already completed")
+    
+    task.cancel()
+    active_tasks.pop(session_id, None)
+    logger.info("Chat session cancelled", session_id=session_id)
+    
+    return {"status": "cancelled", "session_id": session_id}
 
 
 def _collect_chat_history(messages: list, limit: int) -> list[dict[str, str]]:

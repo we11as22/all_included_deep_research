@@ -25,8 +25,9 @@ class ResearchResponse(BaseModel):
     """Research response."""
 
     session_id: str = Field(..., description="Research session identifier")
-    query: str = Field(..., description="Original query")
-    mode: ResearchMode = Field(..., description="Research mode used")
+    status: str = Field(..., description="Session status: running, completed, failed")
+    mode: str = Field(default="unknown", description="Research mode used")
+    query: str | None = Field(None, description="Original query")
     report: str | None = Field(None, description="Final research report")
     sources_count: int = Field(default=0, description="Number of sources consulted")
     findings_count: int = Field(default=0, description="Number of findings generated")

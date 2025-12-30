@@ -64,24 +64,51 @@ class SearXNGSearchProvider(SearchProvider):
                     params["engines"] = ",".join(self.engines)
 
                 async with session.get(url, params=params) as response:
-                    response.raise_for_status()
-                    data = await response.json()
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.warning(
+                            "SearXNG returned non-200 status",
+                            status=response.status,
+                            error=error_text[:200],
+                            query=query,
+                        )
+                        return SearchResponse(query=query, results=[], total_results=0)
+                    
+                    try:
+                        data = await response.json()
+                    except Exception as e:
+                        error_text = await response.text()
+                        logger.error(
+                            "SearXNG response parse failed",
+                            error=str(e),
+                            response_preview=error_text[:500],
+                            query=query,
+                        )
+                        return SearchResponse(query=query, results=[], total_results=0)
 
                 results = []
-                for item in data.get("results", [])[:max_results]:
-                    # SearXNG returns various result types, we only want web results
-                    if item.get("template") not in [None, "default"]:
+                # Perplexica approach: simple mapping without strict template filtering
+                for item in data.get("results", []):
+                    # Only require URL - title can be empty, we'll use URL as fallback
+                    if not item.get("url"):
                         continue
+                    
+                    # Use content or title (like Perplexica does)
+                    content = item.get("content") or item.get("snippet") or ""
+                    title = item.get("title") or item.get("url", "")[:100]  # Use URL as fallback for title
 
                     results.append(
                         SearchResult(
-                            title=item.get("title", ""),
+                            title=title,
                             url=item.get("url", ""),
-                            snippet=item.get("content", ""),
+                            snippet=content,
                             score=item.get("score", 0.0),
                             published_date=item.get("publishedDate"),
                         )
                     )
+                    
+                    if len(results) >= max_results:
+                        break
 
                 logger.info("SearXNG search completed", query=query, results_count=len(results))
 

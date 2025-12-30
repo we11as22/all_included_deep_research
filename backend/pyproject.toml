@@ -2,9 +2,8 @@
 name = "all-included-deep-research"
 version = "1.0.0"
 description = "Comprehensive deep research system with memory integration"
-readme = "README.md"
 requires-python = ">=3.11"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
@@ -43,6 +42,7 @@ dependencies = [
     "beautifulsoup4>=4.12.0",
     "lxml>=5.0.0",
     "markdownify>=0.11.6",
+    "pypdf>=3.17.0",
 
     # Utilities
     "python-dotenv>=1.0.0",

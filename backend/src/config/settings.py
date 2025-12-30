@@ -60,8 +60,18 @@ class Settings(BaseSettings):
 
     # OpenAI Embeddings
     openai_api_key: Optional[str] = Field(default=None, description="OpenAI API key")
-    openai_base_url: Optional[str] = Field(default=None, description="OpenAI API base URL (for OpenRouter, etc)")
+    openai_base_url: Optional[str] = Field(
+        default=None, description="OpenAI API base URL (for OpenRouter, 302.AI, or any OpenAI-compatible API)"
+    )
     openai_embedding_model: str = Field(default="text-embedding-3-small", description="OpenAI embedding model")
+    
+    # OpenAI-compatible API headers (for OpenRouter, etc.)
+    openai_api_http_referer: Optional[str] = Field(
+        default=None, description="HTTP-Referer header for OpenAI-compatible APIs (e.g., OpenRouter)"
+    )
+    openai_api_x_title: Optional[str] = Field(
+        default=None, description="X-Title header for OpenAI-compatible APIs (e.g., OpenRouter)"
+    )
 
     # Ollama Embeddings
     ollama_base_url: str = Field(default="http://localhost:11434", description="Ollama base URL")
@@ -125,7 +135,7 @@ class Settings(BaseSettings):
     balanced_max_concurrent: int = Field(default=3, description="Balanced mode max concurrent researchers")
 
     quality_max_iterations: int = Field(default=25, description="Quality mode max iterations")
-    quality_max_concurrent: int = Field(default=5, description="Quality mode max concurrent researchers")
+    quality_max_concurrent: int = Field(default=4, description="Quality mode max concurrent researchers")
 
     # Advanced Settings
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")

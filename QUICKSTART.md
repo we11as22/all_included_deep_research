@@ -20,7 +20,7 @@
 
 ```bash
 # Перейдите в директорию проекта
-cd /home/asudakov/projects/all_included_search/all_included_deep_research
+cd /root/asudakov/projects/all_included_deep_research
 
 # Настройте backend
 cd backend
@@ -30,6 +30,11 @@ cp .env.example .env
 # POSTGRES_PASSWORD=your_secure_password
 # OPENAI_API_KEY=sk-your-key-here
 # TAVILY_API_KEY=tvly-your-key-here
+# 
+# Опционально: Использование OpenRouter или других API с форматом OpenAI
+# OPENAI_BASE_URL=https://openrouter.ai/api/v1
+# OPENAI_API_KEY=sk-or-v1-your-openrouter-key
+# 
 # LLM_MODE=mock  # для запуска без LLM
 # SEARCH_PROVIDER=mock  # для запуска без внешнего поиска
 # CHAT_HISTORY_LIMIT=2  # сколько последних сообщений передавать агентам
@@ -40,7 +45,7 @@ cp .env.example .env
 
 # Откройте .env и установите пароль и путь памяти:
 # POSTGRES_PASSWORD=your_secure_password
-# MEMORY_HOST_PATH=/home/asudakov/projects/memory_files
+# MEMORY_HOST_PATH=/root/asudakov/projects/memory_files  # или любой другой путь
 ```
 
 ### Шаг 3: Запустите проект
@@ -121,6 +126,33 @@ docker compose logs -f frontend
 ```
 
 ## Дополнительные возможности
+
+### Использование OpenRouter или других API с форматом OpenAI
+
+Отредактируйте `backend/.env`:
+
+```bash
+# Использование OpenRouter
+OPENAI_BASE_URL=https://openrouter.ai/api/v1
+OPENAI_API_KEY=sk-or-v1-your-openrouter-key
+
+# Опционально: кастомные заголовки (для OpenRouter добавляются автоматически)
+OPENAI_API_HTTP_REFERER=https://github.com/your-org/your-repo
+OPENAI_API_X_TITLE=Your App Name
+
+# Использование любого другого API с форматом OpenAI
+OPENAI_BASE_URL=https://api.302.ai/v1
+OPENAI_API_KEY=your-api-key
+```
+
+**Доступные модели на OpenRouter**: `openai:gpt-4o`, `openai:gpt-4o-mini`, `openai:qwen/qwen-2.5-72b-instruct` и многие другие. См. https://openrouter.ai/models
+
+**Настройка моделей**: После настройки `OPENAI_BASE_URL` и `OPENAI_API_KEY`, вы можете использовать любые модели из OpenRouter, указав их в настройках:
+```bash
+CHAT_MODEL=openai:gpt-4o-mini
+RESEARCH_MODEL=openai:gpt-4o
+# Или другие модели: openai:qwen/qwen-2.5-72b-instruct, openai:anthropic/claude-3.5-sonnet и т.д.
+```
 
 ### Использование Claude вместо GPT
 
