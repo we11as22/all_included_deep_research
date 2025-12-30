@@ -86,20 +86,29 @@ class WebScraper:
                 # Use chromium headless shell for better performance in Docker
                 browser = await p.chromium.launch(
                     headless=True,
-                    args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                    args=[
+                        '--no-sandbox',
+                        '--disable-setuid-sandbox',
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-software-rasterizer',
+                        '--disable-extensions',
+                    ]
                 )
                 context = await browser.new_context(
                     user_agent=self.user_agent,
                     viewport={"width": 1920, "height": 1080},
+                    # Increase timeouts for slow connections
+                    navigation_timeout=60000,
                 )
                 page = await context.new_page()
 
                 logger.info("Loading page with Playwright", url=url)
                 await page.goto(url, wait_until="domcontentloaded", timeout=int(self.timeout.total * 1000))
 
-                # Wait for initial content to load
+                # Wait for initial content to load (increased timeout for slow connections)
                 try:
-                    await page.wait_for_load_state("networkidle", timeout=5000)
+                    await page.wait_for_load_state("networkidle", timeout=15000)
                 except Exception:
                     # Timeout is OK, continue
                     pass
@@ -138,9 +147,9 @@ class WebScraper:
             # Wait for new content to load
             await asyncio.sleep(self.scroll_pause)
 
-            # Wait for network to be idle (new content loaded)
+            # Wait for network to be idle (new content loaded, increased timeout for slow connections)
             try:
-                await page.wait_for_load_state("networkidle", timeout=2000)
+                await page.wait_for_load_state("networkidle", timeout=10000)
             except Exception:
                 # Timeout is OK, continue
                 pass
