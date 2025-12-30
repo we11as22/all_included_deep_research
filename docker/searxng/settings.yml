@@ -12,6 +12,30 @@ search:
 server:
   secret_key: "change_me"
 
+# Increase timeout for engines
+outgoing:
+  timeout: 10.0
+  max_redirects: 5
+  pool_connections: 100
+  pool_maxsize: 10
+
+# Engines configuration
+# With use_default_settings: true, all default engines are enabled
+# We can disable problematic engines here if needed
 engines:
+  # Keep wolframalpha for calculations
   - name: wolframalpha
     disabled: false
+  # Disable engines that require API keys or are frequently blocked
+  - name: brave
+    disabled: true
+  - name: startpage
+    disabled: true
+  - name: ahmia
+    disabled: true
+  - name: torch
+    disabled: true
+  # Disable duckduckgo if it keeps timing out
+  - name: duckduckgo
+    disabled: false
+    timeout: 10.0

@@ -108,42 +108,9 @@ RUN cd "/usr/local/searxng/searxng-src" && \
 # Switch back to root
 USER root
 
-# Create entrypoint script for starting both searxng and backend
-RUN echo '#!/bin/sh\n\
-set -e\n\
-\n\
-echo "Starting SearXNG..."\n\
-\n\
-sudo -H -u searxng bash -c "cd /usr/local/searxng/searxng-src && export SEARXNG_SETTINGS_PATH='\''/etc/searxng/settings.yml'\'' && export FLASK_APP=searx/webapp.py && /usr/local/searxng/searx-pyenv/bin/python -m flask run --host=0.0.0.0 --port=8080" &\n\
-SEARXNG_PID=$!\n\
-\n\
-echo "Waiting for SearXNG to be ready..."\n\
-sleep 5\n\
-\n\
-COUNTER=0\n\
-MAX_TRIES=30\n\
-until curl -s http://localhost:8080 > /dev/null 2>&1; do\n\
-  COUNTER=$((COUNTER+1))\n\
-  if [ $COUNTER -ge $MAX_TRIES ]; then\n\
-    echo "Warning: SearXNG health check timeout, but continuing..."\n\
-    break\n\
-  fi\n\
-  sleep 1\n\
-done\n\
-\n\
-if curl -s http://localhost:8080 > /dev/null 2>&1; then\n\
-  echo "SearXNG started successfully (PID: $SEARXNG_PID)"\n\
-else\n\
-  echo "SearXNG may not be fully ready, but continuing (PID: $SEARXNG_PID)"\n\
-fi\n\
-\n\
-cd /app\n\
-echo "Running database migrations..."\n\
-alembic upgrade head\n\
-\n\
-echo "Starting backend server..."\n\
-exec python -m src\n\
-' > /entrypoint.sh && chmod +x /entrypoint.sh && sed -i 's/\r$//' /entrypoint.sh || true
+# Copy entrypoint script
+COPY backend/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh && sed -i 's/\r$//' /entrypoint.sh || true
 
 # Allow searxng user to use sudo (needed for flask run)
 RUN echo "searxng ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers

@@ -7,50 +7,50 @@ Last Updated: 2025-12-30
 This is the main index file for agent memory. All agent notes and findings are stored in the `items/` directory and referenced here.
 
 
-## Project Status - 2025-12-30 15:06:31 UTC
+## Project Status - 2025-12-30 16:19:42 UTC
 
 **Research Query:** Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
 
-**Findings Count:** 5
+**Findings Count:** 10
 
 ### Active Agents Status:
 
-#### agent_r0_0
-- **Todos:** 0 done, 0 in progress, 4 pending
+#### agent_r1_0
+- **Todos:** 1 done, 0 in progress, 3 pending
 - **Notes:** 1
 
-#### agent_r0_1
-- **Todos:** 0 done, 0 in progress, 4 pending
+#### agent_r1_1
+- **Todos:** 1 done, 0 in progress, 3 pending
 - **Notes:** 1
 
-#### agent_r0_2
-- **Todos:** 0 done, 0 in progress, 4 pending
+#### agent_r1_2
+- **Todos:** 1 done, 0 in progress, 3 pending
 - **Notes:** 1
 
-#### agent_r0_3
-- **Todos:** 0 done, 0 in progress, 4 pending
+#### agent_r1_3
+- **Todos:** 1 done, 0 in progress, 3 pending
 - **Notes:** 1
 
-#### agent_r0_4
-- **Todos:** 0 done, 0 in progress, 4 pending
+#### agent_r1_4
+- **Todos:** 1 done, 0 in progress, 3 pending
 - **Notes:** 1
 
 ### Recent Findings:
 
-- **Catalogue of Soviet tank prototypes developed after 1980 that remained experimental and did not enter service**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Catalogue of Soviet tank p...
+- **Investigate the operational testing results and feedback from military units on Soviet tank prototypes post-1980 to identify performance issues and practical limitations.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+Your focus: Investigate the operationa...
 
-- **Technical specifications and innovative features of each prototype tank**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Technical specifications a...
+- **Cross-verify prototype technical specifications and design innovations with multiple primary sources, including Soviet military archives and design bureau reports.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+Your focus: Cross-verify prototype tec...
 
-- **Development history and timeline of each tank prototype**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Development history and ti...
+- **Explore the geopolitical and economic context impacting Soviet tank development post-1980, including how international relations influenced prototype projects and cancellations.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+Your focus: Explore the geopolitical a...
 
-- **Reasons for the non-adoption or cancellation of these prototypes (political, technical, strategic, or economic factors)**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Reasons for the non-adopti...
+- **Analyze competing tank designs within the Soviet military and defense industry to understand why certain prototypes were rejected in favor of others or foreign designs.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+Your focus: Analyze competing tank des...
 
-- **Comparison with tanks that did enter service during the same period**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Comparison with tanks that...
+- **Research any known controversies, internal debates, or conflicting expert opinions among Soviet tank designers and military officials regarding these prototypes.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+Your focus: Research any known controv...
 
 ## Items
 
