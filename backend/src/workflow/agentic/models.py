@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from datetime import datetime, timezone
 from typing import Iterable
 from uuid import uuid4
@@ -12,7 +13,12 @@ from uuid import uuid4
 class AgentTodoItem:
     """Per-agent todo item."""
 
+    reasoning: str
     title: str
+    objective: str
+    expected_output: str
+    sources_needed: list[str] = field(default_factory=list)
+    priority: str = "medium"
     status: str = "pending"
     note: str | None = None
     url: str | None = None
@@ -40,8 +46,29 @@ class AgentMemory:
     notes: list[AgentNote] = field(default_factory=list)
     visited_urls: set[str] = field(default_factory=set)
 
-    def add_todo(self, title: str, note: str | None = None, url: str | None = None) -> AgentTodoItem:
-        item = AgentTodoItem(title=title, note=note, url=url)
+    def add_todo(
+        self,
+        title: str,
+        objective: str,
+        expected_output: str,
+        sources_needed: list[str] | None = None,
+        priority: str = "medium",
+        reasoning: str = "",
+        status: str = "pending",
+        note: str | None = None,
+        url: str | None = None,
+    ) -> AgentTodoItem:
+        item = AgentTodoItem(
+            reasoning=reasoning,
+            title=title,
+            objective=objective,
+            expected_output=expected_output,
+            sources_needed=list(sources_needed or []),
+            priority=priority,
+            status=status,
+            note=note,
+            url=url,
+        )
         self.todos.append(item)
         return item
 
@@ -72,10 +99,23 @@ class AgentMemory:
             return "None."
         lines = []
         for item in self.todos[:limit]:
-            suffix = f" (url: {item.url})" if item.url else ""
-            note = f" - {item.note}" if item.note else ""
-            lines.append(f"- [{item.status}] {item.title}{suffix}{note}")
-        return "\n".join(lines)
+            lines.append(
+                json.dumps(
+                    {
+                        "reasoning": item.reasoning,
+                        "title": item.title,
+                        "objective": item.objective,
+                        "expected_output": item.expected_output,
+                        "sources_needed": item.sources_needed,
+                        "priority": item.priority,
+                        "status": item.status,
+                        "note": item.note,
+                        "url": item.url,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+        return "\n".join(f"- {line}" for line in lines)
 
     def render_notes(self, limit: int = 6) -> str:
         if not self.notes:
@@ -97,9 +137,22 @@ class SharedResearchMemory:
     """Shared memory across agents."""
 
     notes: list[AgentNote] = field(default_factory=list)
+    todo_directives: dict[str, list[dict]] = field(default_factory=dict)
 
     def add_note(self, note: AgentNote) -> None:
         self.notes.append(note)
+
+    def add_todo_directives(self, agent_id: str, updates: list[dict]) -> None:
+        if not agent_id or not updates:
+            return
+        existing = self.todo_directives.get(agent_id, [])
+        existing.extend(updates)
+        self.todo_directives[agent_id] = existing
+
+    def pop_todo_directives(self, agent_id: str) -> list[dict]:
+        if not agent_id:
+            return []
+        return self.todo_directives.pop(agent_id, [])
 
     def recent_notes(self, limit: int = 8) -> list[AgentNote]:
         return self.notes[-limit:]
@@ -115,3 +168,4 @@ class SharedResearchMemory:
 
     def clear(self) -> None:
         self.notes.clear()
+        self.todo_directives.clear()

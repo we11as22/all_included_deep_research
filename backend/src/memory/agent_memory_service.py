@@ -149,7 +149,14 @@ class AgentMemoryService:
                 summary = parts[1].strip()
                 # Take first paragraph
                 summary = summary.split("\n\n")[0] if "\n\n" in summary else summary.split("\n")[0]
-                return summarize_text(summary, 300)
+                return summarize_text(summary, 1200)
+        return ""
+
+    def _extract_agent_from_content(self, content: str) -> str:
+        """Extract agent_id from markdown content."""
+        for line in content.split("\n"):
+            if line.startswith("**Created by:**"):
+                return line.replace("**Created by:**", "").strip()
         return ""
 
     async def _update_main_file(self, file_path: str, title: str, summary: str, tags: list[str]) -> None:
@@ -188,12 +195,12 @@ class AgentMemoryService:
         if next_section != -1:
             # Insert before next section
             insert_pos = items_section_start + next_section
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 240)}\n\n"
+            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 1000)}\n\n"
             content = content[:insert_pos] + new_item + content[insert_pos:]
         else:
             # Append to end of Items section
             insert_pos = items_section_start + items_content_start
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 240)}\n\n"
+            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 1000)}\n\n"
             content = content[:insert_pos] + new_item + content[insert_pos:]
 
         # Update last_updated

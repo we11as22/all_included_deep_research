@@ -72,6 +72,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting up All-Included Deep Research API...")
 
     settings = get_settings()
+    logger.info("Settings loaded", debug_mode=settings.debug_mode)
 
     # Initialize database
     logger.info("Initializing database connection...")

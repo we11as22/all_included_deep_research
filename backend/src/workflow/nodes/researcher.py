@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import math
 from collections import defaultdict
 from typing import Any
@@ -178,7 +177,7 @@ async def researcher_node(
                 scraped_content.append({
                     "url": content.url,
                     "title": content.title,
-                    "content": summarize_text(content.content, 3000),
+                    "content": summarize_text(content.content, 8000),
                 })
             except Exception as e:
                 logger.warning("Scraping failed", url=source.url, error=str(e))
@@ -240,7 +239,7 @@ async def _generate_search_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 240)}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:3]]
         )
 
     existing_hint = _format_existing_findings(existing_findings)
@@ -261,24 +260,15 @@ Requirements:
 - Vary the query types (definition, examples, comparison, current state, etc.)
 - Avoid repeating topics already covered in the existing findings
 
-Respond with just the queries, one per line, without numbering."""
+Return JSON with fields reasoning and queries."""
 
     try:
-        # Try structured output first
-        try:
-            structured_llm = llm.with_structured_output(SearchQueries, method="function_calling")
-            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-            if isinstance(response, SearchQueries):
-                queries = response.queries[:max_queries]
-                return queries if queries else [topic]
-        except Exception:
-            # Fallback to text parsing
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            content = response.content if hasattr(response, "content") else str(response)
-            queries = [q.strip() for q in content.split("\n") if q.strip()]
-            queries = queries[:max_queries]
-            return queries if queries else [topic]
-
+        structured_llm = llm.with_structured_output(SearchQueries, method="function_calling")
+        response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        if not isinstance(response, SearchQueries):
+            raise ValueError("SearchQueries response was not structured")
+        queries = response.queries[:max_queries]
+        return queries if queries else [topic]
     except Exception as e:
         logger.warning("Query generation failed, using topic as query", error=str(e))
         return [topic]
@@ -299,20 +289,20 @@ async def _analyze_and_synthesize(
     sources_text = "\n\n".join([
         f"**Source {idx + 1}:** {source.title}\n"
         f"URL: {source.url}\n"
-        f"Summary: {summarize_text(source.snippet, 260)}"
+        f"Summary: {summarize_text(source.snippet, 3000)}"
         for idx, source in enumerate(sources[:5])
     ])
 
     # Format scraped content
     content_text = "\n\n".join([
-        f"**{sc['title']}**\n{summarize_text(sc['content'], 2000)}"
+        f"**{sc['title']}**\n{summarize_text(sc['content'], 8000)}"
         for sc in scraped_content[:3]
     ])
 
     memory_text = ""
     if memory_context:
         memory_text = "\n\n## Memory Context\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 240)}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:3]]
         )
 
     existing_text = _format_existing_findings(existing_findings)
@@ -337,48 +327,18 @@ Based on these sources, provide a comprehensive analysis:
 2. **Key Findings** (3-5 bullet points): The most important insights or discoveries
 3. **Confidence Level**: low/medium/high based on source quality and consensus
 
-Format your response as:
-
-## Summary
-[Your 2-3 paragraph summary]
-
-## Key Findings
-- [Finding 1]
-- [Finding 2]
-- [Finding 3]
-
-## Confidence
-[low/medium/high] - [brief justification]"""
+Return JSON with fields reasoning, summary, key_findings, confidence."""
 
     try:
-        # Try structured output first
-        try:
-            structured_llm = llm.with_structured_output(ResearchAnalysis, method="function_calling")
-            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-            if isinstance(response, ResearchAnalysis):
-                return {
-                    "summary": response.summary,
-                    "key_findings": response.key_findings,
-                    "confidence": response.confidence,
-                }
-        except Exception as e:
-            logger.warning("Structured output failed, falling back to text parsing", error=str(e))
-        
-        # Fallback to text parsing
-        response = await llm.ainvoke([HumanMessage(content=prompt)])
-        content = response.content if hasattr(response, "content") else str(response)
-
-        # Parse response
-        summary = _extract_section(content, "Summary")
-        findings = _extract_findings(content)
-        confidence = _extract_confidence(content)
-
+        structured_llm = llm.with_structured_output(ResearchAnalysis, method="function_calling")
+        response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        if not isinstance(response, ResearchAnalysis):
+            raise ValueError("ResearchAnalysis response was not structured")
         return {
-            "summary": summary or f"Research on {topic} (parsing failed)",
-            "key_findings": findings or [f"Unable to parse findings for {topic}"],
-            "confidence": confidence or "medium",
+            "summary": response.summary,
+            "key_findings": response.key_findings,
+            "confidence": response.confidence,
         }
-
     except Exception as e:
         logger.error("Analysis failed", error=str(e))
         return {
@@ -386,51 +346,6 @@ Format your response as:
             "key_findings": ["Analysis error occurred"],
             "confidence": "low",
         }
-
-
-def _extract_section(text: str, section_name: str) -> str:
-    """Extract content from a markdown section."""
-    lines = text.split("\n")
-    in_section = False
-    section_content = []
-
-    for line in lines:
-        if f"## {section_name}" in line or f"# {section_name}" in line:
-            in_section = True
-            continue
-        if in_section and line.startswith("##") or line.startswith("#"):
-            break
-        if in_section and line.strip():
-            section_content.append(line)
-
-    return "\n".join(section_content).strip()
-
-
-def _extract_findings(text: str) -> list[str]:
-    """Extract bullet points from key findings section."""
-    findings_text = _extract_section(text, "Key Findings")
-
-    findings = []
-    for line in findings_text.split("\n"):
-        line = line.strip()
-        if line.startswith("-") or line.startswith("*") or line.startswith("•"):
-            finding = line.lstrip("-*• ").strip()
-            if finding:
-                findings.append(finding)
-
-    return findings
-
-
-def _extract_confidence(text: str) -> str:
-    """Extract confidence level."""
-    confidence_text = _extract_section(text, "Confidence").lower()
-
-    if "high" in confidence_text:
-        return "high"
-    elif "low" in confidence_text:
-        return "low"
-    else:
-        return "medium"
 
 
 def _format_existing_findings(existing_findings: list[ResearchFinding]) -> str:
@@ -442,7 +357,7 @@ def _format_existing_findings(existing_findings: list[ResearchFinding]) -> str:
         summary = getattr(finding, "summary", "") or ""
         summary = summary.replace("\n", " ")
         if topic or summary:
-            lines.append(f"- {topic}: {summarize_text(summary, 240)}")
+            lines.append(f"- {topic}: {summarize_text(summary, 3000)}")
     return "\n" + "\n".join(lines)
 
 
@@ -464,11 +379,11 @@ async def _generate_followup_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 220)}" for ctx in memory_context[:2]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:2]]
         )
 
     sources_hint = "\n".join(
-        [f"- {source.title}: {summarize_text(source.snippet, 240)}" for source in sources[:5]]
+        [f"- {source.title}: {summarize_text(source.snippet, 3000)}" for source in sources[:5]]
     )
 
     history_block = chat_history or "Chat history: None."
@@ -482,8 +397,7 @@ Sources Summary:
 {memory_hint}
 {_format_existing_findings(existing_findings)}
 
-Identify any gaps or missing angles. Provide JSON:
-{{"should_continue": true/false, "gap_summary": "...", "queries": ["q1","q2"]}}
+Identify any gaps or missing angles. Return JSON with fields reasoning, should_continue, gap_summary, queries.
 
 Rules:
 - Max {max_queries} queries
@@ -493,32 +407,16 @@ Rules:
 """
 
     try:
-        # Try structured output first
-        try:
-            structured_llm = llm.with_structured_output(FollowupQueries, method="function_calling")
-            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-            if isinstance(response, FollowupQueries):
-                return [q.strip() for q in response.queries if q.strip()][:max_queries]
-        except Exception:
-            # Fallback to JSON parsing
-            response = await llm.ainvoke([HumanMessage(content=prompt)])
-            content = response.content if hasattr(response, "content") else str(response)
-            payload = json.loads(_extract_json(content))
-            if not payload.get("should_continue", False):
-                return []
-            queries = payload.get("queries") or []
-            return [query.strip() for query in queries if query.strip()][:max_queries]
+        structured_llm = llm.with_structured_output(FollowupQueries, method="function_calling")
+        response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        if not isinstance(response, FollowupQueries):
+            raise ValueError("FollowupQueries response was not structured")
+        if not response.should_continue:
+            return []
+        return [q.strip() for q in response.queries if q.strip()][:max_queries]
     except Exception as exc:
         logger.warning("Followup query generation failed", error=str(exc))
         return []
-
-
-def _extract_json(text: str) -> str:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return "{}"
-    return text[start : end + 1]
 
 
 def _dedupe_queries(queries: list[str], existing: list[str]) -> list[str]:

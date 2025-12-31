@@ -2,10 +2,10 @@
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
 
 from src.workflow.state import ResearchFinding, ResearchState
 from src.utils.text import summarize_text
+from src.workflow.agentic.schemas import FinalReport
 
 logger = structlog.get_logger(__name__)
 
@@ -115,7 +115,7 @@ async def generate_final_report_node(
     if memory_context:
         memory_block = "\n## Memory Context\n" + "\n".join(
             [
-                f"- {ctx.file_title} ({ctx.file_path}): {summarize_text(ctx.content, 260)}"
+                f"- {ctx.file_title} ({ctx.file_path}): {summarize_text(ctx.content, 3000)}"
                 for ctx in memory_context[:3]
             ]
         )
@@ -148,7 +148,8 @@ Structure your report with these sections:
 - **Key Takeaways** (3-5 bullet points)
 - **Sources** (list of all sources cited)
 
-Write in a clear, informative style appropriate for {mode} mode and include inline citations like [1]."""
+Write in a clear, informative style appropriate for {mode} mode and include inline citations like [1].
+Return JSON with fields reasoning and report."""
 
     messages = [
         SystemMessage(content=REPORTER_SYSTEM_PROMPT),
@@ -156,9 +157,11 @@ Write in a clear, informative style appropriate for {mode} mode and include inli
     ]
 
     try:
-        # Generate report
-        chain = llm | StrOutputParser()
-        report = await chain.ainvoke(messages)
+        structured_llm = llm.with_structured_output(FinalReport, method="function_calling")
+        response = await structured_llm.ainvoke(messages)
+        if not isinstance(response, FinalReport):
+            raise ValueError("FinalReport response was not structured")
+        report = response.report
 
         logger.info(
             "Final report generated",

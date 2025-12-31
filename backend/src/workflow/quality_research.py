@@ -190,20 +190,14 @@ Create a comprehensive synthesis that:
 4. Organizes information logically
 5. Preserves all sources and cite them inline where relevant
 
-Keep the synthesis detailed but well-structured (aim for 800-1200 words)."""
+Keep the synthesis detailed but well-structured (aim for 800-1200 words).
+Return JSON with fields reasoning, compressed_summary, key_themes, important_sources."""
 
-            try:
-                # Try structured output first
-                structured_llm = self.compression_llm.with_structured_output(CompressedFindings, method="function_calling")
-                response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-                if isinstance(response, CompressedFindings):
-                    compressed = response.compressed_summary
-                else:
-                    compressed = response.content if hasattr(response, "content") else str(response)
-            except Exception:
-                # Fallback to text parsing
-                response = await self.compression_llm.ainvoke([HumanMessage(content=prompt)])
-                compressed = response.content if hasattr(response, "content") else str(response)
+            structured_llm = self.compression_llm.with_structured_output(CompressedFindings, method="function_calling")
+            response = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+            if not isinstance(response, CompressedFindings):
+                raise ValueError("CompressedFindings response was not structured")
+            compressed = response.compressed_summary
 
             logger.info("Findings compressed successfully", compressed_length=len(compressed))
 

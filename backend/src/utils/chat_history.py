@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Iterable
 
+from src.utils.text import summarize_text
+
 
 def format_chat_history(messages: Iterable[dict] | None, limit: int) -> str:
     """Render the last N chat messages for prompts."""
@@ -18,7 +20,7 @@ def format_chat_history(messages: Iterable[dict] | None, limit: int) -> str:
         content = str(msg.get("content") or "").strip()
         if not content or role.lower() == "system":
             continue
-        cleaned.append({"role": role, "content": content})
+        cleaned.append({"role": role, "content": summarize_text(content, 1200)})
 
     if not cleaned:
         return "Chat history: None."

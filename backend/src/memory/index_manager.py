@@ -39,7 +39,19 @@ class IndexManager:
             category: One of projects, concepts, conversations, preferences, other
         """
         content = self.read_main_file()
-        category_header = f"### {category.title()}"
+        category_map = {
+            "project": "Projects",
+            "projects": "Projects",
+            "concept": "Concepts",
+            "concepts": "Concepts",
+            "conversation": "Conversations",
+            "conversations": "Conversations",
+            "preference": "Preferences",
+            "preferences": "Preferences",
+            "main": "Main",
+            "other": "Other",
+        }
+        category_header = f"### {category_map.get(category, category.title())}"
         link = f"- [{Path(file_path).stem.replace('_', ' ').title()}](/memory_files/{file_path}) - {description}"
 
         if category_header not in content:

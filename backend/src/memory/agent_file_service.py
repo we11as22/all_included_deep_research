@@ -1,5 +1,6 @@
 """Service for managing per-agent personal files."""
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -86,6 +87,12 @@ class AgentFileService:
         todo_title: str,
         status: str | None = None,
         note: str | None = None,
+        reasoning: str | None = None,
+        objective: str | None = None,
+        expected_output: str | None = None,
+        sources_needed: list[str] | None = None,
+        priority: str | None = None,
+        url: str | None = None,
     ) -> bool:
         """
         Update agent's todo item.
@@ -109,6 +116,18 @@ class AgentFileService:
                     todo.status = status
                 if note is not None:
                     todo.note = note
+                if reasoning is not None:
+                    todo.reasoning = reasoning
+                if objective is not None:
+                    todo.objective = objective
+                if expected_output is not None:
+                    todo.expected_output = expected_output
+                if sources_needed is not None:
+                    todo.sources_needed = sources_needed
+                if priority is not None:
+                    todo.priority = priority
+                if url is not None:
+                    todo.url = url
                 updated = True
                 break
         
@@ -139,17 +158,44 @@ class AgentFileService:
                 current_section = "todos"
             elif line.startswith("## Notes"):
                 current_section = "notes"
-            elif line.startswith("- [") and current_section == "todos":
-                # Parse todo: - [status] title (url: ...) - note
+            elif line.startswith("- ") and current_section == "todos":
+                entry = line[2:].strip()
+                if entry.startswith("{"):
+                    try:
+                        payload = json.loads(entry)
+                        todos.append(
+                            AgentTodoItem(
+                                reasoning=str(payload.get("reasoning") or ""),
+                                title=str(payload.get("title") or "").strip() or "Task",
+                                objective=str(payload.get("objective") or "").strip() or "Investigate the topic",
+                                expected_output=str(payload.get("expected_output") or "").strip() or "Summary with sources",
+                                sources_needed=list(payload.get("sources_needed") or []),
+                                priority=str(payload.get("priority") or "medium"),
+                                status=str(payload.get("status") or "pending"),
+                                note=payload.get("note"),
+                                url=payload.get("url"),
+                            )
+                        )
+                        continue
+                    except Exception:
+                        pass
+                # Legacy format: - [status] title (url: ...) - note
                 match = re.match(r'- \[(\w+)\]\s+(.+?)(?:\s+\(url:\s+([^)]+)\))?(?:\s+-\s+(.+))?$', line)
                 if match:
                     status, title, url, note = match.groups()
-                    todos.append(AgentTodoItem(
-                        title=title.strip(),
-                        status=status,
-                        url=url.strip() if url else None,
-                        note=note.strip() if note else None,
-                    ))
+                    todos.append(
+                        AgentTodoItem(
+                            reasoning="Legacy todo loaded",
+                            title=title.strip(),
+                            objective="Investigate the topic",
+                            expected_output="Summary with sources",
+                            sources_needed=[],
+                            priority="medium",
+                            status=status,
+                            url=url.strip() if url else None,
+                            note=note.strip() if note else None,
+                        )
+                    )
             elif line.startswith("- ") and current_section == "notes":
                 note_text = line[2:].strip()
                 if note_text:
@@ -194,9 +240,18 @@ class AgentFileService:
         
         if todos:
             for todo in todos:
-                url_part = f" (url: {todo.url})" if todo.url else ""
-                note_part = f" - {todo.note}" if todo.note else ""
-                lines.append(f"- [{todo.status}] {todo.title}{url_part}{note_part}")
+                payload = {
+                    "reasoning": todo.reasoning,
+                    "title": todo.title,
+                    "objective": todo.objective,
+                    "expected_output": todo.expected_output,
+                    "sources_needed": todo.sources_needed,
+                    "priority": todo.priority,
+                    "status": todo.status,
+                    "note": todo.note,
+                    "url": todo.url,
+                }
+                lines.append(f"- {json.dumps(payload, ensure_ascii=False)}")
         else:
             lines.append("<!-- No todos -->")
         
@@ -213,4 +268,3 @@ class AgentFileService:
             lines.append("<!-- No notes -->")
         
         return "\n".join(lines)
-

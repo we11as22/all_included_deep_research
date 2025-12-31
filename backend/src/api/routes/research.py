@@ -1,6 +1,7 @@
 """Research endpoint with structured events."""
 
 import asyncio
+from pathlib import Path
 from uuid import uuid4
 
 import structlog
@@ -9,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from src.api.models.research import ResearchRequest, ResearchResponse
 from src.streaming.sse import ResearchStreamingGenerator
+from src.memory.agent_session import create_agent_session_services, cleanup_agent_session_dir
 
 router = APIRouter(prefix="/api", tags=["research"])
 logger = structlog.get_logger(__name__)
@@ -33,14 +35,25 @@ async def start_research(research_request: ResearchRequest, app_request: Request
     app_state = {
         "agent_memory_service": app_request.app.state.agent_memory_service,
         "agent_file_service": app_request.app.state.agent_file_service,
+        "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
     async def run_research():
+        session_agent_dir: Path | None = None
         try:
             # Emit initialization
             stream_generator.emit_init(mode=research_request.mode.value)
             stream_generator.emit_status("Starting research workflow...", step="init")
+
+            if research_request.mode.value == "quality":
+                memory_root = Path(app_request.app.state.memory_manager.memory_dir)
+                agent_memory_service, agent_file_service, session_agent_dir = create_agent_session_services(
+                    memory_root, session_id
+                )
+                await agent_memory_service.read_main_file()
+                stream_generator.app_state["agent_memory_service"] = agent_memory_service
+                stream_generator.app_state["agent_file_service"] = agent_file_service
 
             # Get workflow from app state
             workflow_factory = app_request.app.state.workflow_factory
@@ -81,6 +94,9 @@ async def start_research(research_request: ResearchRequest, app_request: Request
         finally:
             # Remove task from active tasks
             app_request.app.state.active_tasks.pop(session_id, None)
+            if session_agent_dir:
+                memory_root = Path(app_request.app.state.memory_manager.memory_dir)
+                cleanup_agent_session_dir(memory_root, session_agent_dir)
 
     # Start background task and store it
     task = asyncio.create_task(run_research())

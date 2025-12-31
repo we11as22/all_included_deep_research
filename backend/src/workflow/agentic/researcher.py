@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.agentic.models import AgentMemory, SharedResearchMemory
-from src.workflow.agentic.schemas import AgentAction
+from src.workflow.agentic.schemas import AgentAction, TodoItemSchema, TodoUpdateSchema
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
@@ -35,22 +35,22 @@ Current date: {current_date}
 IMPORTANT: You must respond in the SAME LANGUAGE as the user's query. If the user asks in Russian, respond in Russian. If in English, respond in English. Always match the user's language.
 
 You must respond with a single JSON object:
-{{"action": "<tool_name or finish>", "args": {{...}}}}
+{{"reasoning": "...", "action": "<tool_name or finish>", "args": {{...}}}}
 
-Allowed actions:
-- web_search: {{"action": "web_search", "args": {{"queries": ["..."], "max_results": 5}}}}
-- scrape_urls: {{"action": "scrape_urls", "args": {{"urls": ["..."], "scroll": false}}}}
-- scroll_page: {{"action": "scroll_page", "args": {{"url": "...", "scrolls": 3, "pause": 1.0}}}}
-- summarize_content: {{"action": "summarize_content", "args": {{"url": "...", "content": "..."}}}}
-- write_note: {{"action": "write_note", "args": {{"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true}}}}
-- update_note: {{"action": "update_note", "args": {{"file_path": "...", "summary": "...", "urls": ["..."]}}}}
-- read_note: {{"action": "read_note", "args": {{"file_path": "items/..."}}}}
-- add_todo: {{"action": "add_todo", "args": {{"items": [{{"title": "...", "note": "...", "url": "..."}}, "..."]}}}}
-- update_todo: {{"action": "update_todo", "args": {{"title": "...", "status": "pending|in_progress|done", "note": "..."}}}}
-- complete_todo: {{"action": "complete_todo", "args": {{"titles": ["..."]}}}}
-- read_shared_notes: {{"action": "read_shared_notes", "args": {{"keyword": "...", "limit": 5}}}}
-- read_agent_file: {{"action": "read_agent_file", "args": {{"agent_id": "..."}}}}
-- read_main: {{"action": "read_main", "args": {{}}}}
+Allowed actions (reasoning is always top-level, only args shown here):
+- web_search: args {{ "queries": ["..."], "max_results": 5 }}
+- scrape_urls: args {{ "urls": ["..."], "scroll": false }}
+- scroll_page: args {{ "url": "...", "scrolls": 3, "pause": 1.0 }}
+- summarize_content: args {{ "url": "...", "content": "..." }}
+- write_note: args {{ "title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true }}
+- update_note: args {{ "file_path": "...", "summary": "...", "urls": ["..."] }}
+- read_note: args {{ "file_path": "items/..." }}
+- add_todo: args {{ "items": [{{"reasoning": "...", "title": "...", "objective": "...", "expected_output": "...", "sources_needed": ["..."], "priority": "medium", "status": "pending", "note": "...", "url": "..."}}] }}
+- update_todo: args {{ "reasoning": "...", "title": "...", "status": "pending|in_progress|done", "note": "...", "objective": "...", "expected_output": "...", "sources_needed": ["..."], "priority": "medium", "url": "..." }}
+- complete_todo: args {{ "titles": ["..."] }}
+- read_shared_notes: args {{ "keyword": "...", "limit": 5 }}
+- read_agent_file: args {{ "agent_id": "..." }}
+- read_main: args {{}}
 - finish: {{}}
 
 CRITICAL RULES FOR DEEP RESEARCH:
@@ -83,7 +83,11 @@ CRITICAL RULES FOR DEEP RESEARCH:
 
 5. **Memory Sharing**: Actively read shared notes from other agents using read_shared_notes. Check what other agents have discovered and incorporate their findings into your research. Share your own high-signal notes so other agents can benefit.
 
-6. **Todo Format**: Always use JSON format for todos. When adding todos, use: {{"action": "add_todo", "args": {{"items": [{{"title": "...", "note": "...", "url": "..."}}]}}}}. This ensures better parsing by all agents.
+6. **Todo Format (STRICT)**: Todos must follow a strict schema when using add_todo or update_todo.
+   - Required fields for add_todo items: reasoning, title, objective, expected_output, sources_needed, priority, status, note, url.
+   - Example add_todo args:
+     {{"items": [{{"reasoning": "...", "title": "...", "objective": "...", "expected_output": "...", "sources_needed": ["..."], "priority": "high", "status": "pending", "note": "...", "url": "..."}}]}}
+   - update_todo must include: reasoning, title, and any fields to change (status, note, objective, expected_output, sources_needed, priority, url).
 
 7. **Information Exchange**: After reading shared notes or agent files, actively update your research plan. If you discover something relevant to other agents' work, share it via write_note with share=true.
 
@@ -159,17 +163,9 @@ class AgenticResearcher:
         max_sources: int = 8,
         agent_memory_service: AgentMemoryService | None = None,
         agent_file_service: AgentFileService | None = None,
+        supervisor: Any | None = None,
     ) -> None:
-        # Apply structured output to LLM
-        if not hasattr(llm, "_structured_output") or llm._structured_output is None:
-            try:
-                # Use function_calling method for better OpenAI compatibility
-                self.llm = llm.with_structured_output(AgentAction, method="function_calling")
-            except Exception:
-                # Fallback if structured output not supported
-                self.llm = llm
-        else:
-            self.llm = llm
+        self.llm = llm.with_structured_output(AgentAction, method="function_calling")
         self.search_provider = search_provider
         self.web_scraper = web_scraper
         self.shared_memory = shared_memory
@@ -181,8 +177,10 @@ class AgenticResearcher:
         self.agent_memory = AgentMemory()
         self.agent_memory_service = agent_memory_service
         self.agent_file_service = agent_file_service
+        self.supervisor = supervisor
         self.sources: list[SourceReference] = []
         self.current_topic: str | None = None
+        self.existing_findings: list[ResearchFinding] = []
 
     async def run(
         self,
@@ -194,6 +192,7 @@ class AgenticResearcher:
         preferences: str | None = None,
     ) -> AgenticResearchResult:
         self.current_topic = topic
+        self.existing_findings = existing_findings
         
         # Load or create agent's personal file
         # CRITICAL: Always start fresh for new research session - don't load stale todos from previous queries
@@ -223,9 +222,18 @@ class AgenticResearcher:
         if not self.agent_memory.todos:
             self._seed_todos(topic)
         
-        # Save initial todos to agent file
-        if self.agent_file_service and self.agent_memory.todos:
-            await self.agent_file_service.write_agent_file(agent_id, todos=self.agent_memory.todos)
+        # Save initial memory snapshot to agent file
+        if self.agent_file_service:
+            initial_notes: list[str] = []
+            if assignment:
+                initial_notes.append(summarize_text(assignment, 4000))
+            await self.agent_file_service.write_agent_file(
+                agent_id,
+                todos=self.agent_memory.todos,
+                notes=initial_notes,
+                character=character,
+                preferences=preferences,
+            )
         
         last_tool_result = "None"
 
@@ -260,6 +268,7 @@ class AgenticResearcher:
             )
 
         for step in range(self.max_steps):
+            await self._apply_supervisor_directives(agent_id)
             prompt = await self._build_prompt(
                 agent_id=agent_id,
                 topic=topic,
@@ -272,44 +281,64 @@ class AgenticResearcher:
                 response = await self.llm.ainvoke(
                     [SystemMessage(content=get_agentic_system_prompt()), HumanMessage(content=prompt)]
                 )
-                # Structured output should return AgentAction
-                if isinstance(response, AgentAction):
-                    action = response.action
-                    args = response.args or {}
-                elif hasattr(response, "action") and hasattr(response, "args"):
-                    # Fallback: try to extract from response object
-                    action = response.action
-                    args = response.args or {}
-                elif hasattr(response, "model_dump"):
-                    # Pydantic model - extract fields
-                    data = response.model_dump()
-                    action = data.get("action", "finish")
-                    args = data.get("args", {})
-                    # If queries/max_results are at top level, move them to args
-                    if "queries" in data and "queries" not in args:
-                        args["queries"] = data["queries"]
-                    if "max_results" in data and "max_results" not in args:
-                        args["max_results"] = data["max_results"]
-                else:
-                    # Fallback to parsing text content
-                    content = response.content if hasattr(response, "content") else str(response)
-                    action, args = self._parse_action(content)
+                if not isinstance(response, AgentAction):
+                    raise ValueError("Agent action response was not structured")
+                action = response.action
+                args = response.args or {}
             except Exception as e:
-                logger.warning("Structured output failed, falling back to parsing", error=str(e))
-                # Try to get original LLM without structured output
-                try:
-                    # Get the underlying LLM if wrapped
-                    original_llm = getattr(self.llm, "_llm", None) or getattr(self.llm, "bound", None) or self.llm
-                    response = await original_llm.ainvoke(
-                        [SystemMessage(content=get_agentic_system_prompt()), HumanMessage(content=prompt)]
-                    )
-                    content = response.content if hasattr(response, "content") else str(response)
-                    action, args = self._parse_action(content)
-                except Exception as e2:
-                    logger.error("Fallback parsing also failed", error=str(e2))
-                    action, args = "finish", {}
+                logger.error("Structured agent action failed", error=str(e))
+                action, args = "finish", {}
             
             if action == "finish":
+                if self.supervisor:
+                    try:
+                        supervisor_result = await self.supervisor.react_step(
+                            query=self.current_topic or topic,
+                            agent_id=agent_id,
+                            agent_action="finish",
+                            action_result="Agent requested to finish.",
+                            findings=self.existing_findings,
+                        )
+                        directives = supervisor_result.get("directives") or []
+                        tasks = supervisor_result.get("tasks") or []
+                        if directives or tasks:
+                            by_agent: dict[str, list[dict]] = {}
+                            for directive in directives:
+                                if not isinstance(directive, dict):
+                                    continue
+                                target = str(directive.get("agent_id") or "")
+                                if not target:
+                                    continue
+                                by_agent.setdefault(target, []).append(directive)
+                            for target_id, updates in by_agent.items():
+                                self.shared_memory.add_todo_directives(target_id, updates)
+                            if agent_id in by_agent:
+                                await self._apply_supervisor_directives(agent_id)
+                            if tasks:
+                                task_updates = []
+                                for task in tasks:
+                                    task_title = str(task).strip()
+                                    if not task_title:
+                                        continue
+                                    task_updates.append(
+                                        {
+                                            "agent_id": agent_id,
+                                            "reasoning": "Supervisor requested more depth before finish.",
+                                            "title": task_title,
+                                            "status": "pending",
+                                            "objective": "Investigate the supervisor-assigned task",
+                                            "expected_output": "Summary with sources and key findings",
+                                            "sources_needed": [],
+                                            "priority": "high",
+                                        }
+                                    )
+                                if task_updates:
+                                    self.shared_memory.add_todo_directives(agent_id, task_updates)
+                                    await self._apply_supervisor_directives(agent_id)
+                                    continue
+                        # No directives -> allow finish
+                    except Exception as exc:
+                        logger.warning("Supervisor finish review failed", agent_id=agent_id, error=str(exc))
                 break
 
             last_tool_result = await self._execute_action(action, args, agent_id)
@@ -324,6 +353,65 @@ class AgenticResearcher:
             # Emit todo updates after each action to show progress on frontend
             if self.stream:
                 self.stream.emit_agent_todo(agent_id, self._todo_payload())
+
+            # Supervisor wakes after each action and may update agent todos
+            if self.supervisor:
+                try:
+                    supervisor_result = await self.supervisor.react_step(
+                        query=self.current_topic or topic,
+                        agent_id=agent_id,
+                        agent_action=action,
+                        action_result=last_tool_result,
+                        findings=self.existing_findings,
+                    )
+                    if self.stream and self.stream.app_state.get("debug_mode"):
+                        logger.info(
+                            "Supervisor react result",
+                            agent_id=agent_id,
+                            action=supervisor_result.get("action"),
+                            directives_count=len(supervisor_result.get("directives") or []),
+                            tasks_count=len(supervisor_result.get("tasks") or []),
+                        )
+                    directives = supervisor_result.get("directives") or []
+                    if directives:
+                        by_agent: dict[str, list[dict]] = {}
+                        for directive in directives:
+                            if not isinstance(directive, dict):
+                                continue
+                            target = str(directive.get("agent_id") or "")
+                            if not target:
+                                continue
+                            by_agent.setdefault(target, []).append(directive)
+                        for target_id, updates in by_agent.items():
+                            self.shared_memory.add_todo_directives(target_id, updates)
+                        if agent_id in by_agent:
+                            await self._apply_supervisor_directives(agent_id)
+
+                    # If supervisor returns tasks, convert them into directives for this agent
+                    tasks = supervisor_result.get("tasks") or []
+                    if tasks:
+                        task_updates = []
+                        for task in tasks:
+                            task_title = str(task).strip()
+                            if not task_title:
+                                continue
+                            task_updates.append(
+                                {
+                                    "agent_id": agent_id,
+                                    "reasoning": "Supervisor planned a new task based on latest action.",
+                                    "title": task_title,
+                                    "status": "pending",
+                                    "objective": "Investigate the supervisor-assigned task",
+                                    "expected_output": "Summary with sources and key findings",
+                                    "sources_needed": [],
+                                    "priority": "medium",
+                                }
+                            )
+                        if task_updates:
+                            self.shared_memory.add_todo_directives(agent_id, task_updates)
+                            await self._apply_supervisor_directives(agent_id)
+                except Exception as exc:
+                    logger.warning("Supervisor react step failed", agent_id=agent_id, error=str(exc))
 
         finding = self._synthesize_finding(agent_id, topic)
         if self.stream:
@@ -347,10 +435,39 @@ class AgenticResearcher:
     def _seed_todos(self, topic: str) -> None:
         if self.agent_memory.todos:
             return
-        self.agent_memory.add_todo(f"Run broad search on {topic}")
-        self.agent_memory.add_todo("Identify authoritative sources", note="Prefer official or primary sources")
-        self.agent_memory.add_todo("Extract key facts and evidence")
-        self.agent_memory.add_todo("Check for gaps or conflicting claims")
+        self.agent_memory.add_todo(
+            title=f"Run broad search on {topic}",
+            objective="Collect an overview to map key subtopics and stakeholders",
+            expected_output="3-5 high-quality sources with short summaries",
+            sources_needed=["overview articles", "industry reports", "official pages"],
+            reasoning="A broad scan prevents missing core subtopics early.",
+            priority="high",
+        )
+        self.agent_memory.add_todo(
+            title="Identify authoritative sources",
+            objective="Find primary or official sources relevant to the topic",
+            expected_output="List of primary sources with URLs and credibility notes",
+            sources_needed=["official documents", "peer-reviewed papers", "regulator sites"],
+            reasoning="Primary sources reduce misinformation and improve confidence.",
+            priority="high",
+            note="Prefer official or primary sources",
+        )
+        self.agent_memory.add_todo(
+            title="Extract key facts and evidence",
+            objective="Pull out facts, metrics, and quoted evidence from sources",
+            expected_output="Bullet list of key facts with citations",
+            sources_needed=["reports", "datasets", "expert interviews"],
+            reasoning="Concrete evidence is required for strong findings.",
+            priority="medium",
+        )
+        self.agent_memory.add_todo(
+            title="Check for gaps or conflicting claims",
+            objective="Identify contradictions and missing angles",
+            expected_output="List of gaps/contradictions with follow-up tasks",
+            sources_needed=["multiple independent sources"],
+            reasoning="Deep research must surface inconsistencies and gaps.",
+            priority="medium",
+        )
 
     async def _build_prompt(
         self,
@@ -386,14 +503,14 @@ class AgenticResearcher:
                     persistent_memory_block += f"### Current Project Status:\n{status_section}\n\n"
                 
                 # Show more main content context
-                main_preview = summarize_text(main_content, 2000)
+                main_preview = summarize_text(main_content, 6000)
                 persistent_memory_block += f"### Main Index (full content available via read_main tool):\n{main_preview}\n\n"
                 persistent_memory_block += "**Note:** Use read_main action to read the full main.md file.\n\n"
                 if items:
                     persistent_memory_block += f"### Available Items ({len(items)} total, showing last 8):\n"
                     for item in items[-8:]:
                         # Don't truncate summaries too much - show more context
-                        summary_preview = summarize_text(item['summary'], 320)
+                        summary_preview = summarize_text(item['summary'], 3000)
                         persistent_memory_block += f"- **{item['title']}** ({item['file_path']}): {summary_preview}\n"
                 persistent_memory_block += "\nYou can reference these items and add new ones using write_note action.\n"
             except Exception as e:
@@ -407,10 +524,10 @@ class AgenticResearcher:
                 agent_file_block = "\n\n## Your Personal Agent File\n\n"
                 if agent_file.get("character"):
                     # Show more character and preferences context
-                    char_preview = summarize_text(agent_file['character'], 520)
+                    char_preview = summarize_text(agent_file['character'], 2000)
                     agent_file_block += f"**Character:** {char_preview}\n\n"
                 if agent_file.get("preferences"):
-                    pref_preview = summarize_text(agent_file['preferences'], 520)
+                    pref_preview = summarize_text(agent_file['preferences'], 2000)
                     agent_file_block += f"**Preferences:** {pref_preview}\n\n"
             except Exception as e:
                 logger.warning("Failed to load agent file", error=str(e), agent_id=agent_id)
@@ -473,18 +590,38 @@ Choose the next action (JSON only)."""
         return "Unknown action."
 
     async def _tool_web_search(self, args: dict[str, Any], agent_id: str) -> str:
-        queries = args.get("queries") or []
+        raw_queries = args.get("queries") or []
         max_results = int(args.get("max_results") or 5)
-        if isinstance(queries, str):
-            queries = [queries]
+        max_results = max(1, min(max_results, self.max_sources))
+        if isinstance(raw_queries, str):
+            raw_queries = [raw_queries]
+
+        queries = []
+        seen_queries = set()
+        topic_hint = self.current_topic or ""
+        topic_tokens = {token for token in re.findall(r"\w+", topic_hint.lower()) if len(token) > 3}
+        for query in raw_queries:
+            query_text = str(query).strip()
+            if not query_text or query_text in seen_queries:
+                continue
+            if topic_tokens:
+                overlap = sum(1 for token in topic_tokens if token in query_text.lower())
+                if overlap < 2:
+                    query_text = f"{topic_hint} {query_text}".strip()
+            seen_queries.add(query_text)
+            queries.append(query_text)
 
         if not queries:
             return "No queries provided."
 
+        seen_urls = {source.url for source in self.sources}
         summaries = []
         for query in queries[:3]:
             response = await self.search_provider.search(query, max_results=max_results)
             for result in response.results[:max_results]:
+                if not result.url or result.url in seen_urls:
+                    continue
+                seen_urls.add(result.url)
                 self.sources.append(
                     SourceReference(
                         url=result.url,
@@ -498,6 +635,19 @@ Choose the next action (JSON only)."""
             top = response.results[:3]
             summary = "; ".join([f"{item.title} ({item.url})" for item in top])
             summaries.append(f"{query}: {summary}")
+
+        max_pool = max(self.max_sources * 3, 30)
+        if len(self.sources) > max_pool:
+            trimmed = []
+            seen_urls = set()
+            for source in reversed(self.sources):
+                if source.url in seen_urls:
+                    continue
+                seen_urls.add(source.url)
+                trimmed.append(source)
+                if len(trimmed) >= max_pool:
+                    break
+            self.sources = list(reversed(trimmed))
 
         if self.current_topic:
             self.agent_memory.complete_todo(f"Run broad search on {self.current_topic}")
@@ -517,7 +667,7 @@ Choose the next action (JSON only)."""
         for url in urls[:3]:
             try:
                 content = await self.web_scraper.scrape(url, scroll=scroll)
-                snippets.append(f"{content.title}: {summarize_text(content.content, 420)}")
+                snippets.append(f"{content.title}: {summarize_text(content.content, 2000)}")
             except Exception as exc:
                 snippets.append(f"{url}: scrape failed ({exc})")
 
@@ -568,6 +718,7 @@ Choose the next action (JSON only)."""
                 
                 # Scroll down multiple times
                 previous_height = initial_height
+                new_height = initial_height
                 total_scrolled = 0
                 
                 for i in range(scrolls):
@@ -621,7 +772,7 @@ Choose the next action (JSON only)."""
                 
                 result = f"Scrolled {total_scrolled} times on '{page_title}'. Page height increased from {initial_height} to {new_height}px."
                 if viewport_content:
-                    result += f"\n\nViewport content (visible after scrolling):\n{summarize_text(viewport_content, 1000)}"
+                    result += f"\n\nViewport content (visible after scrolling):\n{summarize_text(viewport_content, 4000)}"
                 else:
                     result += "\n\nNo visible content captured in viewport."
                 
@@ -660,18 +811,34 @@ Choose the next action (JSON only)."""
     def _tool_add_todo(self, args: dict[str, Any], agent_id: str) -> str:
         items = args.get("items") or []
         added = 0
-        if isinstance(items, str):
+        if isinstance(items, (str, dict)):
             items = [items]
+        existing_titles = {todo.title for todo in self.agent_memory.todos}
         for item in items:
             if isinstance(item, str):
-                self.agent_memory.add_todo(item)
-                added += 1
-            elif isinstance(item, dict):
+                logger.warning("Todo item must be structured JSON, skipping string item", agent_id=agent_id)
+                continue
+            if not isinstance(item, dict):
+                continue
+            try:
+                todo = TodoItemSchema.model_validate(item)
+            except Exception as exc:
+                logger.warning("Invalid todo item schema", agent_id=agent_id, error=str(exc))
+                continue
+            title = todo.title.strip()
+            if title and title not in existing_titles:
                 self.agent_memory.add_todo(
-                    title=item.get("title", "Task"),
-                    note=item.get("note"),
-                    url=item.get("url"),
+                    title=title,
+                    objective=todo.objective,
+                    expected_output=todo.expected_output,
+                    sources_needed=todo.sources_needed,
+                    priority=todo.priority,
+                    reasoning=todo.reasoning,
+                    status=todo.status,
+                    note=todo.note,
+                    url=todo.url,
                 )
+                existing_titles.add(title)
                 added += 1
 
         if self.stream:
@@ -780,27 +947,53 @@ Choose the next action (JSON only)."""
 
     async def _tool_update_todo(self, args: dict[str, Any], agent_id: str) -> str:
         """Update own todo item."""
-        title = str(args.get("title") or "")
+        try:
+            update = TodoUpdateSchema.model_validate(args)
+        except Exception as exc:
+            logger.warning("Invalid todo update schema", agent_id=agent_id, error=str(exc))
+            return "Invalid todo update schema."
+
+        title = str(update.title or "").strip()
         if not title:
             return "No title provided."
-        
-        status = args.get("status")
-        note = args.get("note")
-        
+
         # Update in-memory todo
         updated = False
         for todo in self.agent_memory.todos:
             if todo.title == title:
-                if status:
-                    todo.status = status
-                if note is not None:
-                    todo.note = note
+                if update.status:
+                    todo.status = update.status
+                if update.note is not None:
+                    todo.note = update.note
+                if update.reasoning:
+                    todo.reasoning = update.reasoning
+                if update.objective is not None:
+                    todo.objective = update.objective
+                if update.expected_output is not None:
+                    todo.expected_output = update.expected_output
+                if update.sources_needed is not None:
+                    todo.sources_needed = update.sources_needed
+                if update.priority is not None:
+                    todo.priority = update.priority
+                if update.url is not None:
+                    todo.url = update.url
                 updated = True
                 break
         
         # Update in agent file
         if self.agent_file_service:
-            await self.agent_file_service.update_agent_todo(agent_id, title, status, note)
+            await self.agent_file_service.update_agent_todo(
+                agent_id,
+                title,
+                update.status,
+                update.note,
+                update.reasoning,
+                update.objective,
+                update.expected_output,
+                update.sources_needed,
+                update.priority,
+                update.url,
+            )
         
         if self.stream:
             self.stream.emit_agent_todo(agent_id, self._todo_payload())
@@ -827,15 +1020,15 @@ Choose the next action (JSON only)."""
             
             result = f"Agent file for {target_agent_id}:\n\n"
             if character:
-                result += f"Character: {summarize_text(character, 520)}\n\n"
+                result += f"Character: {summarize_text(character, 2000)}\n\n"
             if preferences:
-                result += f"Preferences: {summarize_text(preferences, 520)}\n\n"
+                result += f"Preferences: {summarize_text(preferences, 2000)}\n\n"
             result += "Todo List:\n"
             for todo in todos:
                 result += f"- [{todo.status}] {todo.title}\n"
             result += "\nNotes:\n"
             for note in notes:
-                result += f"- {summarize_text(str(note), 200)}\n"
+                result += f"- {summarize_text(str(note), 2000)}\n"
             return result
         except Exception as e:
             logger.warning("Failed to read agent file", agent_id=target_agent_id, error=str(e))
@@ -858,7 +1051,7 @@ Choose the next action (JSON only)."""
         notes = self.agent_memory.notes[-5:]
         if notes:
             # Don't truncate summary too much - preserve more information
-            summary = summarize_text(" ".join([note.summary for note in notes]), 3000)
+            summary = summarize_text(" ".join([note.summary for note in notes]), 6000)
             key_findings = [note.summary for note in notes[:5]]  # Increased from 3
             confidence = "medium" if self.sources else "low"
         else:
@@ -879,7 +1072,12 @@ Choose the next action (JSON only)."""
         """Return todos in JSON format for better parsing by all agents."""
         return [
             {
+                "reasoning": item.reasoning,
                 "title": item.title,
+                "objective": item.objective,
+                "expected_output": item.expected_output,
+                "sources_needed": item.sources_needed,
+                "priority": item.priority,
                 "status": item.status,
                 "note": item.note or "",
                 "url": item.url or "",
@@ -887,92 +1085,75 @@ Choose the next action (JSON only)."""
             for item in self.agent_memory.todos
         ]
 
-    def _parse_action(self, content: str) -> tuple[str, dict[str, Any]]:
-        """Parse action from LLM response, handling both JSON and Python repr formats."""
-        import re
-        
-        # Try to extract JSON first
-        try:
-            json_str = _extract_json(content)
-            if json_str and json_str != "{}":
-                payload = json.loads(json_str)
-                action = str(payload.get("action", "finish"))
-                args = payload.get("args") or {}
-                return action, args
-        except (json.JSONDecodeError, ValueError):
-            pass
-        
-        # Try to parse Python repr format: action='web_search' args={'queries': [...]}
-        try:
-            # Match action='...' or action="..."
-            action_match = re.search(r"action\s*=\s*['\"]([^'\"]+)['\"]", content)
-            if action_match:
-                action = action_match.group(1)
-                
-                # Try to extract args dictionary
-                args_match = re.search(r"args\s*=\s*(\{[^}]+\})", content, re.DOTALL)
-                if args_match:
-                    try:
-                        # Try to evaluate as Python dict (safely)
-                        args_str = args_match.group(1)
-                        # Replace single quotes with double quotes for JSON
-                        args_str = args_str.replace("'", '"')
-                        args = json.loads(args_str)
-                    except:
-                        # Fallback: try to extract key-value pairs manually
-                        args = {}
-                        # Extract queries if present
-                        queries_match = re.search(r"['\"]queries['\"]\s*:\s*\[([^\]]+)\]", content)
-                        if queries_match:
-                            queries_str = queries_match.group(1)
-                            # Extract quoted strings
-                            queries = re.findall(r"['\"]([^'\"]+)['\"]", queries_str)
-                            args["queries"] = queries
-                        
-                        # Extract max_results if present
-                        max_results_match = re.search(r"['\"]max_results['\"]\s*:\s*(\d+)", content)
-                        if max_results_match:
-                            args["max_results"] = int(max_results_match.group(1))
-                        
-                        # Extract urls if present
-                        urls_match = re.search(r"['\"]urls['\"]\s*:\s*\[([^\]]+)\]", content)
-                        if urls_match:
-                            urls_str = urls_match.group(1)
-                            urls = re.findall(r"['\"]([^'\"]+)['\"]", urls_str)
-                            args["urls"] = urls
-                        
-                        # Extract other common args
-                        for key in ["scroll", "url", "scrolls", "pause", "title", "summary", "file_path", "keyword", "limit", "agent_id", "status", "note", "titles", "items", "tags", "share"]:
-                            if key in ["scroll", "share"]:
-                                bool_match = re.search(rf"['\"]{key}['\"]\s*:\s*(True|False)", content)
-                                if bool_match:
-                                    args[key] = bool_match.group(1) == "True"
-                            elif key in ["scrolls", "pause", "limit"]:
-                                num_match = re.search(rf"['\"]{key}['\"]\s*:\s*([\d.]+)", content)
-                                if num_match:
-                                    args[key] = float(num_match.group(1)) if key == "pause" else int(num_match.group(1))
-                            else:
-                                str_match = re.search(rf"['\"]{key}['\"]\s*:\s*['\"]([^'\"]+)['\"]", content)
-                                if str_match:
-                                    args[key] = str_match.group(1)
-                        
-                        return action, args
+    async def _apply_supervisor_directives(self, agent_id: str) -> None:
+        if not self.shared_memory:
+            return
+        directives = self.shared_memory.pop_todo_directives(agent_id)
+        if not directives:
+            return
+
+        if self.stream and self.stream.app_state.get("debug_mode"):
+            logger.info("Applying supervisor directives", agent_id=agent_id, directives_count=len(directives))
+
+        updated = False
+        for directive in directives:
+            if not isinstance(directive, dict):
+                continue
+            payload = {k: v for k, v in directive.items() if k != "agent_id"}
+            try:
+                update = TodoUpdateSchema.model_validate(payload)
+            except Exception as exc:
+                logger.warning("Invalid supervisor directive", agent_id=agent_id, error=str(exc))
+                continue
+
+            matched = False
+            for todo in self.agent_memory.todos:
+                if todo.title == update.title:
+                    matched = True
+                    if update.status:
+                        todo.status = update.status
+                    if update.note is not None:
+                        todo.note = update.note
+                    if update.reasoning:
+                        todo.reasoning = update.reasoning
+                    if update.objective is not None:
+                        todo.objective = update.objective
+                    if update.expected_output is not None:
+                        todo.expected_output = update.expected_output
+                    if update.sources_needed is not None:
+                        todo.sources_needed = update.sources_needed
+                    if update.priority is not None:
+                        todo.priority = update.priority
+                    if update.url is not None:
+                        todo.url = update.url
+                    updated = True
+                    break
+
+            if not matched:
+                if update.objective and update.expected_output:
+                    self.agent_memory.add_todo(
+                        title=update.title,
+                        objective=update.objective,
+                        expected_output=update.expected_output,
+                        sources_needed=update.sources_needed or [],
+                        priority=update.priority or "medium",
+                        reasoning=update.reasoning,
+                        status=update.status or "pending",
+                        note=update.note,
+                        url=update.url,
+                    )
+                    updated = True
                 else:
-                    return action, {}
-        except Exception as e:
-            logger.warning("Agent action parse failed", response=content[:200], error=str(e))
-        
-        logger.warning("Agent JSON parse failed, using finish", response=content[:200])
-        return "finish", {}
+                    logger.warning(
+                        "Supervisor directive missing required fields for new todo",
+                        agent_id=agent_id,
+                        title=update.title,
+                    )
 
-
-def _extract_json(text: str) -> str:
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return "{}"
-    return text[start : end + 1]
-
+        if updated and self.agent_file_service:
+            await self.agent_file_service.write_agent_file(agent_id, todos=self.agent_memory.todos)
+        if updated and self.stream:
+            self.stream.emit_agent_todo(agent_id, self._todo_payload())
 
 def _format_findings(findings: list[ResearchFinding]) -> str:
     if not findings:
@@ -980,5 +1161,5 @@ def _format_findings(findings: list[ResearchFinding]) -> str:
     lines = []
     for finding in findings[-5:]:
         # Show more of each finding - don't truncate too much
-        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 520)}")
+        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 3000)}")
     return "\n".join(lines)

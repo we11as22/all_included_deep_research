@@ -18,6 +18,7 @@ from src.workflow.nodes.reporter import generate_final_report_node
 from src.workflow.nodes.researcher import researcher_node
 from src.workflow.state import ResearchFinding, ResearchState, SourceReference
 from src.utils.text import summarize_text
+from src.workflow.agentic.schemas import GapTopics
 
 logger = structlog.get_logger(__name__)
 
@@ -281,18 +282,19 @@ Research Query: {query}
 Current Findings:
 {findings}
 
-Return up to {max_topics} additional research topics, one per line. If coverage is sufficient, return "NONE"."""
+Return JSON with fields reasoning and topics. If coverage is sufficient, return an empty topics list."""
 
         findings_text = "\n".join(
-            [f"- {finding.topic}: {summarize_text(finding.summary, 220)}" for finding in findings[:6]]
+            [f"- {finding.topic}: {summarize_text(finding.summary, 3000)}" for finding in findings[:6]]
         )
 
-        response = await self.llm.ainvoke(
+        structured_llm = self.llm.with_structured_output(GapTopics, method="function_calling")
+        response = await structured_llm.ainvoke(
             [HumanMessage(content=prompt.format(query=query, findings=findings_text, max_topics=max_topics))]
         )
-        content = response.content if hasattr(response, "content") else str(response)
-        lines = [line.strip("- ").strip() for line in content.splitlines() if line.strip()]
-        topics = [line for line in lines if line.lower() != "none"]
+        if not isinstance(response, GapTopics):
+            raise ValueError("GapTopics response was not structured")
+        topics = response.topics
 
         deduped = []
         seen = {topic.lower() for topic in completed_topics}

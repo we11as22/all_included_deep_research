@@ -1,12 +1,12 @@
 """Supervisor node for coordinating researchers."""
 
 import structlog
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from langchain_core.prompts import ChatPromptTemplate
+from uuid import uuid4
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from src.workflow.state import ResearchFinding, SupervisorState
-from src.workflow.tools.conduct_research import conduct_research_tool
-from src.workflow.tools.think import think_tool
 
 logger = structlog.get_logger(__name__)
 
@@ -15,22 +15,37 @@ SUPERVISOR_SYSTEM_PROMPT = """You are a research supervisor coordinating a team 
 
 Your responsibilities:
 1. **Strategic Planning**: Analyze the research query and plan the investigation
-2. **Task Delegation**: Assign specific research topics to individual researchers using the conduct_research tool
+2. **Task Delegation**: Assign specific research topics to individual researchers
 3. **Quality Control**: Review findings and identify gaps or areas needing deeper investigation
 4. **Decision Making**: Decide when enough research has been conducted
 
-Available Tools:
-- **think**: Reflect on strategy before taking action (use this first!)
-- **conduct_research**: Delegate a specific research topic to a researcher
-
 Guidelines:
-- Always use the think tool first to plan your approach
+- Always reflect on strategy before taking action
 - Delegate research tasks that are specific and well-defined
 - Each researcher should investigate a distinct aspect of the query
 - Consider existing findings to avoid redundancy
 - Know when to stop and move to synthesis
 
+Return JSON with fields: reasoning, tool_calls, completed.
+tool_calls is a list of objects with name (think|conduct_research) and args.
+
 Current iteration: {iteration} / {max_iterations}"""
+
+
+class SupervisorToolCall(BaseModel):
+    """Structured tool call for supervisor decisions."""
+
+    reasoning: str = Field(..., description="Why this tool call is needed")
+    name: str = Field(..., description="Tool name: think or conduct_research")
+    args: dict = Field(default_factory=dict, description="Arguments for the tool")
+
+
+class SupervisorDecision(BaseModel):
+    """Structured supervisor decision output."""
+
+    reasoning: str = Field(..., description="Why these actions are chosen")
+    tool_calls: list[SupervisorToolCall] = Field(default_factory=list)
+    completed: bool = Field(default=False, description="Whether research should stop")
 
 
 async def supervisor_node(
@@ -92,38 +107,34 @@ Remember: Be strategic and avoid redundant research."""
         HumanMessage(content=user_message),
     ]
 
-    # Bind tools to LLM
-    llm_with_tools = llm.bind_tools([think_tool, conduct_research_tool])
+    structured_llm = llm.with_structured_output(SupervisorDecision, method="function_calling")
 
     try:
-        # Invoke supervisor
-        response = await llm_with_tools.ainvoke(messages)
+        response = await structured_llm.ainvoke(messages)
+        if not isinstance(response, SupervisorDecision):
+            raise ValueError("SupervisorDecision response was not structured")
 
-        # Extract tool calls
-        tool_calls = getattr(response, "tool_calls", [])
+        tool_calls = [
+            {"id": str(uuid4()), "name": call.name, "args": call.args}
+            for call in response.tool_calls
+            if call.name
+        ]
 
-        if tool_calls:
-            # Supervisor wants to use tools
-            logger.info("Supervisor issued tool calls", count=len(tool_calls))
-
-            # Store tool calls for graph to process
-            return {
-                "pending_tool_calls": {"type": "override", "value": tool_calls},
-                "supervisor_reasoning": {
-                    "type": "override",
-                    "value": response.content if hasattr(response, "content") else "",
-                },
-            }
-        else:
-            # No tool calls means supervisor is done
+        if response.completed or not tool_calls:
             logger.info("Supervisor completed without tool calls")
             return {
                 "completed": True,
                 "supervisor_reasoning": {
                     "type": "override",
-                    "value": response.content if hasattr(response, "content") else "Research complete",
+                    "value": response.reasoning,
                 },
             }
+
+        logger.info("Supervisor issued tool calls", count=len(tool_calls))
+        return {
+            "pending_tool_calls": {"type": "override", "value": tool_calls},
+            "supervisor_reasoning": {"type": "override", "value": response.reasoning},
+        }
 
     except Exception as e:
         logger.error("Supervisor node failed", error=str(e))

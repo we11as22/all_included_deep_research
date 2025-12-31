@@ -24,6 +24,11 @@ def _normalize_query(query: object) -> str:
     return str(query)
 
 
+def _format_vector_param(embedding: Sequence[float]) -> str:
+    """Format embedding for pgvector input when asyncpg expects text."""
+    return "[" + ", ".join(str(value) for value in embedding) + "]"
+
+
 class HybridSearchEngine:
     """Hybrid search combining vector and fulltext with RRF."""
 
@@ -130,6 +135,8 @@ class HybridSearchEngine:
         elif len(query_embedding) > 1536:
             query_embedding = query_embedding[:1536]
 
+        embedding_param = _format_vector_param(query_embedding)
+
         async with self.db_pool.acquire() as conn:
             # Build filters
             filters = []
@@ -199,12 +206,12 @@ class HybridSearchEngine:
             LIMIT $4;
             """
 
-            # Pass parameters explicitly: embedding (vector), query (str), rrf_k (int), limit (int), then filter params
-            # asyncpg requires vector to be passed as list[float], which it will convert to vector type
+            # Pass parameters explicitly: embedding (vector text), query (str), rrf_k (int), limit (int), then filter params
+            # Use text format for pgvector to avoid asyncpg type issues.
             # Build complete params list to avoid issues with *filter_params unpacking
             # CRITICAL: query MUST be a string for plainto_tsquery('english', $2)
             query = _normalize_query(query)
-            all_params = [query_embedding, query, self.rrf_k, limit] + filter_params
+            all_params = [embedding_param, query, self.rrf_k, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 
             results = [
@@ -245,6 +252,8 @@ class HybridSearchEngine:
             query_embedding = list(query_embedding) + [0.0] * (1536 - len(query_embedding))
         elif len(query_embedding) > 1536:
             query_embedding = query_embedding[:1536]
+
+        embedding_param = _format_vector_param(query_embedding)
 
         async with self.db_pool.acquire() as conn:
             filters = []
@@ -287,9 +296,9 @@ class HybridSearchEngine:
             LIMIT $2;
             """
 
-            # Pass parameters explicitly: embedding (vector), limit (int), then filter params
+            # Pass parameters explicitly: embedding (vector text), limit (int), then filter params
             # Build complete params list to avoid issues with *filter_params unpacking
-            all_params = [query_embedding, limit] + filter_params
+            all_params = [embedding_param, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 
             results = [

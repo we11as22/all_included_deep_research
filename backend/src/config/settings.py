@@ -148,14 +148,14 @@ class Settings(BaseSettings):
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")
     sources_limit: int = Field(default=8, description="Max sources to include in prompts")
     search_content_max_chars: int = Field(default=6000, description="Max chars per source before summarization")
-    chat_history_limit: int = Field(default=2, description="Chat messages to include in prompts")
+    chat_history_limit: int = Field(default=6, description="Chat messages to include in prompts")
     simple_search_max_results: int = Field(default=5, description="Max results for simple search")
     simple_search_scrape_top_n: int = Field(default=2, description="Top results to scrape in simple search")
     deep_search_max_results: int = Field(default=8, description="Max results per query in deep search")
     deep_search_queries: int = Field(default=3, description="Number of queries for deep search")
     deep_search_scrape_top_n: int = Field(default=4, description="Top results to scrape in deep search")
     deep_search_rerank_top_k: int = Field(default=6, description="Reranked results to keep in deep search")
-    deep_search_iterations: int = Field(default=2, description="Search refinement iterations for deep search")
+    deep_search_iterations: int = Field(default=3, description="Search refinement iterations for deep search")
     deep_search_quality_max_results: int = Field(
         default=12, description="Max results per query in quality deep search"
     )
@@ -165,7 +165,7 @@ class Settings(BaseSettings):
         default=10, description="Reranked results to keep in quality deep search"
     )
     deep_search_quality_iterations: int = Field(
-        default=5, description="Search refinement iterations for quality deep search"
+        default=6, description="Search refinement iterations for quality deep search"
     )
 
     max_retries: int = Field(default=3, description="Max retries for API calls")
@@ -173,6 +173,7 @@ class Settings(BaseSettings):
     rrf_k: int = Field(default=60, description="RRF K parameter")
     embedding_batch_size: int = Field(default=100, description="Embedding batch size")
     allow_clarification: bool = Field(default=True, description="Allow clarification questions in quality mode")
+    debug_mode: bool = Field(default=False, description="Enable debug logging for streams and frontend sync")
 
 
 @lru_cache

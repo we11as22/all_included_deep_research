@@ -63,9 +63,15 @@ class SearchSessionMemory:
         if not results:
             return
         top = results[:3]
-        snippets = "; ".join(
-            [f"{item.title}: {summarize_text(item.snippet, 140)}" for item in top if item.snippet]
-        )
+        formatted = []
+        for item in top:
+            if not item.snippet:
+                continue
+            snippet = item.snippet
+            if len(snippet) > 1200:
+                snippet = summarize_text(snippet, 1200)
+            formatted.append(f"{item.title}: {snippet}")
+        snippets = "; ".join(formatted)
         if snippets:
             self.notes.append(f"{query}: {snippets}")
 
@@ -130,6 +136,7 @@ class ChatSearchService:
         
         system_prompt = (
             f"You are a helpful AI assistant. Provide clear, accurate, and helpful responses. "
+            f"Return JSON with fields reasoning and answer. "
             f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs."
         )
         
@@ -141,24 +148,17 @@ class ChatSearchService:
             "Please provide a helpful and accurate response."
         )
         
+        structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
         try:
-            # Use structured output if available
-            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
-            if isinstance(response, SynthesizedAnswer):
-                answer = response.answer.strip()
-            else:
-                answer = response.content if hasattr(response, "content") else str(response)
-                answer = answer.strip()
-        except Exception:
-            # Fallback to regular LLM call
-            response = await self.chat_llm.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-            )
-            answer = response.content if hasattr(response, "content") else str(response)
-            answer = answer.strip()
+            if not isinstance(response, SynthesizedAnswer):
+                raise ValueError("SynthesizedAnswer response was not structured")
+            answer = response.answer.strip()
+        except Exception as exc:
+            logger.error("Structured answer generation failed", error=str(exc))
+            raise
         
         self._emit_status(stream, "Response generated", step="complete")
         
@@ -329,28 +329,21 @@ class ChatSearchService:
             f"IMPORTANT: Preserve the core meaning and key terms from the original query. "
             f"Use the chat history for context if needed. "
             f"Current date: {current_date} - consider this when rewriting queries about recent events. "
-            f"Return only the rewritten query, without quotes or explanations. "
+            f"Return JSON with fields reasoning and rewritten_query. "
             f"Example: 'расскажи про сорта пива' -> 'сорта пива типы классификация' (NOT 'какие-то' or unrelated terms)."
         )
         history_block = chat_history or "Chat history: None."
+        structured_llm = self.chat_llm.with_structured_output(QueryRewrite, method="function_calling")
         try:
-            # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(QueryRewrite, method="function_calling")
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
             )
-            if isinstance(response, QueryRewrite):
-                rewritten = response.rewritten_query or query
-            else:
-                rewritten = query
-        except Exception:
-            # Fallback to text parsing
-            response = await self.chat_llm.ainvoke(
-                [SystemMessage(content=prompt), HumanMessage(content=f"{history_block}\n\nUser query: {query}")]
-            )
-            text = response.content if hasattr(response, "content") else str(response)
-            rewritten = text.strip().strip('"')
-            rewritten = rewritten or query
+            if not isinstance(response, QueryRewrite):
+                raise ValueError("QueryRewrite response was not structured")
+            rewritten = response.rewritten_query or query
+        except Exception as exc:
+            logger.error("Structured query rewrite failed", error=str(exc))
+            rewritten = query
         
         # Final validation - ensure rewritten is always a string
         if not isinstance(rewritten, str):
@@ -380,33 +373,23 @@ class ChatSearchService:
             f"Generate concise web search queries for deeper research. "
             f"Use memory context if relevant. "
             f"Current date: {current_date} - consider this when generating queries about recent events. "
-            f"Return {max_queries} lines, one query per line."
+            f"Return JSON with fields reasoning and queries."
         )
+        structured_llm = self.chat_llm.with_structured_output(SearchQueries, method="function_calling")
         try:
-            # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(SearchQueries, method="function_calling")
             response = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=prompt),
                     HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
                 ]
             )
-            if isinstance(response, SearchQueries):
-                queries = response.queries[:max_queries]
-                return queries if queries else [query]
-        except Exception:
-            # Fallback to text parsing
-            response = await self.chat_llm.ainvoke(
-                [
-                    SystemMessage(content=prompt),
-                    HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
-                ]
-            )
-            content = response.content if hasattr(response, "content") else str(response)
-            queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
-            if not queries:
-                return [query]
-            return queries[:max_queries]
+            if not isinstance(response, SearchQueries):
+                raise ValueError("SearchQueries response was not structured")
+            queries = response.queries[:max_queries]
+            return queries if queries else [query]
+        except Exception as exc:
+            logger.error("Structured query generation failed", error=str(exc))
+            return [query]
 
     async def _generate_followup_queries(
         self,
@@ -426,20 +409,19 @@ class ChatSearchService:
         history_block = chat_history or "Chat history: None."
         results_block = "\n".join(
             [
-                f"- {item.title}: {item.snippet[:160]}"
+                f"- {item.title}: {summarize_text(item.snippet, 1200)}"
                 for item in results[:6]
             ]
         )
         current_date = get_current_date()
         prompt = (
-            f"Given the original query and existing search queries, propose 2-3 follow-up queries "
+            f"Given the original query and existing search queries, propose follow-up queries "
             f"that would fill gaps or validate key claims. "
             f"Current date: {current_date} - consider this when proposing queries about recent events. "
-            f"Return each query on its own line."
+            f"Return JSON with fields reasoning, should_continue, gap_summary, queries."
         )
+        structured_llm = self.chat_llm.with_structured_output(FollowupQueries, method="function_calling")
         try:
-            # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(FollowupQueries, method="function_calling")
             response = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=prompt),
@@ -454,29 +436,14 @@ class ChatSearchService:
                     ),
                 ]
             )
-            if isinstance(response, FollowupQueries):
-                queries = response.queries
-            else:
-                content = response.content if hasattr(response, "content") else str(response)
-                queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
-        except Exception:
-            # Fallback to text parsing
-            response = await self.chat_llm.ainvoke(
-                [
-                    SystemMessage(content=prompt),
-                    HumanMessage(
-                        content=(
-                            f"Query: {query}\n"
-                            f"Current date: {current_date}\n"
-                            f"Queries:\n"
-                            + "\n".join(existing_queries)
-                            + f"\n\nTop Results:\n{results_block}\n\n{memory_block}\n\n{session_block}\n\n{history_block}"
-                        )
-                    ),
-                ]
-            )
-            content = response.content if hasattr(response, "content") else str(response)
-            queries = [line.strip("- ").strip() for line in content.split("\n") if line.strip()]
+            if not isinstance(response, FollowupQueries):
+                raise ValueError("FollowupQueries response was not structured")
+            if not response.should_continue:
+                return []
+            queries = response.queries
+        except Exception as exc:
+            logger.error("Structured followup query generation failed", error=str(exc))
+            return []
         
         deduped = []
         for item in queries:
@@ -587,24 +554,20 @@ class ChatSearchService:
             trimmed = content.content[: self.settings.search_content_max_chars]
             prompt = (
                 "Summarize the following source for a research assistant. "
-                "Focus on facts relevant to the query. Keep it under 200 words."
+                "Focus on facts relevant to the query. Keep it under 200 words. "
+                "Return JSON with fields reasoning, summary, key_points."
             )
+            structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent, method="function_calling")
             try:
-                # Try structured output first
-                structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent, method="function_calling")
                 response = await structured_llm.ainvoke(
                     [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
                 )
-                if isinstance(response, SummarizedContent):
-                    summary = response.summary
-                else:
-                    summary = response.content if hasattr(response, "content") else str(response)
-            except Exception:
-                # Fallback to text parsing
-                response = await self.summarizer_llm.ainvoke(
-                    [SystemMessage(content=prompt), HumanMessage(content=f"Query: {query}\n\n{trimmed}")]
-                )
-                summary = response.content if hasattr(response, "content") else str(response)
+                if not isinstance(response, SummarizedContent):
+                    raise ValueError("SummarizedContent response was not structured")
+                summary = response.summary
+            except Exception as exc:
+                logger.error("Structured summarization failed", error=str(exc))
+                summary = summarize_text(trimmed, 2000)
             if stream:
                 self._emit_status(stream, f"Summarized {content.title}", "summarize")
             return ScrapedContent(
@@ -636,6 +599,7 @@ class ChatSearchService:
         current_date = get_current_date()
         system_prompt = (
             f"You are a research assistant. Answer with clear, concise reasoning. "
+            f"Return JSON with fields reasoning and answer. "
             f"Use the provided sources and cite them with [number] references. "
             f"If information is missing, say so. "
             f"Current date: {current_date} - always consider this when evaluating information recency and relevance."
@@ -651,24 +615,17 @@ class ChatSearchService:
             "Answer with citations like [1], [2]."
         )
 
+        structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
         try:
-            # Try structured output first
-            structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
-            if isinstance(response, SynthesizedAnswer):
-                return response.answer.strip()
-            else:
-                answer = response.content if hasattr(response, "content") else str(response)
-                return answer.strip()
-        except Exception:
-            # Fallback to text parsing
-            response = await self.chat_llm.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-            )
-            answer = response.content if hasattr(response, "content") else str(response)
-            return answer.strip()
+            if not isinstance(response, SynthesizedAnswer):
+                raise ValueError("SynthesizedAnswer response was not structured")
+            return response.answer.strip()
+        except Exception as exc:
+            logger.error("Structured answer synthesis failed", error=str(exc))
+            raise
 
     def _format_sources(self, sources: list[SearchResult], scraped: list[ScrapedContent]) -> str:
         scraped_map = {item.url: item for item in scraped}
@@ -688,7 +645,7 @@ class ChatSearchService:
         lines = ["Memory Context (from prior notes):"]
         for item in memory_context:
             lines.append(
-                f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 260)}"
+                f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 3000)}"
             )
         return "\n".join(lines)
 

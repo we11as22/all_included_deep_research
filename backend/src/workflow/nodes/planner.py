@@ -2,8 +2,6 @@
 
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
@@ -16,6 +14,8 @@ logger = structlog.get_logger(__name__)
 class ResearchPlan(BaseModel):
     """Structured research plan."""
 
+    reasoning: str = Field(..., description="Why this plan best answers the query")
+
     overview: str = Field(..., description="High-level overview of the research approach")
     topics: list[str] = Field(
         ...,
@@ -23,7 +23,7 @@ class ResearchPlan(BaseModel):
         min_length=1,
         max_length=10,
     )
-    rationale: str = Field(..., description="Reasoning behind this research plan")
+    rationale: str = Field(..., description="Additional justification for the plan structure")
 
 
 PLANNING_SYSTEM_PROMPT = """You are a research planning expert. Your role is to create a strategic research plan.
@@ -56,23 +56,7 @@ Research Mode: {mode}
 
 Based on this information, create a strategic research plan.
 
-Your response should include:
-1. **Overview**: Brief description of the research approach (2-3 sentences)
-2. **Topics**: List of specific topics to investigate (numbered list)
-3. **Rationale**: Why this plan will effectively answer the query (2-3 sentences)
-
-Format your response as:
-
-## Overview
-[Your overview here]
-
-## Research Topics
-1. [Topic 1]
-2. [Topic 2]
-...
-
-## Rationale
-[Your rationale here]"""
+Return JSON with fields: reasoning, overview, topics, rationale."""
 
 
 async def plan_research_node(
@@ -103,43 +87,39 @@ async def plan_research_node(
 
         chat_history = format_chat_history(messages, limit=len(messages))
 
-        # Create planning prompt
-        prompt = ChatPromptTemplate.from_messages(
-            [
-                SystemMessage(content=PLANNING_SYSTEM_PROMPT),
-                HumanMessage(
-                    content=PLANNING_USER_TEMPLATE.format(
-                        query=query,
-                        mode=mode,
-                        chat_history=chat_history,
-                        memory_context=memory_str,
-                    )
-                ),
-            ]
-        )
-
-        # Generate plan with structured output
+        structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
         try:
-            # Try structured output first
-            structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
             plan_obj = await structured_llm.ainvoke(
-                [SystemMessage(content=PLANNING_SYSTEM_PROMPT), HumanMessage(
-                    content=PLANNING_USER_TEMPLATE.format(
-                        query=query,
-                        mode=mode,
-                        chat_history=chat_history,
-                        memory_context=memory_str,
-                    )
-                )]
+                [
+                    SystemMessage(content=PLANNING_SYSTEM_PROMPT),
+                    HumanMessage(
+                        content=PLANNING_USER_TEMPLATE.format(
+                            query=query,
+                            mode=mode,
+                            chat_history=chat_history,
+                            memory_context=memory_str,
+                        )
+                    ),
+                ]
             )
-            topics = plan_obj.topics
-            plan_text = f"## Overview\n\n{plan_obj.overview}\n\n## Research Topics\n\n" + "\n".join(f"{i+1}. {t}" for i, t in enumerate(topics)) + f"\n\n## Rationale\n\n{plan_obj.rationale}"
+            if not isinstance(plan_obj, ResearchPlan):
+                raise ValueError("Planner returned non-structured output")
         except Exception as e:
-            logger.warning("Structured output failed, falling back to text parsing", error=str(e))
-            # Fallback to text parsing
-            chain = prompt | llm | StrOutputParser()
-            plan_text = await chain.ainvoke({})
-            topics = _extract_topics_from_plan(plan_text)
+            logger.error("Structured planning failed", error=str(e))
+            plan_obj = ResearchPlan(
+                reasoning="Fallback plan because structured planning failed.",
+                overview=f"Directly investigate: {query}",
+                topics=[query],
+                rationale="Single-topic fallback to keep research moving.",
+            )
+
+        topics = plan_obj.topics
+        plan_text = (
+            f"## Reasoning\n\n{plan_obj.reasoning}\n\n"
+            f"## Overview\n\n{plan_obj.overview}\n\n## Research Topics\n\n"
+            + "\n".join(f"{i+1}. {t}" for i, t in enumerate(topics))
+            + f"\n\n## Rationale\n\n{plan_obj.rationale}"
+        )
 
         # Limit topics based on mode
         max_topics = _get_max_topics_for_mode(mode)

@@ -36,6 +36,7 @@ services:
       MEMORY_DIR: /memory_files
       SEARXNG_INSTANCE_URL: http://localhost:8080
       SEARXNG_SECRET: ${SEARXNG_SECRET:-change_me_secret_key_please_change_in_production}
+      DEBUG_MODE: ${DEBUG_MODE:-false}
     env_file:
       - ./backend/.env
     volumes:
@@ -78,6 +79,7 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: http://backend:8000
       NODE_ENV: production
+      NEXT_PUBLIC_DEBUG_MODE: ${NEXT_PUBLIC_DEBUG_MODE:-false}
     ports:
       - "3000:3000"
     networks:

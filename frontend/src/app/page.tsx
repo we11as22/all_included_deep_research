@@ -40,6 +40,7 @@ const MAX_PROGRESS_FINDINGS = 30;
 const MAX_PROGRESS_AGENT_NOTES = 20;
 const MAX_PROGRESS_QUERIES = 12;
 const MAX_SAVED_PROGRESS = 20;
+const DEBUG_MODE = process.env.NEXT_PUBLIC_DEBUG_MODE === 'true';
 
 export default function HomePage() {
   const initialMode = (process.env.NEXT_PUBLIC_DEFAULT_MODE as ChatMode) || 'search';
@@ -82,6 +83,9 @@ export default function HomePage() {
       if (saved) {
         const parsed = JSON.parse(saved);
         setProgressByMessage(parsed);
+        if (DEBUG_MODE) {
+          console.debug('[debug] restored progressByMessage', parsed);
+        }
       }
     } catch (e) {
       console.error('Failed to load progress from localStorage:', e);
@@ -164,6 +168,9 @@ export default function HomePage() {
         [...messagePayload, { role: 'user' as const, content: userMessage.content }],
         backendMode as any
       )) {
+        if (DEBUG_MODE) {
+          console.debug('[debug] stream event', { type: event.type, data: event.data, sessionId: event.sessionId });
+        }
         // Capture session ID from first event
         if (event.sessionId && !sessionId) {
           sessionId = event.sessionId;
@@ -275,6 +282,9 @@ export default function HomePage() {
                 : message
             )
           );
+          if (DEBUG_MODE) {
+            console.debug('[debug] report chunk', { length: event.data.content?.length || 0 });
+          }
         }
 
         if (event.type === 'final_report') {
@@ -286,6 +296,9 @@ export default function HomePage() {
                 : message
             )
           );
+          if (DEBUG_MODE) {
+            console.debug('[debug] final report', { length: finalContent.length });
+          }
           
           // Save assistant message to DB if chat exists
           if (currentChatId && finalContent) {
@@ -347,6 +360,9 @@ export default function HomePage() {
       );
       setProgressByMessage({});
       localStorage.removeItem('progressByMessage');
+      if (DEBUG_MODE) {
+        console.debug('[debug] chat selected', { chatId, messages: dbMessages.length });
+      }
     } catch (error) {
       console.error('Failed to load chat:', error);
     }
@@ -361,6 +377,9 @@ export default function HomePage() {
     setCurrentSessionId(null);
     setError(null);
     localStorage.removeItem('progressByMessage');
+    if (DEBUG_MODE) {
+      console.debug('[debug] new chat started');
+    }
   };
 
   return (

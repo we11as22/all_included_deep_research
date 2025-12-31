@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from pathlib import Path
 from uuid import uuid4
 
 import structlog
@@ -11,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from src.api.models.chat import ChatCompletionRequest
 from src.streaming.sse import ResearchStreamingGenerator
 from src.utils.pdf_generator import markdown_to_pdf
+from src.memory.agent_session import create_agent_session_services, cleanup_agent_session_dir
 from fastapi.responses import Response
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -99,13 +101,24 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     app_state = {
         "agent_memory_service": app_request.app.state.agent_memory_service,
         "agent_file_service": app_request.app.state.agent_file_service,
+        "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
     async def run_task():
+        session_agent_dir: Path | None = None
         try:
             stream_generator.emit_init(mode=mode)
             stream_generator.emit_status("Starting chat workflow...", step="init")
+
+            if mode == "deep_research":
+                memory_root = Path(app_request.app.state.memory_manager.memory_dir)
+                agent_memory_service, agent_file_service, session_agent_dir = create_agent_session_services(
+                    memory_root, session_id
+                )
+                await agent_memory_service.read_main_file()
+                stream_generator.app_state["agent_memory_service"] = agent_memory_service
+                stream_generator.app_state["agent_file_service"] = agent_file_service
 
             if mode == "chat":
                 # Simple chat mode - no web search
@@ -166,20 +179,6 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 # Store final report in session for PDF generation
                 _store_session_report(app_request.app.state, session_id, final_report, query, mode)
                 
-                stream_generator.emit_status("Saving research to memory...", step="save_memory")
-                try:
-                    memory_manager = app_request.app.state.memory_manager
-                    file_path = _generate_memory_path(query)
-                    content = _format_memory_report(query, final_report)
-                    await memory_manager.create_file(
-                        file_path=file_path,
-                        title=query[:80],
-                        content=content,
-                    )
-                    embedding_dimension = getattr(app_request.app.state, "embedding_dimension", 1536)
-                    await memory_manager.sync_file_to_db(file_path, embedding_dimension=embedding_dimension)
-                except Exception as exc:
-                    stream_generator.emit_error(error=str(exc), details="Memory save failed")
             stream_generator.emit_done()
 
         except asyncio.CancelledError:
@@ -187,12 +186,6 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             stream_generator.emit_status("Chat cancelled by user", step="cancelled")
             stream_generator.emit_done()
         except Exception as exc:
-            # Ensure stream is closed even on error
-            try:
-                stream_generator.emit_error(error=str(exc), details="Chat stream failed")
-                stream_generator.emit_done()
-            except Exception:
-                pass  # Ignore errors during cleanup
             error_str = str(exc)
             error_details = "Chat stream failed"
             
@@ -214,11 +207,17 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             else:
                 logger.error("Chat stream failed", error=error_str, exc_info=True)
             
-            stream_generator.emit_error(error=error_details, details="Chat stream failed")
-            stream_generator.emit_done()
+            try:
+                stream_generator.emit_error(error=error_details, details="Chat stream failed")
+                stream_generator.emit_done()
+            except Exception:
+                pass  # Ignore errors during cleanup
         finally:
             # Remove task from active tasks
             app_request.app.state.active_tasks.pop(session_id, None)
+            if session_agent_dir:
+                memory_root = Path(app_request.app.state.memory_manager.memory_dir)
+                cleanup_agent_session_dir(memory_root, session_agent_dir)
 
     # Start background task and store it
     task = asyncio.create_task(run_task())
@@ -238,16 +237,6 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
 def _chunk_text(text: str, size: int = 180) -> list[str]:
     return [text[i : i + size] for i in range(0, len(text), size)]
-
-
-def _generate_memory_path(query: str) -> str:
-    safe = "".join(ch for ch in query.lower() if ch.isalnum() or ch in (" ", "_", "-")).strip()
-    slug = "_".join(safe.split())[:60] or "research"
-    return f"conversations/{slug}.md"
-
-
-def _format_memory_report(query: str, report: str) -> str:
-    return f"# {query}\n\n{report}\n"
 
 
 @router.post("/stream/{session_id}/cancel")

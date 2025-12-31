@@ -11,6 +11,21 @@ import structlog
 logger = structlog.get_logger(__name__)
 
 
+def _debug_payload(value: Any) -> Any:
+    if isinstance(value, str):
+        if len(value) > 2000:
+            return {"length": len(value), "preview": value[:500]}
+        return value
+    if isinstance(value, dict):
+        output = {}
+        for key, item in value.items():
+            output[key] = _debug_payload(item)
+        return output
+    if isinstance(value, list):
+        return [_debug_payload(item) for item in value[:20]]
+    return value
+
+
 class StreamEventType(str, Enum):
     """Types of events that can be streamed."""
 
@@ -129,6 +144,13 @@ class ResearchStreamingGenerator(StreamingGenerator):
             "timestamp": time.time(),
             "data": data,
         }
+        if self.app_state.get("debug_mode"):
+            logger.info(
+                "stream_event",
+                session_id=self.session_id,
+                event_type=event_type.value,
+                data=_debug_payload(data),
+            )
         return f"data: {json.dumps(event)}\n\n"
 
     def emit_init(self, mode: str) -> None:
