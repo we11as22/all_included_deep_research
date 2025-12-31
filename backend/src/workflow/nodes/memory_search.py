@@ -1,6 +1,7 @@
 """Memory search node for retrieving relevant context."""
 
 import structlog
+import re
 
 from src.memory.hybrid_search import HybridSearchEngine
 from src.memory.models.search import SearchMode
@@ -76,7 +77,48 @@ async def search_memory_node(
             limit=search_limit,
         )
 
-        filtered_results = [result for result in search_results if result.file_category != "chat"]
+        filtered_results = [
+            result
+            for result in search_results
+            if result.file_category not in {"chat", "conversation", "conversations"}
+        ]
+        if filtered_results:
+            filtered_results.sort(key=lambda item: item.score, reverse=True)
+            top_score = filtered_results[0].score
+            if top_score > 0:
+                threshold = top_score * 0.4
+                score_filtered = [item for item in filtered_results if item.score >= threshold]
+                min_keep = min(3, len(filtered_results))
+                if len(score_filtered) >= min_keep:
+                    logger.info(
+                        "Filtered low-relevance memory results",
+                        before=len(filtered_results),
+                        after=len(score_filtered),
+                        threshold=threshold,
+                        top_score=top_score,
+                    )
+                    filtered_results = score_filtered
+
+        query_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 3}
+        if query_tokens and filtered_results:
+            token_filtered = []
+            for result in filtered_results:
+                haystack = f"{result.file_title} {result.content}".lower()
+                if any(token in haystack for token in query_tokens):
+                    token_filtered.append(result)
+            if token_filtered:
+                logger.info(
+                    "Filtered memory results by query tokens",
+                    before=len(filtered_results),
+                    after=len(token_filtered),
+                )
+                filtered_results = token_filtered
+            else:
+                logger.info(
+                    "No memory results matched query tokens; returning empty context",
+                    before=len(filtered_results),
+                )
+                filtered_results = []
 
         # Convert to MemoryContext objects
         memory_context = [

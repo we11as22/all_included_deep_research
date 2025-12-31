@@ -1,13 +1,50 @@
 """Pydantic schemas for structured LLM outputs."""
 
 from typing import Literal, Optional, Any
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
 
 class AgentAction(BaseModel):
     """Structured output for agent actions."""
     
     model_config = ConfigDict(extra='forbid')
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_args(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        if "args" in values:
+            return values
+        arg_keys = {
+            "queries",
+            "max_results",
+            "urls",
+            "scroll",
+            "scrolls",
+            "pause",
+            "url",
+            "content",
+            "title",
+            "summary",
+            "tags",
+            "share",
+            "file_path",
+            "items",
+            "titles",
+            "keyword",
+            "limit",
+            "status",
+            "note",
+            "objective",
+            "expected_output",
+            "sources_needed",
+            "priority",
+        }
+        args = {key: values.pop(key) for key in list(values.keys()) if key in arg_keys}
+        if args:
+            values = {**values, "args": args}
+        return values
     
     reasoning: str = Field(..., description="Brief reasoning for the chosen action")
 
@@ -15,6 +52,7 @@ class AgentAction(BaseModel):
         "web_search",
         "scrape_urls",
         "scroll_page",
+        "summarize_content",
         "write_note",
         "update_note",
         "read_note",
@@ -34,10 +72,45 @@ class AgentAction(BaseModel):
 
 
 class SupervisorAction(BaseModel):
-    """Structured output for supervisor ReAct actions."""
-    
+    """Structured output for a single supervisor ReAct action."""
+
     model_config = ConfigDict(extra='forbid')
-    
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_args(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        if "args" in values:
+            return values
+        arg_keys = {
+            "tasks",
+            "stop",
+            "agent_id",
+            "character",
+            "preferences",
+            "initial_todos",
+            "todo_title",
+            "title",
+            "status",
+            "note",
+            "objective",
+            "expected_output",
+            "sources_needed",
+            "priority",
+            "url",
+            "updates",
+            "file_path",
+            "content",
+            "section",
+            "urls",
+            "tags",
+        }
+        args = {key: values.pop(key) for key in list(values.keys()) if key in arg_keys}
+        if args:
+            values = {**values, "args": args}
+        return values
+
     reasoning: str = Field(..., description="Brief reasoning for the chosen action")
 
     action: Literal[
@@ -51,10 +124,45 @@ class SupervisorAction(BaseModel):
         "write_note",
         "read_main"
     ] = Field(..., description="Supervisor action to perform")
-    
+
     args: dict[str, Any] = Field(
         default_factory=dict,
         description="Action arguments"
+    )
+
+
+class SupervisorActions(BaseModel):
+    """Structured output for supervisor ReAct with multiple actions."""
+
+    model_config = ConfigDict(extra='forbid')
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_actions(cls, values: Any) -> Any:
+        if not isinstance(values, dict):
+            return values
+        if "actions" in values:
+            return values
+        if "action" in values:
+            action_payload = {k: values.get(k) for k in ("reasoning", "action", "args") if k in values}
+            extra = {
+                key: val
+                for key, val in values.items()
+                if key not in {"actions", "reasoning", "action", "args"}
+            }
+            if extra:
+                action_payload.update(extra)
+            return {
+                "reasoning": values.get("reasoning") or "Supervisor action",
+                "actions": [action_payload],
+            }
+        return values
+
+    reasoning: str = Field(..., description="Why these supervisor actions are chosen")
+
+    actions: list[SupervisorAction] = Field(
+        default_factory=list,
+        description="Ordered list of supervisor actions to execute",
     )
 
 
@@ -78,7 +186,7 @@ class SupervisorTasks(BaseModel):
 
 class SearchQueries(BaseModel):
     """Structured output for search query generation."""
-    
+
     reasoning: str = Field(..., description="Why these queries cover the topic")
 
     queries: list[str] = Field(
@@ -91,7 +199,7 @@ class SearchQueries(BaseModel):
 
 class ResearchAnalysis(BaseModel):
     """Structured output for research analysis and synthesis."""
-    
+
     reasoning: str = Field(..., description="Why the evidence supports this analysis")
 
     summary: str = Field(
@@ -115,7 +223,7 @@ class ResearchAnalysis(BaseModel):
 
 class QueryRewrite(BaseModel):
     """Structured output for query rewriting."""
-    
+
     reasoning: str = Field(..., description="Why this rewrite best fits the intent")
 
     rewritten_query: str = Field(
@@ -127,7 +235,7 @@ class QueryRewrite(BaseModel):
 
 class FollowupQueries(BaseModel):
     """Structured output for follow-up query generation."""
-    
+
     reasoning: str = Field(..., description="Why follow-up queries are or are not needed")
 
     should_continue: bool = Field(
@@ -150,8 +258,6 @@ class FollowupQueries(BaseModel):
 
 class SummarizedContent(BaseModel):
     """Structured output for content summarization."""
-    
-    reasoning: str = Field(..., description="Why these points are most relevant")
 
     summary: str = Field(
         ...,
@@ -167,7 +273,7 @@ class SummarizedContent(BaseModel):
 
 class SynthesizedAnswer(BaseModel):
     """Structured output for answer synthesis."""
-    
+
     reasoning: str = Field(..., description="Why the answer follows from the evidence")
 
     answer: str = Field(
@@ -184,7 +290,7 @@ class SynthesizedAnswer(BaseModel):
 
 class CompressedFindings(BaseModel):
     """Structured output for findings compression."""
-    
+
     reasoning: str = Field(..., description="Why these themes and sources were prioritized")
 
     compressed_summary: str = Field(

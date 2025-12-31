@@ -20,7 +20,9 @@ class ResearchMode(str, Enum):
             return cls.SPEED
         elif "balanced" in mode_lower:
             return cls.BALANCED
-        elif "quality" in mode_lower or "deep" in mode_lower:
+        elif "deep_search" in mode_lower:
+            return cls.BALANCED
+        elif "deep_research" in mode_lower or "quality" in mode_lower:
             return cls.QUALITY
 
         # Default to balanced

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -13,7 +14,7 @@ from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.agentic.models import SharedResearchMemory
 from src.workflow.agentic.researcher import AgenticResearcher
-from src.workflow.agentic.schemas import SupervisorAction, SupervisorTasks, TodoUpdateSchema
+from src.workflow.agentic.schemas import SupervisorActions, SupervisorTasks, TodoUpdateSchema
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.workflow.state import ResearchFinding
 from src.utils.chat_history import format_chat_history
@@ -33,9 +34,11 @@ def get_supervisor_system_prompt() -> str:
 Current date: {current_date}
 
 You must respond with a single JSON object:
-{{"reasoning": "...", "action": "<tool_name or plan_tasks>", "args": {{...}}}}
+{{"reasoning": "...", "actions": [{{"reasoning": "...", "action": "<tool_name or plan_tasks>", "args": {{...}}}}]}}
 
-Allowed actions (reasoning is always top-level, only args shown here):
+You can return multiple actions in order. Return an empty actions list when you are done and want to sleep.
+
+Allowed actions (reasoning is always included per action, only args shown here):
 - plan_tasks: args {{ "tasks": ["topic1", "topic2"], "stop": false }}
 - create_agent: args {{ "agent_id": "...", "character": "...", "preferences": "...", "initial_todos": ["..."] }}
 - write_to_main: args {{ "content": "...", "section": "Notes|Quick Reference" }}
@@ -127,7 +130,7 @@ class AgenticResearchCoordinator:
     ) -> None:
         self.llm = llm
         self.llm_planning = llm.with_structured_output(SupervisorTasks, method="function_calling")
-        self.llm_react = llm.with_structured_output(SupervisorAction, method="function_calling")
+        self.llm_react = llm.with_structured_output(SupervisorActions, method="function_calling")
         self.search_provider = search_provider
         self.web_scraper = web_scraper
         self.memory_context = memory_context
@@ -187,7 +190,7 @@ class AgenticResearchCoordinator:
         if self.agent_memory_service:
             try:
                 main_content = await self.agent_memory_service.read_main_file()
-                main_content = summarize_text(main_content, 6000)
+                main_content = summarize_text(main_content, 12000)
             except Exception:
                 main_content = ""
 
@@ -281,33 +284,61 @@ Provide up to {max_tasks} tasks in JSON only with fields: reasoning, tasks, stop
                 [SystemMessage(content=get_supervisor_system_prompt()), HumanMessage(content=prompt)]
             )
 
-            if not isinstance(response, SupervisorAction):
+            if not isinstance(response, SupervisorActions):
                 raise ValueError("Supervisor action response was not structured")
 
-            action = response.action
-            args = response.args
+            actions = response.actions or []
+            if not actions:
+                return {"actions": [], "tasks": [], "directives": []}
 
-            if action == "create_agent":
-                return await self._tool_create_agent(args)
-            if action == "write_to_main":
-                return await self._tool_write_to_main(args)
-            if action == "read_agent_file":
-                return await self._tool_read_agent_file(args)
-            if action == "update_agent_todo":
-                return await self._tool_update_agent_todo(args)
-            if action == "update_agent_todos":
-                return await self._tool_update_agent_todos(args)
-            if action == "read_note":
-                return await self._tool_read_note(args)
-            if action == "write_note":
-                return await self._tool_write_note(args)
-            if action == "read_main":
-                return await self._tool_read_main()
+            results: list[dict[str, Any]] = []
+            directives: list[dict[str, Any]] = []
+            tasks: list[str] = []
+            action_names: list[str] = []
 
-            return {"action": "plan_tasks", "tasks": args.get("tasks", [])}
+            for action_item in actions:
+                action = action_item.action
+                args = action_item.args or {}
+                action_names.append(action)
+                result = await self._execute_supervisor_action(action, args)
+                results.append(result)
+                directives.extend(result.get("directives") or [])
+                tasks.extend(result.get("tasks") or [])
+
+            tasks = _dedupe_tasks(tasks)
+
+            return {
+                "actions": action_names,
+                "directives": directives,
+                "tasks": tasks,
+                "results": results,
+            }
         except Exception as exc:
             logger.warning("Supervisor ReAct step failed", error=str(exc))
-            return {"action": "plan_tasks", "tasks": []}
+            return {"actions": [], "tasks": [], "directives": []}
+
+    async def _execute_supervisor_action(self, action: str, args: dict[str, Any]) -> dict[str, Any]:
+        if action == "create_agent":
+            return await self._tool_create_agent(args)
+        if action == "write_to_main":
+            return await self._tool_write_to_main(args)
+        if action == "read_agent_file":
+            return await self._tool_read_agent_file(args)
+        if action == "update_agent_todo":
+            return await self._tool_update_agent_todo(args)
+        if action == "update_agent_todos":
+            return await self._tool_update_agent_todos(args)
+        if action == "read_note":
+            return await self._tool_read_note(args)
+        if action == "write_note":
+            return await self._tool_write_note(args)
+        if action == "read_main":
+            return await self._tool_read_main()
+        if action == "plan_tasks":
+            raw_tasks = args.get("tasks") or []
+            tasks = [str(task).strip() for task in raw_tasks if str(task).strip()]
+            return {"action": "plan_tasks", "tasks": tasks}
+        return {"action": action, "result": "Unknown action"}
 
     async def _build_react_prompt(
         self,
@@ -327,7 +358,7 @@ Provide up to {max_tasks} tasks in JSON only with fields: reasoning, tasks, stop
         if self.agent_memory_service:
             try:
                 main_content = await self.agent_memory_service.read_main_file()
-                main_content = summarize_text(main_content, 6000)
+                main_content = summarize_text(main_content, 12000)
             except Exception:
                 main_content = ""
 
@@ -344,7 +375,7 @@ Research query: {query}
 Current date: {current_date}
 
 Agent {agent_id} just performed: {agent_action}
-Result: {summarize_text(str(action_result), 6000)}
+Result: {summarize_text(str(action_result), 12000)}
 
 {chat_block}
 
@@ -391,7 +422,7 @@ Decide what to do next. You can:
 - plan_tasks: Plan new high-level tasks (but prefer update_agent_todo for specific agent guidance)
 - Do nothing ONLY if research is truly deep and comprehensive AND agent is actively updating todos
 
-Respond with JSON action."""
+You may return multiple actions in order. Respond with JSON containing reasoning and an actions list."""
 
     async def _tool_write_to_main(self, args: dict[str, Any]) -> dict[str, Any]:
         if not self.agent_memory_service:
@@ -562,7 +593,7 @@ Respond with JSON action."""
         file_path = str(args.get("file_path") or "")
         try:
             content = await self.agent_memory_service.file_manager.read_file(file_path)
-            return {"action": "read_note", "result": summarize_text(content, 6000)}
+            return {"action": "read_note", "result": summarize_text(content, 12000)}
         except Exception as e:
             return {"action": "read_note", "result": f"Failed: {str(e)}"}
 
@@ -591,7 +622,7 @@ Respond with JSON action."""
 
         try:
             content = await self.agent_memory_service.read_main_file()
-            return {"action": "read_main", "result": summarize_text(content, 6000)}
+            return {"action": "read_main", "result": summarize_text(content, 12000)}
         except Exception as e:
             return {"action": "read_main", "result": f"Failed: {str(e)}"}
 
@@ -634,7 +665,7 @@ Respond with JSON action."""
             status_lines.append("### Recent Findings:")
             status_lines.append("")
             for finding in findings[-5:]:
-                status_lines.append(f"- **{finding.topic}**: {summarize_text(finding.summary, 4000)}")
+                status_lines.append(f"- **{finding.topic}**: {summarize_text(finding.summary, 8000)}")
                 status_lines.append("")
 
             status_content = "\n".join(status_lines)
@@ -709,6 +740,12 @@ Respond with JSON action."""
         self.query = query
         self._reset_session()
         findings: list[ResearchFinding] = []
+
+        if self.agent_memory_service:
+            try:
+                await self.agent_memory_service.read_main_file()
+            except Exception as exc:
+                logger.warning("Failed to initialize main agent memory file", error=str(exc))
 
         if seed_tasks:
             tasks = seed_tasks[: self.max_concurrent]
@@ -806,12 +843,18 @@ Respond with JSON action."""
                     "notes": [
                         {
                             "title": note.title,
-                            "summary": summarize_text(note.summary, 2000),
+                            "summary": summarize_text(note.summary, 4000),
                             "urls": note.urls,
                         }
                         for note in result.memory.notes
                     ],
                 }
+
+                if self.agent_file_service and self._should_cleanup_agent_files():
+                    try:
+                        await self.agent_file_service.delete_agent_file(agent_id)
+                    except Exception as exc:
+                        logger.warning("Failed to cleanup agent file", agent_id=agent_id, error=str(exc))
 
                 return result.finding, agent_id, agent_status
 
@@ -845,7 +888,7 @@ Respond with JSON action."""
 
             shared_note = AgentNote(
                 title=f"Finding: {finding.topic}",
-                summary=summarize_text(finding.summary, 4000),
+                summary=summarize_text(finding.summary, 8000),
                 urls=[source.url for source in finding.sources[:3]],
                 tags=["finding"],
             )
@@ -861,6 +904,15 @@ Respond with JSON action."""
                 pass
             except Exception as e:
                 logger.warning("Failed to clear agent files during reset", error=str(e))
+
+    def _should_cleanup_agent_files(self) -> bool:
+        if not self.agent_file_service:
+            return False
+        try:
+            memory_dir = Path(self.agent_file_service.file_manager.memory_dir)
+        except Exception:
+            return False
+        return "agent_sessions" in memory_dir.parts
 
     def _build_assignment(self, topic: str) -> str:
         query = self.query or "unknown"
@@ -893,7 +945,7 @@ def _format_findings(findings: list[ResearchFinding]) -> str:
         return "None."
     lines = []
     for finding in findings[-6:]:
-        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 4000)}")
+        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 8000)}")
     return "\n".join(lines)
 
 
@@ -909,12 +961,12 @@ def _format_agent_file_snapshot(agent_file: dict[str, Any]) -> str:
 
     if character:
         lines.append("Character:")
-        lines.append(summarize_text(character, 2000))
+        lines.append(summarize_text(character, 4000))
         lines.append("")
 
     if preferences:
         lines.append("Preferences:")
-        lines.append(summarize_text(preferences, 2000))
+        lines.append(summarize_text(preferences, 4000))
         lines.append("")
 
     lines.append("Todos:")
@@ -939,6 +991,21 @@ def _format_agent_file_snapshot(agent_file: dict[str, Any]) -> str:
         lines.append("")
         lines.append("Notes:")
         for note in notes[-5:]:
-            lines.append(f"- {summarize_text(str(note), 800)}")
+            lines.append(f"- {summarize_text(str(note), 1600)}")
 
     return "\n".join(lines).strip()
+
+
+def _dedupe_tasks(tasks: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for task in tasks:
+        task_text = str(task).strip()
+        if not task_text:
+            continue
+        key = task_text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(task_text)
+    return unique

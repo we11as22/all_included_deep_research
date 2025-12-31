@@ -1,5 +1,6 @@
 """Research planning node."""
 
+import re
 import structlog
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -43,7 +44,9 @@ Your plan should be:
 Mode-specific guidance:
 - **Speed mode**: 1-2 topics, very targeted
 - **Balanced mode**: 3-5 topics, balanced coverage
-- **Quality mode**: 5-8 topics, comprehensive exploration"""
+- **Quality mode**: 5-8 topics, comprehensive exploration
+
+CRITICAL: Every topic MUST explicitly reference the user's query. Do not output generic topics."""
 
 
 PLANNING_USER_TEMPLATE = """Research Query: {query}
@@ -113,7 +116,7 @@ async def plan_research_node(
                 rationale="Single-topic fallback to keep research moving.",
             )
 
-        topics = plan_obj.topics
+        topics = _align_topics_with_query(plan_obj.topics, query)
         plan_text = (
             f"## Reasoning\n\n{plan_obj.reasoning}\n\n"
             f"## Overview\n\n{plan_obj.overview}\n\n## Research Topics\n\n"
@@ -195,6 +198,25 @@ def _extract_topics_from_plan(plan_text: str) -> list[str]:
                 topics.append(match.group(1))
 
     return topics
+
+
+def _align_topics_with_query(topics: list[str], query: str) -> list[str]:
+    if not query:
+        return topics
+    anchor_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 4}
+    if not anchor_tokens:
+        return topics
+
+    aligned: list[str] = []
+    for topic in topics:
+        topic_text = str(topic).strip()
+        if not topic_text:
+            continue
+        if any(token in topic_text.lower() for token in anchor_tokens):
+            aligned.append(topic_text)
+        else:
+            aligned.append(f"{query}: {topic_text}")
+    return aligned
 
 
 def _get_max_topics_for_mode(mode: str) -> int:

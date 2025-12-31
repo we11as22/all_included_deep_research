@@ -195,12 +195,12 @@ class AgentMemoryService:
         if next_section != -1:
             # Insert before next section
             insert_pos = items_section_start + next_section
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 1000)}\n\n"
+            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 2000)}\n\n"
             content = content[:insert_pos] + new_item + content[insert_pos:]
         else:
             # Append to end of Items section
             insert_pos = items_section_start + items_content_start
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 1000)}\n\n"
+            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 2000)}\n\n"
             content = content[:insert_pos] + new_item + content[insert_pos:]
 
         # Update last_updated

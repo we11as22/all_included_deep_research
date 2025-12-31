@@ -81,6 +81,23 @@ class AgentFileService:
         await self.file_manager.write_file(file_path, content)
         logger.info("Agent file written", agent_id=agent_id, file_path=file_path)
 
+    async def delete_agent_file(self, agent_id: str) -> bool:
+        """
+        Delete agent's personal file.
+
+        Returns:
+            True if file was deleted, False if it didn't exist.
+        """
+        file_path = f"{self.agents_dir}/{agent_id}.md"
+        try:
+            await self.file_manager.delete_file(file_path)
+            return True
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            logger.warning("Failed to delete agent file", agent_id=agent_id, error=str(exc))
+            return False
+
     async def update_agent_todo(
         self,
         agent_id: str,

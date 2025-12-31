@@ -99,6 +99,7 @@ async def generate_final_report_node(
     mode = state.get("mode", "balanced")
     memory_context = state.get("memory_context", [])
     stream = state.get("stream")
+    suppress_stream = bool(state.get("suppress_final_report_stream"))
 
     logger.info(
         "Generating final report",
@@ -115,7 +116,7 @@ async def generate_final_report_node(
     if memory_context:
         memory_block = "\n## Memory Context\n" + "\n".join(
             [
-                f"- {ctx.file_title} ({ctx.file_path}): {summarize_text(ctx.content, 3000)}"
+                f"- {ctx.file_title} ({ctx.file_path}): {summarize_text(ctx.content, 6000)}"
                 for ctx in memory_context[:3]
             ]
         )
@@ -168,7 +169,7 @@ Return JSON with fields reasoning and report."""
             report_length=len(report),
         )
 
-        if stream and report:
+        if stream and report and not suppress_stream:
             for i in range(0, len(report), 200):
                 stream.emit_report_chunk(report[i : i + 200])
             stream.emit_final_report(report)
@@ -183,7 +184,7 @@ Return JSON with fields reasoning and report."""
         # Fallback: create simple report
         fallback_report = _create_fallback_report(query, findings, memory_context)
 
-        if stream:
+        if stream and not suppress_stream:
             for i in range(0, len(fallback_report), 200):
                 stream.emit_report_chunk(fallback_report[i : i + 200])
             stream.emit_final_report(fallback_report)

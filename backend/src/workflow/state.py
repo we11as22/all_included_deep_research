@@ -97,6 +97,7 @@ class ResearchState(TypedDict, total=False):
 
     # Streaming
     stream: Any
+    suppress_final_report_stream: bool
 
 
 # ===================================================================

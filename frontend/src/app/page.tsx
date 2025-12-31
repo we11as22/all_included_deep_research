@@ -42,6 +42,20 @@ const MAX_PROGRESS_QUERIES = 12;
 const MAX_SAVED_PROGRESS = 20;
 const DEBUG_MODE = process.env.NEXT_PUBLIC_DEBUG_MODE === 'true';
 
+const summarizeProgressState = (progress: ProgressState) => ({
+  status: progress.status,
+  step: progress.step,
+  queries: progress.queries?.length || 0,
+  memory: progress.memoryContext.length,
+  topics: progress.topics.length,
+  findings: progress.findings.length,
+  sources: progress.sources.length,
+  agents: Object.keys(progress.agentTodos).length,
+  todos: Object.values(progress.agentTodos).reduce((sum, items) => sum + items.length, 0),
+  notes: Object.values(progress.agentNotes).reduce((sum, items) => sum + items.length, 0),
+  isComplete: progress.isComplete,
+});
+
 export default function HomePage() {
   const initialMode = (process.env.NEXT_PUBLIC_DEFAULT_MODE as ChatMode) || 'search';
   const [mode, setMode] = useState<ChatMode>(initialMode);
@@ -269,6 +283,10 @@ export default function HomePage() {
             case 'done':
               next.isComplete = true;
               break;
+          }
+
+          if (DEBUG_MODE) {
+            console.debug('[debug] progress update', { event: event.type, summary: summarizeProgressState(next) });
           }
 
           return { ...prev, [assistantMessage.id]: next };

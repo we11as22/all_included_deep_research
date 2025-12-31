@@ -177,7 +177,7 @@ async def researcher_node(
                 scraped_content.append({
                     "url": content.url,
                     "title": content.title,
-                    "content": summarize_text(content.content, 8000),
+                    "content": summarize_text(content.content, 12000),
                 })
             except Exception as e:
                 logger.warning("Scraping failed", url=source.url, error=str(e))
@@ -239,7 +239,7 @@ async def _generate_search_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 6000)}" for ctx in memory_context[:3]]
         )
 
     existing_hint = _format_existing_findings(existing_findings)
@@ -260,7 +260,7 @@ Requirements:
 - Vary the query types (definition, examples, comparison, current state, etc.)
 - Avoid repeating topics already covered in the existing findings
 
-Return JSON with fields reasoning and queries."""
+Return JSON with fields reasoning, queries."""
 
     try:
         structured_llm = llm.with_structured_output(SearchQueries, method="function_calling")
@@ -289,20 +289,20 @@ async def _analyze_and_synthesize(
     sources_text = "\n\n".join([
         f"**Source {idx + 1}:** {source.title}\n"
         f"URL: {source.url}\n"
-        f"Summary: {summarize_text(source.snippet, 3000)}"
+        f"Summary: {summarize_text(source.snippet, 6000)}"
         for idx, source in enumerate(sources[:5])
     ])
 
     # Format scraped content
     content_text = "\n\n".join([
-        f"**{sc['title']}**\n{summarize_text(sc['content'], 8000)}"
+        f"**{sc['title']}**\n{summarize_text(sc['content'], 12000)}"
         for sc in scraped_content[:3]
     ])
 
     memory_text = ""
     if memory_context:
         memory_text = "\n\n## Memory Context\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 6000)}" for ctx in memory_context[:3]]
         )
 
     existing_text = _format_existing_findings(existing_findings)
@@ -357,7 +357,7 @@ def _format_existing_findings(existing_findings: list[ResearchFinding]) -> str:
         summary = getattr(finding, "summary", "") or ""
         summary = summary.replace("\n", " ")
         if topic or summary:
-            lines.append(f"- {topic}: {summarize_text(summary, 3000)}")
+            lines.append(f"- {topic}: {summarize_text(summary, 6000)}")
     return "\n" + "\n".join(lines)
 
 
@@ -379,11 +379,11 @@ async def _generate_followup_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {summarize_text(ctx.content, 3000)}" for ctx in memory_context[:2]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 6000)}" for ctx in memory_context[:2]]
         )
 
     sources_hint = "\n".join(
-        [f"- {source.title}: {summarize_text(source.snippet, 3000)}" for source in sources[:5]]
+        [f"- {source.title}: {summarize_text(source.snippet, 6000)}" for source in sources[:5]]
     )
 
     history_block = chat_history or "Chat history: None."

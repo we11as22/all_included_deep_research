@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Any
@@ -68,8 +69,8 @@ class SearchSessionMemory:
             if not item.snippet:
                 continue
             snippet = item.snippet
-            if len(snippet) > 1200:
-                snippet = summarize_text(snippet, 1200)
+            if len(snippet) > 2400:
+                snippet = summarize_text(snippet, 2400)
             formatted.append(f"{item.title}: {snippet}")
         snippets = "; ".join(formatted)
         if snippets:
@@ -136,7 +137,7 @@ class ChatSearchService:
         
         system_prompt = (
             f"You are a helpful AI assistant. Provide clear, accurate, and helpful responses. "
-            f"Return JSON with fields reasoning and answer. "
+            f"Return JSON with fields reasoning, answer, key_points. "
             f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs."
         )
         
@@ -329,7 +330,7 @@ class ChatSearchService:
             f"IMPORTANT: Preserve the core meaning and key terms from the original query. "
             f"Use the chat history for context if needed. "
             f"Current date: {current_date} - consider this when rewriting queries about recent events. "
-            f"Return JSON with fields reasoning and rewritten_query. "
+            f"Return JSON with fields reasoning, rewritten_query. "
             f"Example: 'расскажи про сорта пива' -> 'сорта пива типы классификация' (NOT 'какие-то' or unrelated terms)."
         )
         history_block = chat_history or "Chat history: None."
@@ -373,7 +374,7 @@ class ChatSearchService:
             f"Generate concise web search queries for deeper research. "
             f"Use memory context if relevant. "
             f"Current date: {current_date} - consider this when generating queries about recent events. "
-            f"Return JSON with fields reasoning and queries."
+            f"Return JSON with fields reasoning, queries."
         )
         structured_llm = self.chat_llm.with_structured_output(SearchQueries, method="function_calling")
         try:
@@ -409,7 +410,7 @@ class ChatSearchService:
         history_block = chat_history or "Chat history: None."
         results_block = "\n".join(
             [
-                f"- {item.title}: {summarize_text(item.snippet, 1200)}"
+                f"- {item.title}: {summarize_text(item.snippet, 2400)}"
                 for item in results[:6]
             ]
         )
@@ -460,13 +461,38 @@ class ChatSearchService:
                     query = ""  # Use empty string to prevent SQL error
                 else:
                     query = str(query) if query else ""
+
+            if not query.strip():
+                return []
             
             results = await self.search_engine.search(
                 query=query,
                 search_mode=SearchMode.HYBRID,
                 limit=self.settings.memory_context_limit,
             )
-            filtered_results = [result for result in results if result.file_category != "chat"]
+            filtered_results = [
+                result
+                for result in results
+                if result.file_category not in {"chat", "conversation", "conversations"}
+            ]
+            if filtered_results:
+                filtered_results.sort(key=lambda item: item.score, reverse=True)
+                top_score = filtered_results[0].score
+                if top_score > 0:
+                    threshold = top_score * 0.4
+                    score_filtered = [item for item in filtered_results if item.score >= threshold]
+                    min_keep = min(3, len(filtered_results))
+                    if len(score_filtered) >= min_keep:
+                        filtered_results = score_filtered
+
+            query_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 3}
+            if query_tokens and filtered_results:
+                token_filtered = []
+                for result in filtered_results:
+                    haystack = f"{result.file_title} {result.content}".lower()
+                    if any(token in haystack for token in query_tokens):
+                        token_filtered.append(result)
+                filtered_results = token_filtered
             memory_context = [
                 {
                     "file_path": result.file_path,
@@ -551,11 +577,23 @@ class ChatSearchService:
             return []
 
         async def summarize(content: ScrapedContent) -> ScrapedContent:
-            trimmed = content.content[: self.settings.search_content_max_chars]
+            trimmed = summarize_text(content.content, self.settings.search_content_max_chars)
+            if len(trimmed) <= 1800:
+                if stream:
+                    self._emit_status(stream, f"Using full text for {content.title}", "summarize")
+                return ScrapedContent(
+                    url=content.url,
+                    title=content.title,
+                    content=trimmed.strip(),
+                    markdown=None,
+                    html=None,
+                    images=content.images,
+                    links=content.links,
+                )
             prompt = (
                 "Summarize the following source for a research assistant. "
                 "Focus on facts relevant to the query. Keep it under 200 words. "
-                "Return JSON with fields reasoning, summary, key_points."
+                "Return JSON with fields summary, key_points."
             )
             structured_llm = self.summarizer_llm.with_structured_output(SummarizedContent, method="function_calling")
             try:
@@ -567,7 +605,7 @@ class ChatSearchService:
                 summary = response.summary
             except Exception as exc:
                 logger.error("Structured summarization failed", error=str(exc))
-                summary = summarize_text(trimmed, 2000)
+                summary = summarize_text(trimmed, 4000)
             if stream:
                 self._emit_status(stream, f"Summarized {content.title}", "summarize")
             return ScrapedContent(
@@ -599,7 +637,7 @@ class ChatSearchService:
         current_date = get_current_date()
         system_prompt = (
             f"You are a research assistant. Answer with clear, concise reasoning. "
-            f"Return JSON with fields reasoning and answer. "
+            f"Return JSON with fields reasoning, answer, key_points. "
             f"Use the provided sources and cite them with [number] references. "
             f"If information is missing, say so. "
             f"Current date: {current_date} - always consider this when evaluating information recency and relevance."
@@ -645,7 +683,7 @@ class ChatSearchService:
         lines = ["Memory Context (from prior notes):"]
         for item in memory_context:
             lines.append(
-                f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 3000)}"
+                f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 6000)}"
             )
         return "\n".join(lines)
 

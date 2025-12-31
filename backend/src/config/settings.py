@@ -155,7 +155,7 @@ class Settings(BaseSettings):
     deep_search_queries: int = Field(default=3, description="Number of queries for deep search")
     deep_search_scrape_top_n: int = Field(default=4, description="Top results to scrape in deep search")
     deep_search_rerank_top_k: int = Field(default=6, description="Reranked results to keep in deep search")
-    deep_search_iterations: int = Field(default=3, description="Search refinement iterations for deep search")
+    deep_search_iterations: int = Field(default=6, description="Search refinement iterations for deep search")
     deep_search_quality_max_results: int = Field(
         default=12, description="Max results per query in quality deep search"
     )
@@ -165,7 +165,7 @@ class Settings(BaseSettings):
         default=10, description="Reranked results to keep in quality deep search"
     )
     deep_search_quality_iterations: int = Field(
-        default=6, description="Search refinement iterations for quality deep search"
+        default=25, description="Search refinement iterations for quality deep search"
     )
 
     max_retries: int = Field(default=3, description="Max retries for API calls")

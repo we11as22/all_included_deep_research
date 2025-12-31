@@ -20,7 +20,7 @@ def format_chat_history(messages: Iterable[dict] | None, limit: int) -> str:
         content = str(msg.get("content") or "").strip()
         if not content or role.lower() == "system":
             continue
-        cleaned.append({"role": role, "content": summarize_text(content, 1200)})
+        cleaned.append({"role": role, "content": summarize_text(content, 4000)})
 
     if not cleaned:
         return "Chat history: None."

@@ -13,7 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
 from src.workflow.agentic.models import AgentMemory, SharedResearchMemory
-from src.workflow.agentic.schemas import AgentAction, TodoItemSchema, TodoUpdateSchema
+from src.workflow.agentic.schemas import AgentAction, SummarizedContent, TodoItemSchema, TodoUpdateSchema
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
@@ -56,12 +56,13 @@ Allowed actions (reasoning is always top-level, only args shown here):
 CRITICAL RULES FOR DEEP RESEARCH:
 1. **Language Matching**: Always respond in the SAME LANGUAGE as the user's query. Match the user's language exactly.
 
-2. **MANDATORY Todo Updates**: After EVERY tool call, you MUST update your todo list:
-   - When you start working on a todo, immediately mark it as "in_progress" using update_todo
-   - When you complete a todo, mark it as "done" using complete_todo
-   - After discovering new information, add new todos for follow-up research using add_todo
-   - After each search/scrape, review your todos and update them based on what you learned
-   - NEVER skip todo updates - this is critical for deep research coordination
+2. **MANDATORY Todo Updates**: After every research action, review and update your todo list as needed:
+   - Todos track research tasks, not tool calls. Do not add todos that are just tool usage.
+   - When you start working on a todo, immediately mark it as "in_progress" using update_todo.
+   - When you complete a todo, mark it as "done" using complete_todo.
+   - After discovering new information, add new todos for follow-up research using add_todo.
+   - After each search/scrape, update task statuses and notes to reflect progress.
+   - NEVER skip todo reviews when task progress changes - this is critical for deep research coordination.
 
 3. **REALLY DEEP Investigation** - This is DEEP RESEARCH mode, not surface-level search:
    - Don't stop after finding basic information - dig deeper into every interesting lead
@@ -81,19 +82,24 @@ CRITICAL RULES FOR DEEP RESEARCH:
    - Break down complex todos into smaller, actionable ones
    - Prioritize todos based on importance and dependencies
 
-5. **Memory Sharing**: Actively read shared notes from other agents using read_shared_notes. Check what other agents have discovered and incorporate their findings into your research. Share your own high-signal notes so other agents can benefit.
+5. **Tool Planning and Replanning**: You can and should plan your tool usage:
+   - Before selecting the next action, outline a brief tool plan in your reasoning.
+   - Replan tool sequences when new evidence changes the approach.
+   - Keep plans short and practical (next 1-3 actions).
 
-6. **Todo Format (STRICT)**: Todos must follow a strict schema when using add_todo or update_todo.
+6. **Memory Sharing**: Actively read shared notes from other agents using read_shared_notes. Check what other agents have discovered and incorporate their findings into your research. Share your own high-signal notes so other agents can benefit.
+
+7. **Todo Format (STRICT)**: Todos must follow a strict schema when using add_todo or update_todo.
    - Required fields for add_todo items: reasoning, title, objective, expected_output, sources_needed, priority, status, note, url.
    - Example add_todo args:
      {{"items": [{{"reasoning": "...", "title": "...", "objective": "...", "expected_output": "...", "sources_needed": ["..."], "priority": "high", "status": "pending", "note": "...", "url": "..."}}]}}
    - update_todo must include: reasoning, title, and any fields to change (status, note, objective, expected_output, sources_needed, priority, url).
 
-7. **Information Exchange**: After reading shared notes or agent files, actively update your research plan. If you discover something relevant to other agents' work, share it via write_note with share=true.
+8. **Information Exchange**: After reading shared notes or agent files, actively update your research plan. If you discover something relevant to other agents' work, share it via write_note with share=true.
 
-8. **Iterative Refinement**: Regularly review your todo list and the shared memory. Update your plans based on new information. Don't just follow your initial plan blindly - adapt as you learn more.
+9. **Iterative Refinement**: Regularly review your todo list and the shared memory. Update your plans based on new information. Don't just follow your initial plan blindly - adapt as you learn more.
 
-9. **Depth Indicators**: You're doing deep research correctly when:
+10. **Depth Indicators**: You're doing deep research correctly when:
    - You've explored multiple perspectives on the topic
    - You've verified information from multiple independent sources
    - You've identified and investigated sub-topics and related areas
@@ -102,7 +108,7 @@ CRITICAL RULES FOR DEEP RESEARCH:
    - You've identified gaps, contradictions, or areas needing more research
    - Your todos are constantly evolving and expanding as you learn
 
-10. **Comprehensive Answers with Citations**: When writing notes and findings:
+11. **Comprehensive Answers with Citations**: When writing notes and findings:
     - Include DIRECT QUOTES from sources with proper attribution (URL, title)
     - Use quotes to support every major claim: "According to [source], '[direct quote]'"
     - Provide context for quotes - explain why they're relevant
@@ -165,7 +171,8 @@ class AgenticResearcher:
         agent_file_service: AgentFileService | None = None,
         supervisor: Any | None = None,
     ) -> None:
-        self.llm = llm.with_structured_output(AgentAction, method="function_calling")
+        self.base_llm = llm
+        self.action_llm = llm.with_structured_output(AgentAction, method="function_calling")
         self.search_provider = search_provider
         self.web_scraper = web_scraper
         self.shared_memory = shared_memory
@@ -226,7 +233,7 @@ class AgenticResearcher:
         if self.agent_file_service:
             initial_notes: list[str] = []
             if assignment:
-                initial_notes.append(summarize_text(assignment, 4000))
+                initial_notes.append(summarize_text(assignment, 8000))
             await self.agent_file_service.write_agent_file(
                 agent_id,
                 todos=self.agent_memory.todos,
@@ -241,7 +248,7 @@ class AgenticResearcher:
             self.stream.emit_research_start(agent_id, topic)
             self.stream.emit_agent_todo(agent_id, self._todo_payload())
 
-        if getattr(self.llm, "_llm_type", "") == "mock-chat":
+        if getattr(self.base_llm, "_llm_type", "") == "mock-chat":
             note = self.agent_memory.add_note(
                 title=f"Mock findings for {topic}",
                 summary=f"Mock summary for {topic}.",
@@ -278,7 +285,7 @@ class AgenticResearcher:
             
             # Use structured output (already applied in __init__)
             try:
-                response = await self.llm.ainvoke(
+                response = await self.action_llm.ainvoke(
                     [SystemMessage(content=get_agentic_system_prompt()), HumanMessage(content=prompt)]
                 )
                 if not isinstance(response, AgentAction):
@@ -365,10 +372,11 @@ class AgenticResearcher:
                         findings=self.existing_findings,
                     )
                     if self.stream and self.stream.app_state.get("debug_mode"):
+                        actions = supervisor_result.get("actions") or []
                         logger.info(
                             "Supervisor react result",
                             agent_id=agent_id,
-                            action=supervisor_result.get("action"),
+                            actions=actions,
                             directives_count=len(supervisor_result.get("directives") or []),
                             tasks_count=len(supervisor_result.get("tasks") or []),
                         )
@@ -503,14 +511,14 @@ class AgenticResearcher:
                     persistent_memory_block += f"### Current Project Status:\n{status_section}\n\n"
                 
                 # Show more main content context
-                main_preview = summarize_text(main_content, 6000)
+                main_preview = summarize_text(main_content, 12000)
                 persistent_memory_block += f"### Main Index (full content available via read_main tool):\n{main_preview}\n\n"
                 persistent_memory_block += "**Note:** Use read_main action to read the full main.md file.\n\n"
                 if items:
                     persistent_memory_block += f"### Available Items ({len(items)} total, showing last 8):\n"
                     for item in items[-8:]:
                         # Don't truncate summaries too much - show more context
-                        summary_preview = summarize_text(item['summary'], 3000)
+                        summary_preview = summarize_text(item['summary'], 6000)
                         persistent_memory_block += f"- **{item['title']}** ({item['file_path']}): {summary_preview}\n"
                 persistent_memory_block += "\nYou can reference these items and add new ones using write_note action.\n"
             except Exception as e:
@@ -524,10 +532,10 @@ class AgenticResearcher:
                 agent_file_block = "\n\n## Your Personal Agent File\n\n"
                 if agent_file.get("character"):
                     # Show more character and preferences context
-                    char_preview = summarize_text(agent_file['character'], 2000)
+                    char_preview = summarize_text(agent_file['character'], 4000)
                     agent_file_block += f"**Character:** {char_preview}\n\n"
                 if agent_file.get("preferences"):
-                    pref_preview = summarize_text(agent_file['preferences'], 2000)
+                    pref_preview = summarize_text(agent_file['preferences'], 4000)
                     agent_file_block += f"**Preferences:** {pref_preview}\n\n"
             except Exception as e:
                 logger.warning("Failed to load agent file", error=str(e), agent_id=agent_id)
@@ -667,11 +675,50 @@ Choose the next action (JSON only)."""
         for url in urls[:3]:
             try:
                 content = await self.web_scraper.scrape(url, scroll=scroll)
-                snippets.append(f"{content.title}: {summarize_text(content.content, 2000)}")
+                snippets.append(f"{content.title}: {summarize_text(content.content, 4000)}")
             except Exception as exc:
                 snippets.append(f"{url}: scrape failed ({exc})")
 
         return "Scraped content: " + " | ".join(snippets)
+
+    async def _tool_summarize_content(self, args: dict[str, Any]) -> str:
+        """Summarize provided content when it is long enough to need compression."""
+        content = str(args.get("content") or "").strip()
+        url = str(args.get("url") or "").strip()
+        if not content:
+            return "No content provided."
+
+        cleaned = " ".join(content.split())
+        if len(cleaned) <= 1400:
+            return cleaned
+
+        trimmed = summarize_text(cleaned, 12000)
+        prompt = (
+            "Summarize the following content for a research assistant. "
+            "Focus on facts relevant to the topic and keep key details. "
+            "Return JSON with fields summary, key_points."
+        )
+
+        structured_llm = self.base_llm.with_structured_output(SummarizedContent, method="function_calling")
+        try:
+            response = await structured_llm.ainvoke(
+                [SystemMessage(content=prompt), HumanMessage(content=trimmed)]
+            )
+            if not isinstance(response, SummarizedContent):
+                raise ValueError("SummarizedContent response was not structured")
+            summary = response.summary.strip()
+            key_points = response.key_points or []
+        except Exception as exc:
+            logger.warning("Content summarization failed", error=str(exc))
+            summary = summarize_text(trimmed, 4000)
+            key_points = []
+
+        header = f"Summary for {url}:" if url else "Summary:"
+        lines = [header, summary]
+        if key_points:
+            lines.append("Key points:")
+            lines.extend([f"- {point}" for point in key_points if point])
+        return "\n".join(lines)
 
     async def _tool_scroll_page(self, args: dict[str, Any]) -> str:
         """Scroll page to load dynamic content."""
@@ -850,12 +897,16 @@ Choose the next action (JSON only)."""
         if isinstance(titles, str):
             titles = [titles]
         completed = 0
+        completed_titles: list[str] = []
         for title in titles:
             if self.agent_memory.complete_todo(title):
                 completed += 1
+                completed_titles.append(title)
 
         if self.stream:
             self.stream.emit_agent_todo(agent_id, self._todo_payload())
+        if completed_titles:
+            return f"Completed {completed} todo items: {', '.join(completed_titles)}."
         return f"Completed {completed} todo items."
 
     def _tool_read_shared_notes(self, args: dict[str, Any]) -> str:
@@ -999,7 +1050,8 @@ Choose the next action (JSON only)."""
             self.stream.emit_agent_todo(agent_id, self._todo_payload())
         
         if updated:
-            return f"Todo updated: {title}"
+            status_suffix = f" status={update.status}" if update.status else ""
+            return f"Todo updated: {title}{status_suffix}"
         return f"Todo not found: {title}"
 
     async def _tool_read_agent_file(self, args: dict[str, Any]) -> str:
@@ -1020,15 +1072,15 @@ Choose the next action (JSON only)."""
             
             result = f"Agent file for {target_agent_id}:\n\n"
             if character:
-                result += f"Character: {summarize_text(character, 2000)}\n\n"
+                result += f"Character: {summarize_text(character, 4000)}\n\n"
             if preferences:
-                result += f"Preferences: {summarize_text(preferences, 2000)}\n\n"
+                result += f"Preferences: {summarize_text(preferences, 4000)}\n\n"
             result += "Todo List:\n"
             for todo in todos:
                 result += f"- [{todo.status}] {todo.title}\n"
             result += "\nNotes:\n"
             for note in notes:
-                result += f"- {summarize_text(str(note), 2000)}\n"
+                result += f"- {summarize_text(str(note), 4000)}\n"
             return result
         except Exception as e:
             logger.warning("Failed to read agent file", agent_id=target_agent_id, error=str(e))
@@ -1051,7 +1103,7 @@ Choose the next action (JSON only)."""
         notes = self.agent_memory.notes[-5:]
         if notes:
             # Don't truncate summary too much - preserve more information
-            summary = summarize_text(" ".join([note.summary for note in notes]), 6000)
+            summary = summarize_text(" ".join([note.summary for note in notes]), 8000)
             key_findings = [note.summary for note in notes[:5]]  # Increased from 3
             confidence = "medium" if self.sources else "low"
         else:
@@ -1161,5 +1213,5 @@ def _format_findings(findings: list[ResearchFinding]) -> str:
     lines = []
     for finding in findings[-5:]:
         # Show more of each finding - don't truncate too much
-        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 3000)}")
+        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 6000)}")
     return "\n".join(lines)

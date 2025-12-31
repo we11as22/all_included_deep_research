@@ -285,7 +285,7 @@ Current Findings:
 Return JSON with fields reasoning and topics. If coverage is sufficient, return an empty topics list."""
 
         findings_text = "\n".join(
-            [f"- {finding.topic}: {summarize_text(finding.summary, 3000)}" for finding in findings[:6]]
+            [f"- {finding.topic}: {summarize_text(finding.summary, 6000)}" for finding in findings[:6]]
         )
 
         structured_llm = self.llm.with_structured_output(GapTopics, method="function_calling")

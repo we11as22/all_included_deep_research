@@ -157,7 +157,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
             workflow_factory = app_request.app.state.workflow_factory
             workflow = workflow_factory.create_workflow("quality")
-            final_state = await workflow.run(query, stream=stream_generator, messages=chat_history)
+            final_state = await workflow.run(
+                query,
+                stream=stream_generator,
+                messages=chat_history,
+                suppress_final_report_stream=True,
+            )
 
             # Extract final_report - handle both dict with override and direct value
             final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")

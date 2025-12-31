@@ -226,6 +226,7 @@ Return JSON with fields reasoning, compressed_summary, key_themes, important_sou
         query: str,
         stream: Any | None = None,
         messages: list[dict[str, str]] | None = None,
+        suppress_final_report_stream: bool = False,
     ) -> dict:
         """
         Execute quality research workflow.
@@ -255,6 +256,7 @@ Return JSON with fields reasoning, compressed_summary, key_themes, important_sou
             "max_iterations": self.settings.quality_max_iterations,
             "max_concurrent_researchers": self.settings.quality_max_concurrent,
             "stream": stream,
+            "suppress_final_report_stream": suppress_final_report_stream,
         }
 
         # Run workflow

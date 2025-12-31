@@ -2,6 +2,8 @@
 
 import aiohttp
 import structlog
+import re
+from urllib.parse import urlparse
 
 from src.search.base import SearchProvider
 from src.search.models import ScrapedContent, SearchResponse, SearchResult
@@ -36,6 +38,241 @@ class SearXNGSearchProvider(SearchProvider):
         self.safesearch = safesearch
         logger.info("SearXNGSearchProvider initialized", instance_url=self.instance_url)
 
+    def _build_params(self, query: str, engines_override: list[str] | None) -> dict[str, str | int]:
+        params: dict[str, str | int] = {
+            "q": query,
+            "format": "json",
+            "language": self.language,
+            "safesearch": self.safesearch,
+        }
+        if self.categories:
+            params["categories"] = ",".join(self.categories)
+        engines = engines_override if engines_override is not None else self.engines
+        if engines:
+            params["engines"] = ",".join(engines)
+        return params
+
+    async def _search_once(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        max_results: int,
+        engines_override: list[str] | None,
+        label: str,
+    ) -> SearchResponse:
+        url = f"{self.instance_url}/search"
+        params = self._build_params(query, engines_override)
+
+        logger.info("SearXNG search request", url=url, params=params, query=query, label=label)
+
+        try:
+            async with session.get(url, params=params) as response:
+                response_text = await response.text()
+
+                logger.debug(
+                    "SearXNG raw response",
+                    status=response.status,
+                    content_length=len(response_text),
+                    content_preview=response_text[:200] if response_text else "empty",
+                    label=label,
+                )
+
+                if response.status != 200:
+                    logger.warning(
+                        "SearXNG returned non-200 status",
+                        status=response.status,
+                        error=response_text[:500],
+                        query=query,
+                        url=url,
+                        label=label,
+                    )
+                    return SearchResponse(query=query, results=[], total_results=0)
+
+                try:
+                    data = await response.json()
+                    logger.info(
+                        "SearXNG response received",
+                        query=query,
+                        results_count=len(data.get("results", [])),
+                        number_of_results=data.get("number_of_results", 0),
+                        has_results=bool(data.get("results")),
+                        response_keys=list(data.keys()) if isinstance(data, dict) else "not_dict",
+                        label=label,
+                    )
+
+                    if data.get("results") and len(data.get("results", [])) > 0:
+                        first_result = data["results"][0]
+                        logger.debug(
+                            "SearXNG first result structure",
+                            result_keys=list(first_result.keys()) if isinstance(first_result, dict) else "not_dict",
+                            has_url="url" in first_result if isinstance(first_result, dict) else False,
+                            has_title="title" in first_result if isinstance(first_result, dict) else False,
+                            has_content="content" in first_result if isinstance(first_result, dict) else False,
+                            label=label,
+                        )
+                except Exception as e:
+                    logger.error(
+                        "SearXNG response parse failed",
+                        error=str(e),
+                        response_preview=response_text[:1000],
+                        query=query,
+                        status=response.status,
+                        content_type=response.headers.get("content-type", "unknown"),
+                        label=label,
+                    )
+                    return SearchResponse(query=query, results=[], total_results=0)
+
+                results = []
+                raw_results = data.get("results", [])
+
+                logger.info(
+                    "Processing SearXNG results",
+                    query=query,
+                    raw_results_count=len(raw_results),
+                    max_results=max_results,
+                    label=label,
+                )
+
+                for idx, item in enumerate(raw_results):
+                    if not item.get("url"):
+                        logger.debug("Skipping result without URL", index=idx, item_keys=list(item.keys()), label=label)
+                        continue
+
+                    content = item.get("content") or item.get("snippet") or ""
+                    title = item.get("title") or item.get("url", "")[:100]
+
+                    results.append(
+                        SearchResult(
+                            title=title,
+                            url=item.get("url", ""),
+                            snippet=content,
+                            score=item.get("score", 0.0),
+                            published_date=item.get("publishedDate"),
+                        )
+                    )
+
+                    if len(results) >= max_results:
+                        break
+
+                total_results = data.get("number_of_results", 0)
+                if total_results == 0 and len(results) > 0:
+                    total_results = len(results)
+
+                filtered_results = self._filter_results_by_query(query, results, max_results)
+
+                logger.info(
+                    "SearXNG search completed",
+                    query=query,
+                    results_count=len(filtered_results),
+                    total_results=total_results,
+                    raw_results_processed=len(raw_results),
+                    number_of_results_from_api=data.get("number_of_results", 0),
+                    label=label,
+                )
+
+                if len(filtered_results) == 0 and len(raw_results) > 0:
+                    logger.warning(
+                        "SearXNG returned raw results but none were valid",
+                        query=query,
+                        raw_results_count=len(raw_results),
+                        sample_result=raw_results[0] if raw_results else None,
+                        label=label,
+                    )
+
+                return SearchResponse(
+                    query=query,
+                    results=filtered_results,
+                    total_results=total_results,
+                )
+        except aiohttp.ClientError as e:
+            logger.error("SearXNG search failed - connection error", error=str(e), query=query, url=url, label=label)
+            return SearchResponse(query=query, results=[], total_results=0)
+
+    def _result_diversity(self, results: list[SearchResult]) -> tuple[int, int]:
+        domains = []
+        for item in results:
+            if not item.url:
+                continue
+            try:
+                domain = urlparse(item.url).netloc.lower()
+            except Exception:
+                continue
+            if domain:
+                domains.append(domain)
+        return len(set(domains)), len(domains)
+
+    def _should_fallback(self, results: list[SearchResult], max_results: int) -> bool:
+        if not results:
+            return True
+        unique_domains, total = self._result_diversity(results)
+        if total == 0:
+            return True
+        if total >= 3 and unique_domains <= 1:
+            return True
+        if total >= 6 and (unique_domains / total) < 0.34:
+            return True
+        if total < max(3, max_results // 2):
+            return True
+        return False
+
+    def _tokenize(self, text: str) -> list[str]:
+        return [token for token in re.findall(r"\w+", text.lower()) if len(token) >= 3]
+
+    def _filter_results_by_query(
+        self, query: str, results: list[SearchResult], max_results: int
+    ) -> list[SearchResult]:
+        if not results:
+            return results
+        query_tokens = set(self._tokenize(query))
+        if not query_tokens:
+            return results
+
+        def overlap_count(item: SearchResult) -> int:
+            haystack = f"{item.title} {item.snippet}"
+            tokens = set(self._tokenize(haystack))
+            return len(query_tokens & tokens)
+
+        min_overlap = 2 if len(query_tokens) >= 5 else 1
+        filtered = [item for item in results if overlap_count(item) >= min_overlap]
+
+        if filtered:
+            if len(filtered) != len(results):
+                logger.info(
+                    "Filtered low-relevance SearXNG results",
+                    query=query,
+                    before=len(results),
+                    after=len(filtered),
+                    min_overlap=min_overlap,
+                )
+            return filtered
+
+        if len(query_tokens) <= 2:
+            logger.info(
+                "Keeping unfiltered SearXNG results for short query",
+                query=query,
+                before=len(results),
+            )
+            return results
+
+        logger.info(
+            "No SearXNG results matched query tokens; returning empty",
+            query=query,
+            before=len(results),
+            min_overlap=min_overlap,
+        )
+        return []
+
+    def _prefer_fallback(
+        self,
+        primary_results: list[SearchResult],
+        fallback_results: list[SearchResult],
+    ) -> bool:
+        if not fallback_results:
+            return False
+        primary_domains, primary_total = self._result_diversity(primary_results)
+        fallback_domains, fallback_total = self._result_diversity(fallback_results)
+        return (fallback_domains, fallback_total) > (primary_domains, primary_total)
+
     async def search(self, query: str, max_results: int = 10) -> SearchResponse:
         """
         Search using SearXNG API.
@@ -49,140 +286,41 @@ class SearXNGSearchProvider(SearchProvider):
         """
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                # SearXNG search API endpoint
-                url = f"{self.instance_url}/search"
-                params = {
-                    "q": query,
-                    "format": "json",
-                    "language": self.language,
-                    "safesearch": self.safesearch,
-                }
+                primary = await self._search_once(
+                    session,
+                    query,
+                    max_results=max_results,
+                    engines_override=None,
+                    label="primary",
+                )
 
-                if self.categories:
-                    params["categories"] = ",".join(self.categories)
-                if self.engines:
-                    params["engines"] = ",".join(self.engines)
+                if self.engines or not self._should_fallback(primary.results, max_results):
+                    return primary
 
-                logger.info("SearXNG search request", url=url, params=params, query=query)
-                
-                try:
-                    async with session.get(url, params=params) as response:
-                        response_text = await response.text()
-                        
-                        logger.debug(
-                            "SearXNG raw response",
-                            status=response.status,
-                            content_length=len(response_text),
-                            content_preview=response_text[:200] if response_text else "empty",
-                        )
-                        
-                        if response.status != 200:
-                            logger.warning(
-                                "SearXNG returned non-200 status",
-                                status=response.status,
-                                error=response_text[:500],
-                                query=query,
-                                url=url,
-                            )
-                            return SearchResponse(query=query, results=[], total_results=0)
-                        
-                        try:
-                            data = await response.json()
-                            logger.info(
-                                "SearXNG response received",
-                                query=query,
-                                results_count=len(data.get("results", [])),
-                                number_of_results=data.get("number_of_results", 0),
-                                has_results=bool(data.get("results")),
-                                response_keys=list(data.keys()) if isinstance(data, dict) else "not_dict",
-                            )
-                            
-                            # Log first result structure for debugging
-                            if data.get("results") and len(data.get("results", [])) > 0:
-                                first_result = data["results"][0]
-                                logger.debug(
-                                    "SearXNG first result structure",
-                                    result_keys=list(first_result.keys()) if isinstance(first_result, dict) else "not_dict",
-                                    has_url="url" in first_result if isinstance(first_result, dict) else False,
-                                    has_title="title" in first_result if isinstance(first_result, dict) else False,
-                                    has_content="content" in first_result if isinstance(first_result, dict) else False,
-                                )
-                        except Exception as e:
-                            logger.error(
-                                "SearXNG response parse failed",
-                                error=str(e),
-                                response_preview=response_text[:1000],
-                                query=query,
-                                status=response.status,
-                                content_type=response.headers.get("content-type", "unknown"),
-                            )
-                            return SearchResponse(query=query, results=[], total_results=0)
-                        
-                        results = []
-                        raw_results = data.get("results", [])
-                        
-                        logger.info(
-                            "Processing SearXNG results",
-                            query=query,
-                            raw_results_count=len(raw_results),
-                            max_results=max_results,
-                        )
-                        
-                        # Perplexica approach: simple mapping without strict template filtering
-                        for idx, item in enumerate(raw_results):
-                            # Only require URL - title can be empty, we'll use URL as fallback
-                            if not item.get("url"):
-                                logger.debug("Skipping result without URL", index=idx, item_keys=list(item.keys()))
-                                continue
-                            
-                            # Use content or title (like Perplexica does)
-                            content = item.get("content") or item.get("snippet") or ""
-                            title = item.get("title") or item.get("url", "")[:100]  # Use URL as fallback for title
+                fallback = await self._search_once(
+                    session,
+                    query,
+                    max_results=max_results,
+                    engines_override=["duckduckgo"],
+                    label="duckduckgo",
+                )
 
-                            results.append(
-                                SearchResult(
-                                    title=title,
-                                    url=item.get("url", ""),
-                                    snippet=content,
-                                    score=item.get("score", 0.0),
-                                    published_date=item.get("publishedDate"),
-                                )
-                            )
-                            
-                            if len(results) >= max_results:
-                                break
+                if self._prefer_fallback(primary.results, fallback.results):
+                    primary_domains, primary_total = self._result_diversity(primary.results)
+                    fallback_domains, fallback_total = self._result_diversity(fallback.results)
+                    logger.info(
+                        "SearXNG fallback used",
+                        query=query,
+                        primary_results=len(primary.results),
+                        fallback_results=len(fallback.results),
+                        primary_domains=primary_domains,
+                        fallback_domains=fallback_domains,
+                        primary_total=primary_total,
+                        fallback_total=fallback_total,
+                    )
+                    return fallback
 
-                        # Use actual results count if number_of_results is 0 or missing
-                        total_results = data.get("number_of_results", 0)
-                        if total_results == 0 and len(results) > 0:
-                            total_results = len(results)
-                        
-                        logger.info(
-                            "SearXNG search completed",
-                            query=query,
-                            results_count=len(results),
-                            total_results=total_results,
-                            raw_results_processed=len(raw_results),
-                            number_of_results_from_api=data.get("number_of_results", 0),
-                        )
-                        
-                        if len(results) == 0 and len(raw_results) > 0:
-                            logger.warning(
-                                "SearXNG returned raw results but none were valid",
-                                query=query,
-                                raw_results_count=len(raw_results),
-                                sample_result=raw_results[0] if raw_results else None,
-                            )
-
-                        return SearchResponse(
-                            query=query,
-                            results=results,
-                            total_results=total_results,
-                        )
-                except aiohttp.ClientError as e:
-                    logger.error("SearXNG search failed - connection error", error=str(e), query=query, url=url)
-                    return SearchResponse(query=query, results=[], total_results=0)
-
+                return primary
         except aiohttp.ClientError as e:
             logger.error("SearXNG search failed - connection error", error=str(e), query=query)
             return SearchResponse(query=query, results=[], total_results=0)
