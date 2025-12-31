@@ -49,7 +49,7 @@ Mode-specific guidance:
 - **Quality mode**: 5-8 topics, comprehensive exploration
 
 CRITICAL: Every topic MUST reference the user's query. Do not output generic topics.
-Avoid repeating the full query verbatim; use compact phrasing."""
+Do NOT prefix topics with the full query; embed the subject naturally."""
 
 
 PLANNING_USER_TEMPLATE = """Research Query: {query}
@@ -210,7 +210,6 @@ def _align_topics_with_query(topics: list[str], query: str) -> list[str]:
     anchor_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 4}
     if not anchor_tokens:
         return topics
-    prefix = _compact_query_prefix(query)
 
     aligned: list[str] = []
     for topic in topics:
@@ -219,17 +218,7 @@ def _align_topics_with_query(topics: list[str], query: str) -> list[str]:
             continue
         if any(token in topic_text.lower() for token in anchor_tokens):
             aligned.append(topic_text)
-        else:
-            aligned.append(f"{prefix}: {topic_text}")
-    return aligned
-
-
-def _compact_query_prefix(query: str) -> str:
-    query_text = str(query).strip()
-    tokens = re.findall(r"\w+", query_text.lower())
-    if not tokens:
-        return query_text[:120].strip()
-    return " ".join(tokens[:5])
+    return aligned or topics
 
 
 def _get_max_topics_for_mode(mode: str) -> int:

@@ -216,6 +216,7 @@ CRITICAL: You MUST create tasks that are DIRECTLY RELATED to the research query:
 - Tasks must be SPECIFIC subtopics of the main query
 - Each task should be a focused investigation angle related to: {query}
 - Use the SAME language as the research query for all tasks
+- Do NOT prefix tasks with the full query; embed the subject naturally in the task text
 
 IMPORTANT: You must create EXACTLY {max_tasks} tasks or fewer. Do not exceed this limit.
 
@@ -1037,7 +1038,6 @@ def _align_tasks_with_query(tasks: list[str], query: str) -> list[str]:
     anchor_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 4}
     if not anchor_tokens:
         return tasks
-    prefix = _compact_query_prefix(query)
 
     aligned: list[str] = []
     for task in tasks:
@@ -1046,23 +1046,11 @@ def _align_tasks_with_query(tasks: list[str], query: str) -> list[str]:
             continue
         if any(token in task_text.lower() for token in anchor_tokens):
             aligned.append(task_text)
-        else:
-            aligned.append(f"{prefix}: {task_text}")
-    return aligned
-
-
-def _compact_query_prefix(query: str) -> str:
-    query_text = str(query).strip()
-    tokens = re.findall(r"\w+", query_text.lower())
-    if not tokens:
-        return query_text[:120].strip()
-    return " ".join(tokens[:5])
+    return aligned or tasks
 
 
 def _language_hint(text: str) -> str:
-    if re.search(r"[\u0400-\u04FF]", text):
-        return "Russian"
-    return "English"
+    return "match the query language"
 
 
 def _normalize_tasks(tasks: list[str], query: str) -> list[str]:
@@ -1078,10 +1066,6 @@ def _normalize_task_text(task: str, query: str) -> str:
     text = str(task).strip()
     if not text:
         return ""
-    if query:
-        prefix = _compact_query_prefix(query)
-        pattern = re.compile(re.escape(query), re.IGNORECASE)
-        text = pattern.sub(prefix, text)
     text = re.sub(r"\s*Depth:.*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*Primary query:.*$", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*Your focus:.*$", "", text, flags=re.IGNORECASE)
