@@ -16,7 +16,6 @@ from src.config.settings import Settings
 from src.embeddings.base import EmbeddingProvider
 from src.llm.factory import create_chat_model
 from src.memory.hybrid_search import HybridSearchEngine
-from src.memory.models.search import SearchMode
 from src.search.factory import create_search_provider
 from src.search.models import ScrapedContent, SearchResult
 from src.search.reranker import SemanticReranker
@@ -222,8 +221,7 @@ class ChatSearchService:
             rewritten = await self._rewrite_query(query, chat_history=chat_history)
             self._emit_search_queries(stream, [rewritten], "rewrite")
 
-            self._emit_status(stream, "Searching memory...", "memory")
-            memory_context = await self._search_memory(rewritten, stream=stream)
+            memory_context: list[dict[str, Any]] = []
 
             self._emit_status(stream, "Generating search queries...", "queries")
             queries = await self._generate_search_queries(
@@ -459,66 +457,8 @@ class ChatSearchService:
         return deduped[:3]
 
     async def _search_memory(self, query: str, stream: Any | None = None) -> list[dict[str, Any]]:
-        try:
-            # Ensure query is a string, not a list/embedding
-            if not isinstance(query, str):
-                if isinstance(query, (list, tuple)):
-                    logger.warning("Query was passed as list/embedding in _search_memory, converting to empty string", query_type=type(query).__name__)
-                    query = ""  # Use empty string to prevent SQL error
-                else:
-                    query = str(query) if query else ""
-
-            if not query.strip():
-                return []
-            
-            results = await self.search_engine.search(
-                query=query,
-                search_mode=SearchMode.HYBRID,
-                limit=self.settings.memory_context_limit,
-            )
-            filtered_results = [
-                result
-                for result in results
-                if result.file_category not in {"chat", "conversation", "conversations"}
-            ]
-            if filtered_results:
-                filtered_results.sort(key=lambda item: item.score, reverse=True)
-                top_score = filtered_results[0].score
-                if top_score > 0:
-                    threshold = top_score * 0.4
-                    score_filtered = [item for item in filtered_results if item.score >= threshold]
-                    min_keep = min(3, len(filtered_results))
-                    if len(score_filtered) >= min_keep:
-                        filtered_results = score_filtered
-
-            query_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 3}
-            if query_tokens and filtered_results:
-                token_filtered = []
-                for result in filtered_results:
-                    haystack = f"{result.file_title} {result.content}".lower()
-                    if any(token in haystack for token in query_tokens):
-                        token_filtered.append(result)
-                filtered_results = token_filtered
-            memory_context = [
-                {
-                    "file_path": result.file_path,
-                    "title": result.file_title,
-                    "content": result.content,
-                    "score": result.score,
-                }
-                for result in filtered_results[:3]
-            ]
-            if stream:
-                stream.emit_memory_context(
-                    [
-                        {"file_path": item["file_path"], "title": item["title"], "score": item["score"]}
-                        for item in memory_context
-                    ]
-                )
-            return memory_context
-        except Exception as exc:
-            logger.warning("memory_search_failed", error=str(exc))
-            return []
+        _ = (query, stream)
+        return []
 
     async def _rerank_results(
         self,

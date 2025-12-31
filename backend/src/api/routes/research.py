@@ -31,10 +31,8 @@ async def start_research(research_request: ResearchRequest, app_request: Request
     )
 
     session_id = str(uuid4())
-    # Pass app state to stream generator for agent memory service
+    # Pass app state to stream generator
     app_state = {
-        "agent_memory_service": app_request.app.state.agent_memory_service,
-        "agent_file_service": app_request.app.state.agent_file_service,
         "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
@@ -62,23 +60,8 @@ async def start_research(research_request: ResearchRequest, app_request: Request
             # Run workflow with streaming
             final_state = await workflow.run(research_request.query, stream=stream_generator)
 
-            # Save to memory if requested
+            # Memory persistence disabled; ephemeral agent memory only.
             final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
-            if research_request.save_to_memory and final_report:
-                stream_generator.emit_status("Saving research to memory...", step="save_memory")
-                try:
-                    memory_manager = app_request.app.state.memory_manager
-                    file_path = _generate_memory_path(research_request.query)
-                    content = _format_memory_report(research_request.query, final_report)
-                    await memory_manager.create_file(
-                        file_path=file_path,
-                        title=research_request.query[:80],
-                        content=content,
-                    )
-                    embedding_dimension = getattr(app_request.app.state, "embedding_dimension", 1536)
-                    await memory_manager.sync_file_to_db(file_path, embedding_dimension=embedding_dimension)
-                except Exception as exc:
-                    stream_generator.emit_error(error=str(exc), details="Memory save failed")
 
             stream_generator.emit_status("Research completed!", step="done")
             stream_generator.emit_done()

@@ -97,10 +97,8 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     logger.info("Chat stream request", mode=mode, query=query[:100])
 
     session_id = str(uuid4())
-    # Pass app state to stream generator for agent memory service
+    # Pass app state to stream generator
     app_state = {
-        "agent_memory_service": app_request.app.state.agent_memory_service,
-        "agent_file_service": app_request.app.state.agent_file_service,
         "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
