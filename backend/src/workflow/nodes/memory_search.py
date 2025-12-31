@@ -76,6 +76,8 @@ async def search_memory_node(
             limit=search_limit,
         )
 
+        filtered_results = [result for result in search_results if result.file_category != "chat"]
+
         # Convert to MemoryContext objects
         memory_context = [
             MemoryContext(
@@ -86,7 +88,7 @@ async def search_memory_node(
                 score=result.score,
                 header_path=result.header_path,
             )
-            for result in search_results
+            for result in filtered_results
         ]
 
         logger.info(

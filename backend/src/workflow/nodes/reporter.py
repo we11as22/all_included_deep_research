@@ -5,6 +5,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 
 from src.workflow.state import ResearchFinding, ResearchState
+from src.utils.text import summarize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -114,7 +115,7 @@ async def generate_final_report_node(
     if memory_context:
         memory_block = "\n## Memory Context\n" + "\n".join(
             [
-                f"- {ctx.file_title} ({ctx.file_path}): {ctx.content[:200]}"
+                f"- {ctx.file_title} ({ctx.file_path}): {summarize_text(ctx.content, 260)}"
                 for ctx in memory_context[:3]
             ]
         )

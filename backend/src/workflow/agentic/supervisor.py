@@ -16,6 +16,7 @@ from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
 from src.memory.agent_memory_service import AgentMemoryService
 from src.memory.agent_file_service import AgentFileService
+from src.utils.text import summarize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -62,6 +63,10 @@ CRITICAL RULES FOR DEEP RESEARCH SUPERVISION:
    - If an agent has many pending todos but isn't updating them, use update_agent_todo to push them
    - If an agent is stuck on surface-level research, add specific deep-dive todos
    - If an agent finishes too quickly, add more detailed investigation tasks
+   - ACTIVELY MODIFY agent plans: if you see an agent needs to dig deeper, use update_agent_todo to add new specific tasks
+   - BREAK DOWN broad todos into specific sub-tasks when agents are not being detailed enough
+   - ADD verification tasks when agents make claims without sources
+   - ADD cross-reference tasks when information seems incomplete
 
 5. **Gap Analysis**: Continuously identify research gaps:
    - What angles haven't been explored yet?
@@ -174,7 +179,7 @@ class AgenticSupervisor:
         if self.agent_memory_service:
             try:
                 main_content = await self.agent_memory_service.read_main_file()
-                main_content = main_content[:500] if main_content else ""
+                main_content = summarize_text(main_content, 1500)
             except Exception:
                 main_content = ""
 
@@ -182,15 +187,27 @@ class AgenticSupervisor:
 Research query: {query}
 Current date: {current_date}
 
+CRITICAL: You MUST create tasks that are DIRECTLY RELATED to the research query: "{query}"
+- DO NOT create tasks about unrelated topics (e.g., if query is about "spirits/alcohols", don't create tasks about "multi-agent systems" or "tanks")
+- Tasks must be SPECIFIC subtopics of the main query
+- Each task should be a focused investigation angle related to: {query}
+
 IMPORTANT: You must create EXACTLY {max_tasks} tasks or fewer. Do not exceed this limit.
 
-CRITICAL: For DEEP RESEARCH, tasks must push agents to:
-- Explore multiple angles and perspectives
-- Verify information from multiple sources
-- Investigate sub-topics and related areas
-- Find primary sources, not just summaries
-- Check for controversies, limitations, alternatives
-- Dig deeper into every interesting lead
+CRITICAL: For DEEP RESEARCH, create DETAILED and SPECIFIC tasks that push agents to:
+- Explore multiple angles and perspectives (e.g., "Investigate X from historical, technical, and economic perspectives")
+- Verify information from multiple sources (e.g., "Verify claim Y by checking at least 3 independent sources")
+- Investigate sub-topics and related areas (e.g., "Deep dive into sub-topic Z: explore origins, evolution, current state, and future trends")
+- Find primary sources, not just summaries (e.g., "Find original research papers, official documents, or expert interviews about X")
+- Check for controversies, limitations, alternatives (e.g., "Identify controversies, limitations, and alternative viewpoints on X")
+- Dig deeper into every interesting lead (e.g., "Follow up on lead X: investigate related aspects Y and Z")
+
+TASK FORMAT: Each task should be:
+- Specific and actionable (not vague like "research X")
+- Include sub-questions or angles to explore
+- Specify what kind of sources to look for
+- Indicate depth level expected (surface, medium, deep)
+- Include verification requirements when relevant
 
 {chat_block}
 
@@ -198,7 +215,7 @@ Memory context:
 {memory_block}
 
 Main file (summary):
-{main_content}...
+{main_content}
 
 Shared notes from researchers:
 {shared_notes}
@@ -332,16 +349,25 @@ Provide up to {max_tasks} tasks in JSON only."""
         if self.agent_memory_service:
             try:
                 main_content = await self.agent_memory_service.read_main_file()
-                main_content = main_content[:500] if main_content else ""
+                main_content = summarize_text(main_content, 2000)
             except Exception:
                 main_content = ""
+        
+        # Get agent file content to see current todos and progress
+        agent_file_content = ""
+        if self.agent_file_service:
+            try:
+                agent_file = await self.agent_file_service.read_agent_file(agent_id)
+                agent_file_content = _format_agent_file_snapshot(agent_file)
+            except Exception:
+                agent_file_content = ""
         
         return f"""Supervisor ReAct Step
 Research query: {query}
 Current date: {current_date}
 
 Agent {agent_id} just performed: {agent_action}
-Result: {action_result[:500]}
+Result: {summarize_text(str(action_result), 1500)}
 
 {chat_block}
 
@@ -349,7 +375,10 @@ Memory context:
 {memory_block}
 
 Main file (summary):
-{main_content[:500]}...
+{main_content}
+
+Agent {agent_id} current file (todos and progress):
+{agent_file_content}
 
 Shared notes:
 {shared_notes}
@@ -366,20 +395,24 @@ CRITICAL EVALUATION REQUIRED:
 6. What verification is needed?
 7. What sub-topics should be investigated?
 
-YOU MUST BE PROACTIVE:
-- If agent isn't updating todos, use update_agent_todo to push them
-- If agent is doing surface-level research, add specific deep-dive tasks using plan_tasks
-- If agent finishes too quickly, add more detailed investigation tasks
-- If there are gaps, create tasks to fill them
+YOU MUST BE PROACTIVE AND ACTIVELY MANAGE PLANS:
+- If agent isn't updating todos, use update_agent_todo to push them (MANDATORY)
+- If agent is doing surface-level research, use update_agent_todo to add specific deep-dive tasks
+- If agent finishes too quickly, use update_agent_todo to add more detailed investigation tasks
+- If there are gaps, use update_agent_todo to add tasks that fill them
+- BREAK DOWN broad todos into specific sub-tasks when needed
+- ADD verification tasks when agents make claims without sources
+- ADD cross-reference tasks when information seems incomplete
 - Don't wait for agents to ask - actively guide them to deeper research
+- MODIFY agent plans in real-time based on what you see in their file
 
 Decide what to do next. You can:
-- Create agent with character/preferences using create_agent
-- Update agent's todo if needed (MANDATORY if they're not updating themselves)
-- Add note to main if important
-- Read agent file to check progress (DO THIS to assess depth)
-- Plan new tasks if needed (DO THIS if research is shallow)
-- Do nothing ONLY if research is truly deep and comprehensive
+- update_agent_todo: Add/modify agent's todos to push deeper research (USE THIS OFTEN)
+- create_agent: Create new agent with character/preferences
+- write_to_main: Add note to main if important
+- read_agent_file: Check progress (already shown above, but you can read again)
+- plan_tasks: Plan new high-level tasks (but prefer update_agent_todo for specific agent guidance)
+- Do nothing ONLY if research is truly deep and comprehensive AND agent is actively updating todos
 
 Respond with JSON action."""
 
@@ -450,7 +483,7 @@ Respond with JSON action."""
         file_path = str(args.get("file_path") or "")
         try:
             content = await self.agent_memory_service.file_manager.read_file(file_path)
-            return {"action": "read_note", "result": content[:500]}
+            return {"action": "read_note", "result": summarize_text(content, 2000)}
         except Exception as e:
             return {"action": "read_note", "result": f"Failed: {str(e)}"}
 
@@ -480,7 +513,7 @@ Respond with JSON action."""
         
         try:
             content = await self.agent_memory_service.read_main_file()
-            return {"action": "read_main", "result": content[:1000]}
+            return {"action": "read_main", "result": summarize_text(content, 3000)}
         except Exception as e:
             return {"action": "read_main", "result": f"Failed: {str(e)}"}
     
@@ -529,7 +562,7 @@ Respond with JSON action."""
             status_lines.append("### Recent Findings:")
             status_lines.append("")
             for finding in findings[-5:]:  # Last 5 findings
-                status_lines.append(f"- **{finding.topic}**: {finding.summary[:150]}...")
+                status_lines.append(f"- **{finding.topic}**: {summarize_text(finding.summary, 260)}")
                 status_lines.append("")
             
             status_content = "\n".join(status_lines)
@@ -593,5 +626,46 @@ def _format_findings(findings: list[ResearchFinding]) -> str:
         return "None."
     lines = []
     for finding in findings[-6:]:
-        lines.append(f"- {finding.topic}: {finding.summary[:200]}")
+        # Show more of each finding
+        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 520)}")
     return "\n".join(lines)
+
+
+def _format_agent_file_snapshot(agent_file: dict[str, Any]) -> str:
+    if not agent_file:
+        return "None."
+
+    lines = []
+    character = agent_file.get("character") or ""
+    preferences = agent_file.get("preferences") or ""
+    todos = agent_file.get("todos") or []
+    notes = agent_file.get("notes") or []
+
+    if character:
+        lines.append("Character:")
+        lines.append(summarize_text(character, 520))
+        lines.append("")
+
+    if preferences:
+        lines.append("Preferences:")
+        lines.append(summarize_text(preferences, 520))
+        lines.append("")
+
+    lines.append("Todos:")
+    if todos:
+        for item in todos[:8]:
+            title = getattr(item, "title", "") or ""
+            status = getattr(item, "status", "pending") or "pending"
+            note = getattr(item, "note", "") or ""
+            note_text = f" - {summarize_text(note, 120)}" if note else ""
+            lines.append(f"- [{status}] {title}{note_text}")
+    else:
+        lines.append("- None")
+
+    if notes:
+        lines.append("")
+        lines.append("Notes:")
+        for note in notes[-5:]:
+            lines.append(f"- {summarize_text(str(note), 200)}")
+
+    return "\n".join(lines).strip()

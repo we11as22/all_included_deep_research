@@ -7,50 +7,50 @@ Last Updated: 2025-12-30
 This is the main index file for agent memory. All agent notes and findings are stored in the `items/` directory and referenced here.
 
 
-## Project Status - 2025-12-30 16:19:42 UTC
+## Project Status - 2025-12-30 23:23:35 UTC
 
-**Research Query:** Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
+**Research Query:** Расскажи про типы спиртов полно и подробно
 
-**Findings Count:** 10
+**Findings Count:** 15
 
 ### Active Agents Status:
 
-#### agent_r1_0
-- **Todos:** 1 done, 0 in progress, 3 pending
+#### agent_r2_0
+- **Todos:** 0 done, 0 in progress, 4 pending
 - **Notes:** 1
 
-#### agent_r1_1
-- **Todos:** 1 done, 0 in progress, 3 pending
+#### agent_r2_1
+- **Todos:** 0 done, 0 in progress, 4 pending
 - **Notes:** 1
 
-#### agent_r1_2
-- **Todos:** 1 done, 0 in progress, 3 pending
+#### agent_r2_2
+- **Todos:** 0 done, 0 in progress, 4 pending
 - **Notes:** 1
 
-#### agent_r1_3
-- **Todos:** 1 done, 0 in progress, 3 pending
+#### agent_r2_3
+- **Todos:** 0 done, 0 in progress, 4 pending
 - **Notes:** 1
 
-#### agent_r1_4
-- **Todos:** 1 done, 0 in progress, 3 pending
+#### agent_r2_4
+- **Todos:** 0 done, 0 in progress, 4 pending
 - **Notes:** 1
 
 ### Recent Findings:
 
-- **Investigate the operational testing results and feedback from military units on Soviet tank prototypes post-1980 to identify performance issues and practical limitations.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Investigate the operationa...
+- **Analyze synthesis methods and industrial production processes for major types of alcohols, including primary, secondary, tertiary, polyhydric, aromatic, and cyclic alcohols; compare efficiencies and environmental impact. Use industry reports, patents, and primary research papers; verify via multiple independent sources. Deep dive with detailed chemical engineering perspectives.**: Primary query: Расскажи про типы спиртов полно и подробно
+Your focus: Analyze synthesis methods and industrial production processes for major types of...
 
-- **Cross-verify prototype technical specifications and design innovations with multiple primary sources, including Soviet military archives and design bureau reports.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Cross-verify prototype tec...
+- **Investigate the pharmacological and toxicological profiles of different alcohol types, including less common and substituted alcohols like allyl alcohol and phenols; assess health risks and therapeutic potentials. Source data from toxicology databases, clinical studies, and expert reviews; verify claims with governmental and NGO health reports. Deep and comprehensive analysis required.**: Primary query: Расскажи про типы спиртов полно и подробно
+Your focus: Investigate the pharmacological and toxicological profiles of different alcohol ...
 
-- **Explore the geopolitical and economic context impacting Soviet tank development post-1980, including how international relations influenced prototype projects and cancellations.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Explore the geopolitical a...
+- **Explore the role of alcohol types in emerging green chemistry and sustainable technologies, focusing on biodegradable and bio-based alcohols; evaluate recent innovations and industrial applications. Review cutting-edge journals, conference proceedings, and expert interviews; verify information through cross-referencing multiple primary sources. Medium to deep investigation expected.**: Primary query: Расскажи про типы спиртов полно и подробно
+Your focus: Explore the role of alcohol types in emerging green chemistry and sustainable te...
 
-- **Analyze competing tank designs within the Soviet military and defense industry to understand why certain prototypes were rejected in favor of others or foreign designs.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Analyze competing tank des...
+- **Conduct a critical review of the chemical classification controversies and alternative classification schemes for alcohols, including recent proposals and debates within academic and industrial circles. Collect data from recent review articles, expert interviews, and conference proceedings; validate findings by comparing views from different research groups. Deep analytical research needed.**: Primary query: Расскажи про типы спиртов полно и подробно
+Your focus: Conduct a critical review of the chemical classification controversies and alter...
 
-- **Research any known controversies, internal debates, or conflicting expert opinions among Soviet tank designers and military officials regarding these prototypes.**: Primary query: Расскажи про все советские танки после 80 года которые были прототипами и не пошли на вооркжение
-Your focus: Research any known controv...
+- **Perform a comprehensive cross-disciplinary study on environmental impacts of alcohol production and usage, emphasizing biodegradability, toxicity, and ecosystem effects of various alcohol types. Utilize government/NGO environmental reports, scientific studies, and industry data; ensure all claims are backed by official documents and confirmed by multiple independent sources. Deep and integrative approach required.**: Primary query: Расскажи про типы спиртов полно и подробно
+Your focus: Perform a comprehensive cross-disciplinary study on environmental impacts of alc...
 
 ## Items
 

@@ -17,6 +17,7 @@ from src.workflow.nodes.planner import plan_research_node
 from src.workflow.nodes.reporter import generate_final_report_node
 from src.workflow.nodes.researcher import researcher_node
 from src.workflow.state import ResearchFinding, ResearchState, SourceReference
+from src.utils.text import summarize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -283,7 +284,7 @@ Current Findings:
 Return up to {max_topics} additional research topics, one per line. If coverage is sufficient, return "NONE"."""
 
         findings_text = "\n".join(
-            [f"- {finding.topic}: {finding.summary[:180]}" for finding in findings[:6]]
+            [f"- {finding.topic}: {summarize_text(finding.summary, 220)}" for finding in findings[:6]]
         )
 
         response = await self.llm.ainvoke(

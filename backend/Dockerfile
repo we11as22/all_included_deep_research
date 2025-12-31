@@ -84,7 +84,9 @@ RUN useradd --shell /bin/bash --system \
 
 RUN mkdir "/usr/local/searxng"
 RUN mkdir -p /etc/searxng
+RUN mkdir -p /var/cache/searxng
 RUN chown -R "searxng:searxng" "/usr/local/searxng"
+RUN chown -R "searxng:searxng" "/var/cache/searxng"
 
 # Copy searxng configuration files
 COPY docker/searxng/settings.yml /etc/searxng/settings.yml
@@ -104,6 +106,8 @@ RUN python3 -m venv "/usr/local/searxng/searx-pyenv"
 RUN "/usr/local/searxng/searx-pyenv/bin/pip" install --upgrade pip setuptools wheel pyyaml msgspec
 RUN cd "/usr/local/searxng/searxng-src" && \
     "/usr/local/searxng/searx-pyenv/bin/pip" install --use-pep517 --no-build-isolation -e .
+# Install uwsgi in virtual environment for compatibility
+RUN "/usr/local/searxng/searx-pyenv/bin/pip" install uwsgi
 
 # Switch back to root
 USER root

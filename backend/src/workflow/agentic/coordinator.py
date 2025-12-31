@@ -16,6 +16,7 @@ from src.workflow.state import ResearchFinding
 from src.utils.chat_history import format_chat_history
 from src.memory.agent_memory_service import AgentMemoryService
 from src.memory.agent_file_service import AgentFileService
+from src.utils.text import summarize_text
 
 logger = structlog.get_logger(__name__)
 
@@ -161,7 +162,7 @@ class AgenticResearchCoordinator:
                     "notes": [
                         {
                             "title": note.title,
-                            "summary": note.summary[:100],
+                            "summary": summarize_text(note.summary, 240),
                             "urls": note.urls,
                         }
                         for note in result.memory.notes
@@ -201,7 +202,7 @@ class AgenticResearchCoordinator:
 
             shared_note = AgentNote(
                 title=f"Finding: {finding.topic}",
-                summary=finding.summary[:600],
+                summary=summarize_text(finding.summary, 600),
                 urls=[source.url for source in finding.sources[:3]],
                 tags=["finding"],
             )
@@ -210,7 +211,17 @@ class AgenticResearchCoordinator:
             logger.warning("Shared note creation failed", error=str(exc))
 
     def _reset_session(self) -> None:
+        """Reset session state - clear shared memory and recreate supervisor."""
         self.shared_memory = SharedResearchMemory()
+        # Clear agent files to prevent stale data from previous sessions
+        # This ensures agents don't get assignments from old queries
+        if self.agent_file_service:
+            try:
+                # Note: We don't clear all agent files here as they might be needed
+                # Instead, we rely on agent_id being unique per session
+                pass
+            except Exception as e:
+                logger.warning("Failed to clear agent files during reset", error=str(e))
         self.supervisor = AgenticSupervisor(
             llm=self.llm,
             shared_memory=self.shared_memory,

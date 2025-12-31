@@ -2,11 +2,26 @@
 
 import asyncpg
 import structlog
+from collections.abc import Sequence
 
 from src.embeddings.base import EmbeddingProvider
 from src.memory.models.search import SearchMode, SearchResult
 
 logger = structlog.get_logger(__name__)
+
+
+def _normalize_query(query: object) -> str:
+    if isinstance(query, str):
+        return query
+    if query is None:
+        return ""
+    if hasattr(query, "tolist"):
+        return ""
+    if isinstance(query, (list, tuple, set, dict)):
+        return ""
+    if isinstance(query, Sequence):
+        return ""
+    return str(query)
 
 
 class HybridSearchEngine:
@@ -48,19 +63,10 @@ class HybridSearchEngine:
         Returns:
             List of search results
         """
-        # Ensure query is a string, not a list/embedding
-        # This is critical - SQL queries expect string, not vector/list
-        if isinstance(query, (list, tuple)):
-            logger.error("Query was passed as list/embedding vector! This is invalid. Converting to empty string.", query_type=type(query).__name__, query_length=len(query) if hasattr(query, '__len__') else 'unknown')
-            query = ""  # Use empty string instead of str(query) to avoid passing vector as string
-        elif not isinstance(query, str):
-            logger.warning("Query was not a string, converting", query_type=type(query).__name__)
-            query = str(query) if query else ""
-        
-        # Final validation - query must be a string
-        if not isinstance(query, str):
-            logger.error("Query is still not a string after conversion! Using empty string.", query_type=type(query).__name__)
-            query = ""
+        normalized = _normalize_query(query)
+        if not isinstance(query, str) or normalized != query:
+            logger.warning("Query normalized for search", query_type=type(query).__name__)
+        query = normalized
         
         if search_mode == SearchMode.HYBRID:
             return await self._hybrid_search(query, limit, category_filter, tag_filter, file_path)
@@ -112,18 +118,7 @@ class HybridSearchEngine:
         file_path: str | None,
     ) -> list[SearchResult]:
         """Hybrid search with RRF combining vector and fulltext."""
-        # Ensure query is a string, not a list/embedding
-        # This is critical for SQL plainto_tsquery which expects string
-        if isinstance(query, (list, tuple)):
-            logger.error("Query passed as list/embedding to _hybrid_search! Using empty string.", query_type=type(query).__name__)
-            query = ""
-        elif not isinstance(query, str):
-            query = str(query) if query else ""
-        
-        # Final check before embedding
-        if not isinstance(query, str):
-            logger.error("Query is still not a string in _hybrid_search! Using empty string.")
-            query = ""
+        query = _normalize_query(query)
         
         # Generate query embedding (requires string input)
         query_embedding = await self.embedding_provider.embed_text(query)
@@ -208,9 +203,7 @@ class HybridSearchEngine:
             # asyncpg requires vector to be passed as list[float], which it will convert to vector type
             # Build complete params list to avoid issues with *filter_params unpacking
             # CRITICAL: query MUST be a string for plainto_tsquery('english', $2)
-            if not isinstance(query, str):
-                logger.error("Query is not a string before SQL execution! Using empty string.", query_type=type(query).__name__)
-                query = ""
+            query = _normalize_query(query)
             all_params = [query_embedding, query, self.rrf_k, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 
@@ -242,17 +235,7 @@ class HybridSearchEngine:
         file_path: str | None,
     ) -> list[SearchResult]:
         """Vector-only semantic search."""
-        # Ensure query is a string, not a list/embedding
-        if isinstance(query, (list, tuple)):
-            logger.error("Query passed as list/embedding to _vector_search! Using empty string.", query_type=type(query).__name__)
-            query = ""
-        elif not isinstance(query, str):
-            query = str(query) if query else ""
-        
-        # Final check before embedding
-        if not isinstance(query, str):
-            logger.error("Query is still not a string in _vector_search! Using empty string.")
-            query = ""
+        query = _normalize_query(query)
         
         query_embedding = await self.embedding_provider.embed_text(query)
         
@@ -381,9 +364,7 @@ class HybridSearchEngine:
             # Pass parameters explicitly: query (str), limit (int), then filter params
             # Build complete params list to avoid issues with *filter_params unpacking
             # CRITICAL: query MUST be a string for plainto_tsquery('english', $1)
-            if not isinstance(query, str):
-                logger.error("Query is not a string before SQL execution in _fulltext_search! Using empty string.", query_type=type(query).__name__)
-                query = ""
+            query = _normalize_query(query)
             all_params = [query, limit] + filter_params
             rows = await conn.fetch(sql, *all_params)
 

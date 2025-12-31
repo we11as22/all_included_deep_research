@@ -35,6 +35,11 @@ const suggestions = [
   'Summarize recent supply chain shocks for lithium batteries.',
   'What are the top 3 competitors to Perplexity in 2024 and why?',
 ];
+const MAX_PROGRESS_SOURCES = 60;
+const MAX_PROGRESS_FINDINGS = 30;
+const MAX_PROGRESS_AGENT_NOTES = 20;
+const MAX_PROGRESS_QUERIES = 12;
+const MAX_SAVED_PROGRESS = 20;
 
 export default function HomePage() {
   const initialMode = (process.env.NEXT_PUBLIC_DEFAULT_MODE as ChatMode) || 'search';
@@ -52,14 +57,23 @@ export default function HomePage() {
 
   // Save progress to localStorage
   useEffect(() => {
-    if (Object.keys(progressByMessage).length > 0) {
-      try {
-        localStorage.setItem('progressByMessage', JSON.stringify(progressByMessage));
-      } catch (e) {
-        console.error('Failed to save progress to localStorage:', e);
-      }
+    if (Object.keys(progressByMessage).length === 0) {
+      return;
     }
-  }, [progressByMessage]);
+    try {
+      const assistantIds = messages.filter((msg) => msg.role === 'assistant').map((msg) => msg.id);
+      const keepIds = assistantIds.slice(-MAX_SAVED_PROGRESS);
+      const trimmed: Record<string, ProgressState> = {};
+      keepIds.forEach((id) => {
+        if (progressByMessage[id]) {
+          trimmed[id] = progressByMessage[id];
+        }
+      });
+      localStorage.setItem('progressByMessage', JSON.stringify(trimmed));
+    } catch (e) {
+      console.error('Failed to save progress to localStorage:', e);
+    }
+  }, [progressByMessage, messages]);
 
   // Load progress from localStorage on mount
   useEffect(() => {
@@ -173,7 +187,7 @@ export default function HomePage() {
               next.memoryContext = event.data.preview || [];
               break;
             case 'search_queries':
-              next.queries = event.data.queries || [];
+              next.queries = (event.data.queries || []).slice(0, MAX_PROGRESS_QUERIES);
               break;
             case 'planning':
               next.researchPlan = event.data.plan;
@@ -181,11 +195,19 @@ export default function HomePage() {
               break;
             case 'source_found':
               if (event.data.url || event.data.title) {
-                next.sources = [...next.sources, {
+                const candidate = {
                   url: event.data.url,
                   title: event.data.title,
                   researcher_id: event.data.researcher_id,
-                }];
+                };
+                const seen = new Set<string>();
+                const deduped = [...next.sources, candidate].filter((item) => {
+                  const key = `${item.url || ''}|${item.title || ''}|${item.researcher_id || ''}`;
+                  if (seen.has(key)) return false;
+                  seen.add(key);
+                  return true;
+                });
+                next.sources = deduped.slice(-MAX_PROGRESS_SOURCES);
               }
               break;
             case 'finding':
@@ -195,7 +217,7 @@ export default function HomePage() {
                   summary: event.data.summary,
                   findings_count: event.data.findings_count,
                   researcher_id: event.data.researcher_id,
-                }];
+                }].slice(-MAX_PROGRESS_FINDINGS);
               }
               break;
             case 'agent_todo': {
@@ -218,7 +240,7 @@ export default function HomePage() {
                 const existingNotes = next.agentNotes[researcherId] || [];
                 next.agentNotes = {
                   ...next.agentNotes,
-                  [researcherId]: [...existingNotes, event.data.note],
+                  [researcherId]: [...existingNotes, event.data.note].slice(-MAX_PROGRESS_AGENT_NOTES),
                 };
               }
               break;
@@ -324,6 +346,7 @@ export default function HomePage() {
         }))
       );
       setProgressByMessage({});
+      localStorage.removeItem('progressByMessage');
     } catch (error) {
       console.error('Failed to load chat:', error);
     }
@@ -334,6 +357,10 @@ export default function HomePage() {
     setMessages([]);
     setProgressByMessage({});
     setInput('');
+    setIsStreaming(false);  // Ensure streaming is reset
+    setCurrentSessionId(null);
+    setError(null);
+    localStorage.removeItem('progressByMessage');
   };
 
   return (

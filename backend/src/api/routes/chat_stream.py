@@ -1,6 +1,7 @@
 """Chat streaming endpoint with progress events."""
 
 import asyncio
+import time
 from uuid import uuid4
 
 import structlog
@@ -14,6 +15,49 @@ from fastapi.responses import Response
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 logger = structlog.get_logger(__name__)
+
+MAX_SESSION_REPORTS = 20
+SESSION_REPORT_TTL_SECONDS = 2 * 60 * 60
+
+
+def _store_session_report(app_state: object, session_id: str, report: str, query: str, mode: str) -> None:
+    if not hasattr(app_state, "session_reports"):
+        app_state.session_reports = {}
+    if not hasattr(app_state, "session_report_order"):
+        app_state.session_report_order = []
+
+    now = time.time()
+    app_state.session_reports[session_id] = {
+        "report": report,
+        "query": query,
+        "mode": mode,
+        "stored_at": now,
+    }
+    order = app_state.session_report_order
+    if session_id in order:
+        order.remove(session_id)
+    order.append(session_id)
+    _prune_session_reports(app_state)
+
+
+def _prune_session_reports(app_state: object) -> None:
+    reports = getattr(app_state, "session_reports", {})
+    order = getattr(app_state, "session_report_order", [])
+    now = time.time()
+
+    expired = [
+        session_id
+        for session_id in list(order)
+        if now - reports.get(session_id, {}).get("stored_at", now) > SESSION_REPORT_TTL_SECONDS
+    ]
+    for session_id in expired:
+        reports.pop(session_id, None)
+        if session_id in order:
+            order.remove(session_id)
+
+    while len(order) > MAX_SESSION_REPORTS:
+        oldest = order.pop(0)
+        reports.pop(oldest, None)
 
 
 @router.post("/stream")
@@ -82,20 +126,18 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 else:
                     result = await chat_service.answer_deep(query, stream=stream_generator, messages=chat_history)
 
-                stream_generator.emit_status("Drafting answer...", step="answer")
-                for chunk in _chunk_text(result.answer, size=180):
-                    stream_generator.emit_report_chunk(chunk)
-                    await asyncio.sleep(0.02)
-                stream_generator.emit_final_report(result.answer)
+                # Emit final answer
+                if result.answer:
+                    stream_generator.emit_status("Finalizing answer...", step="answer")
+                    for chunk in _chunk_text(result.answer, size=180):
+                        stream_generator.emit_report_chunk(chunk)
+                        await asyncio.sleep(0.02)
+                    stream_generator.emit_final_report(result.answer)
+                else:
+                    stream_generator.emit_error(error="No answer generated", details="Search completed but no answer was generated")
                 
                 # Store report for PDF generation
-                if not hasattr(app_request.app.state, "session_reports"):
-                    app_request.app.state.session_reports = {}
-                app_request.app.state.session_reports[session_id] = {
-                    "report": result.answer,
-                    "query": query,
-                    "mode": mode,
-                }
+                _store_session_report(app_request.app.state, session_id, result.answer, query, mode)
                 
                 stream_generator.emit_done()
                 return
@@ -104,16 +146,25 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             workflow = workflow_factory.create_workflow("quality")
             final_state = await workflow.run(query, stream=stream_generator, messages=chat_history)
 
-            final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+            # Extract final_report - handle both dict with override and direct value
+            final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+            if isinstance(final_report_raw, dict) and "value" in final_report_raw:
+                final_report = final_report_raw["value"]
+            elif isinstance(final_report_raw, str):
+                final_report = final_report_raw
+            else:
+                final_report = str(final_report_raw) if final_report_raw else ""
+            
             if final_report:
+                # Emit final report chunks and final report event
+                stream_generator.emit_status("Generating final report...", step="report")
+                for chunk in _chunk_text(final_report, size=200):
+                    stream_generator.emit_report_chunk(chunk)
+                    await asyncio.sleep(0.02)
+                stream_generator.emit_final_report(final_report)
+                
                 # Store final report in session for PDF generation
-                if not hasattr(app_request.app.state, "session_reports"):
-                    app_request.app.state.session_reports = {}
-                app_request.app.state.session_reports[session_id] = {
-                    "report": final_report,
-                    "query": query,
-                    "mode": mode,
-                }
+                _store_session_report(app_request.app.state, session_id, final_report, query, mode)
                 
                 stream_generator.emit_status("Saving research to memory...", step="save_memory")
                 try:
@@ -136,6 +187,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             stream_generator.emit_status("Chat cancelled by user", step="cancelled")
             stream_generator.emit_done()
         except Exception as exc:
+            # Ensure stream is closed even on error
+            try:
+                stream_generator.emit_error(error=str(exc), details="Chat stream failed")
+                stream_generator.emit_done()
+            except Exception:
+                pass  # Ignore errors during cleanup
             error_str = str(exc)
             error_details = "Chat stream failed"
             

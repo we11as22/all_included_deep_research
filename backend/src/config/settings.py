@@ -48,7 +48,7 @@ class Settings(BaseSettings):
         )
 
     # Memory Settings
-    memory_dir: str = Field(default="/home/asudakov/projects/memory_files", description="Memory files directory")
+    memory_dir: str = Field(default="./memory_files", description="Memory files directory")
     chunk_size: int = Field(default=800, description="Chunk size for text splitting")
     chunk_overlap: int = Field(default=200, description="Chunk overlap")
 
@@ -151,21 +151,21 @@ class Settings(BaseSettings):
     chat_history_limit: int = Field(default=2, description="Chat messages to include in prompts")
     simple_search_max_results: int = Field(default=5, description="Max results for simple search")
     simple_search_scrape_top_n: int = Field(default=2, description="Top results to scrape in simple search")
-    deep_search_max_results: int = Field(default=10, description="Max results per query in deep search")
-    deep_search_queries: int = Field(default=4, description="Number of queries for deep search")
-    deep_search_scrape_top_n: int = Field(default=5, description="Top results to scrape in deep search")
-    deep_search_rerank_top_k: int = Field(default=8, description="Reranked results to keep in deep search")
+    deep_search_max_results: int = Field(default=8, description="Max results per query in deep search")
+    deep_search_queries: int = Field(default=3, description="Number of queries for deep search")
+    deep_search_scrape_top_n: int = Field(default=4, description="Top results to scrape in deep search")
+    deep_search_rerank_top_k: int = Field(default=6, description="Reranked results to keep in deep search")
     deep_search_iterations: int = Field(default=2, description="Search refinement iterations for deep search")
     deep_search_quality_max_results: int = Field(
-        default=16, description="Max results per query in quality deep search"
+        default=12, description="Max results per query in quality deep search"
     )
-    deep_search_quality_queries: int = Field(default=6, description="Number of queries for quality deep search")
-    deep_search_quality_scrape_top_n: int = Field(default=8, description="Top results to scrape in quality deep search")
+    deep_search_quality_queries: int = Field(default=3, description="Number of queries for quality deep search")
+    deep_search_quality_scrape_top_n: int = Field(default=6, description="Top results to scrape in quality deep search")
     deep_search_quality_rerank_top_k: int = Field(
-        default=12, description="Reranked results to keep in quality deep search"
+        default=10, description="Reranked results to keep in quality deep search"
     )
     deep_search_quality_iterations: int = Field(
-        default=3, description="Search refinement iterations for quality deep search"
+        default=5, description="Search refinement iterations for quality deep search"
     )
 
     max_retries: int = Field(default=3, description="Max retries for API calls")

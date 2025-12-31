@@ -17,6 +17,7 @@ from src.workflow.agentic.schemas import AgentAction
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
+from src.utils.text import summarize_text
 from src.workflow.state import ResearchFinding, SourceReference
 from src.memory.agent_memory_service import AgentMemoryService
 from src.memory.agent_file_service import AgentFileService
@@ -40,6 +41,7 @@ Allowed actions:
 - web_search: {{"action": "web_search", "args": {{"queries": ["..."], "max_results": 5}}}}
 - scrape_urls: {{"action": "scrape_urls", "args": {{"urls": ["..."], "scroll": false}}}}
 - scroll_page: {{"action": "scroll_page", "args": {{"url": "...", "scrolls": 3, "pause": 1.0}}}}
+- summarize_content: {{"action": "summarize_content", "args": {{"url": "...", "content": "..."}}}}
 - write_note: {{"action": "write_note", "args": {{"title": "...", "summary": "...", "urls": ["..."], "tags": ["..."], "share": true}}}}
 - update_note: {{"action": "update_note", "args": {{"file_path": "...", "summary": "...", "urls": ["..."]}}}}
 - read_note: {{"action": "read_note", "args": {{"file_path": "items/..."}}}}
@@ -95,6 +97,16 @@ CRITICAL RULES FOR DEEP RESEARCH:
    - You've discovered connections between different pieces of information
    - You've identified gaps, contradictions, or areas needing more research
    - Your todos are constantly evolving and expanding as you learn
+
+10. **Comprehensive Answers with Citations**: When writing notes and findings:
+    - Include DIRECT QUOTES from sources with proper attribution (URL, title)
+    - Use quotes to support every major claim: "According to [source], '[direct quote]'"
+    - Provide context for quotes - explain why they're relevant
+    - Include multiple quotes per finding when possible to show different perspectives
+    - Make answers DETAILED and COMPREHENSIVE - don't summarize too much, include specifics
+    - Use summarize_content tool for long articles to extract key information without losing details
+    - Minimum 3-5 direct quotes per major finding, with full context
+    - Quotes should be substantial (2-3 sentences), not just single phrases
 
 General Rules:
 - Prefer web_search first if you need sources - use multiple queries from different angles.
@@ -184,17 +196,25 @@ class AgenticResearcher:
         self.current_topic = topic
         
         # Load or create agent's personal file
+        # CRITICAL: Always start fresh for new research session - don't load stale todos from previous queries
         if self.agent_file_service:
-            agent_file = await self.agent_file_service.read_agent_file(agent_id)
-            # Use character/preferences from file or provided
-            if character:
-                await self.agent_file_service.write_agent_file(agent_id, character=character)
-            if preferences:
-                await self.agent_file_service.write_agent_file(agent_id, preferences=preferences)
-            # Load todos from file if they exist
-            file_todos = agent_file.get("todos", [])
-            if file_todos:
-                self.agent_memory.todos = file_todos
+            try:
+                agent_file = await self.agent_file_service.read_agent_file(agent_id)
+                # Use character/preferences from file or provided
+                if character:
+                    await self.agent_file_service.write_agent_file(agent_id, character=character)
+                if preferences:
+                    await self.agent_file_service.write_agent_file(agent_id, preferences=preferences)
+                # DON'T load todos from file - they might be from a different query/session
+                # Always start with fresh todos based on current topic
+                # file_todos = agent_file.get("todos", [])
+                # if file_todos:
+                #     self.agent_memory.todos = file_todos
+            except FileNotFoundError:
+                # Agent file doesn't exist yet - that's fine, we'll create it
+                pass
+            except Exception as e:
+                logger.warning("Failed to read agent file", agent_id=agent_id, error=str(e))
         
         if assignment:
             self._seed_assignment(agent_id, assignment)
@@ -293,6 +313,17 @@ class AgenticResearcher:
                 break
 
             last_tool_result = await self._execute_action(action, args, agent_id)
+            
+            # Save todos after each action to persist state and ensure frontend sees updates
+            if self.agent_file_service:
+                try:
+                    await self.agent_file_service.write_agent_file(agent_id, todos=self.agent_memory.todos)
+                except Exception as e:
+                    logger.warning("Failed to save todos after action", agent_id=agent_id, error=str(e))
+            
+            # Emit todo updates after each action to show progress on frontend
+            if self.stream:
+                self.stream.emit_agent_todo(agent_id, self._todo_payload())
 
         finding = self._synthesize_finding(agent_id, topic)
         if self.stream:
@@ -354,12 +385,16 @@ class AgenticResearcher:
                         status_section = main_content[status_start:status_end]
                     persistent_memory_block += f"### Current Project Status:\n{status_section}\n\n"
                 
-                persistent_memory_block += f"### Main Index (full content available via read_main tool):\n{main_content[:1000]}...\n\n"
+                # Show more main content context
+                main_preview = summarize_text(main_content, 2000)
+                persistent_memory_block += f"### Main Index (full content available via read_main tool):\n{main_preview}\n\n"
                 persistent_memory_block += "**Note:** Use read_main action to read the full main.md file.\n\n"
                 if items:
                     persistent_memory_block += f"### Available Items ({len(items)} total, showing last 8):\n"
                     for item in items[-8:]:
-                        persistent_memory_block += f"- **{item['title']}** ({item['file_path']}): {item['summary'][:100]}...\n"
+                        # Don't truncate summaries too much - show more context
+                        summary_preview = summarize_text(item['summary'], 320)
+                        persistent_memory_block += f"- **{item['title']}** ({item['file_path']}): {summary_preview}\n"
                 persistent_memory_block += "\nYou can reference these items and add new ones using write_note action.\n"
             except Exception as e:
                 logger.warning("Failed to load persistent memory files", error=str(e), agent_id=agent_id)
@@ -371,9 +406,12 @@ class AgenticResearcher:
                 agent_file = await self.agent_file_service.read_agent_file(agent_id)
                 agent_file_block = "\n\n## Your Personal Agent File\n\n"
                 if agent_file.get("character"):
-                    agent_file_block += f"**Character:** {agent_file['character'][:200]}\n\n"
+                    # Show more character and preferences context
+                    char_preview = summarize_text(agent_file['character'], 520)
+                    agent_file_block += f"**Character:** {char_preview}\n\n"
                 if agent_file.get("preferences"):
-                    agent_file_block += f"**Preferences:** {agent_file['preferences'][:200]}\n\n"
+                    pref_preview = summarize_text(agent_file['preferences'], 520)
+                    agent_file_block += f"**Preferences:** {pref_preview}\n\n"
             except Exception as e:
                 logger.warning("Failed to load agent file", error=str(e), agent_id=agent_id)
 
@@ -429,6 +467,8 @@ Choose the next action (JSON only)."""
             return await self._tool_read_agent_file(args)
         if action == "read_main":
             return await self._tool_read_main()
+        if action == "summarize_content":
+            return await self._tool_summarize_content(args)
 
         return "Unknown action."
 
@@ -477,7 +517,7 @@ Choose the next action (JSON only)."""
         for url in urls[:3]:
             try:
                 content = await self.web_scraper.scrape(url, scroll=scroll)
-                snippets.append(f"{content.title}: {content.content[:400]}")
+                snippets.append(f"{content.title}: {summarize_text(content.content, 420)}")
             except Exception as exc:
                 snippets.append(f"{url}: scrape failed ({exc})")
 
@@ -581,7 +621,7 @@ Choose the next action (JSON only)."""
                 
                 result = f"Scrolled {total_scrolled} times on '{page_title}'. Page height increased from {initial_height} to {new_height}px."
                 if viewport_content:
-                    result += f"\n\nViewport content (visible after scrolling):\n{viewport_content[:1000]}..."
+                    result += f"\n\nViewport content (visible after scrolling):\n{summarize_text(viewport_content, 1000)}"
                 else:
                     result += "\n\nNo visible content captured in viewport."
                 
@@ -787,15 +827,15 @@ Choose the next action (JSON only)."""
             
             result = f"Agent file for {target_agent_id}:\n\n"
             if character:
-                result += f"Character: {character}\n\n"
+                result += f"Character: {summarize_text(character, 520)}\n\n"
             if preferences:
-                result += f"Preferences: {preferences}\n\n"
+                result += f"Preferences: {summarize_text(preferences, 520)}\n\n"
             result += "Todo List:\n"
             for todo in todos:
                 result += f"- [{todo.status}] {todo.title}\n"
             result += "\nNotes:\n"
             for note in notes:
-                result += f"- {note}\n"
+                result += f"- {summarize_text(str(note), 200)}\n"
             return result
         except Exception as e:
             logger.warning("Failed to read agent file", agent_id=target_agent_id, error=str(e))
@@ -817,8 +857,9 @@ Choose the next action (JSON only)."""
     def _synthesize_finding(self, agent_id: str, topic: str) -> ResearchFinding:
         notes = self.agent_memory.notes[-5:]
         if notes:
-            summary = " ".join([note.summary for note in notes])[:1200]
-            key_findings = [note.summary for note in notes[:3]]
+            # Don't truncate summary too much - preserve more information
+            summary = summarize_text(" ".join([note.summary for note in notes]), 3000)
+            key_findings = [note.summary for note in notes[:5]]  # Increased from 3
             confidence = "medium" if self.sources else "low"
         else:
             summary = f"No detailed notes produced for {topic}."
@@ -938,5 +979,6 @@ def _format_findings(findings: list[ResearchFinding]) -> str:
         return "None."
     lines = []
     for finding in findings[-5:]:
-        lines.append(f"- {finding.topic}: {finding.summary[:200]}")
+        # Show more of each finding - don't truncate too much
+        lines.append(f"- {finding.topic}: {summarize_text(finding.summary, 520)}")
     return "\n".join(lines)

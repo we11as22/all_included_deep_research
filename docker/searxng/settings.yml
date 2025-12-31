@@ -13,11 +13,12 @@ server:
   secret_key: "change_me"
 
 # Increase timeout for engines to handle slow connections
+# Optimized for high load: increased connection pools
 outgoing:
   timeout: 15.0
   max_redirects: 5
-  pool_connections: 100
-  pool_maxsize: 10
+  pool_connections: 500  # Increased from 100 for high load
+  pool_maxsize: 50       # Increased from 10 for high load
   # User-Agent to avoid blocking
   useragent_suffix: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 

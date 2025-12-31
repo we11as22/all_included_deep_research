@@ -22,6 +22,7 @@ from src.search.reranker import SemanticReranker
 from src.search.scraper import WebScraper
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
+from src.utils.text import summarize_text
 from src.workflow.agentic.schemas import QueryRewrite, SearchQueries, FollowupQueries, SummarizedContent, SynthesizedAnswer
 
 logger = structlog.get_logger(__name__)
@@ -63,7 +64,7 @@ class SearchSessionMemory:
             return
         top = results[:3]
         snippets = "; ".join(
-            [f"{item.title}: {item.snippet[:120]}" for item in top if item.snippet]
+            [f"{item.title}: {summarize_text(item.snippet, 140)}" for item in top if item.snippet]
         )
         if snippets:
             self.notes.append(f"{query}: {snippets}")
@@ -208,6 +209,13 @@ class ChatSearchService:
         try:
             chat_history = format_chat_history(messages, self.settings.chat_history_limit)
             self._emit_status(stream, "Rewriting query...", "rewrite")
+            # Ensure query is a string before rewriting
+            if not isinstance(query, str):
+                if isinstance(query, (list, tuple)):
+                    logger.error("Query was passed as list/embedding to _run_multi_query_search, using empty string", query_type=type(query).__name__)
+                    query = ""
+                else:
+                    query = str(query) if query else ""
             rewritten = await self._rewrite_query(query, chat_history=chat_history)
             self._emit_search_queries(stream, [rewritten], "rewrite")
 
@@ -238,7 +246,9 @@ class ChatSearchService:
                         search_query,
                         max_results=tuning.max_results,
                     )
-                    return response.results
+                    # Rerank results for each query to improve relevance
+                    reranked = await self._rerank_results(search_query, response.results, top_k=tuning.max_results)
+                    return reranked
 
                 search_batches = await asyncio.gather(*[run_query(q) for q in queries])
                 for query_text, batch in zip(queries, search_batches):
@@ -263,6 +273,7 @@ class ChatSearchService:
             scraped = await self._scrape_results(results, tuning.scrape_top_n, stream=stream)
             summarized = await self._summarize_scraped(query, scraped, stream=stream)
 
+            self._emit_status(stream, "Synthesizing answer from sources...", "synthesize")
             answer = await self._synthesize_answer(
                 query=query,
                 search_query=rewritten,
@@ -274,6 +285,7 @@ class ChatSearchService:
             )
 
             self._emit_finding(stream, f"{tuning.mode}_search", answer)
+            self._emit_status(stream, "Answer ready", "complete")
             return ChatSearchResult(answer=answer, sources=results, memory_context=memory_context)
         finally:
             session_memory.clear()
@@ -313,10 +325,12 @@ class ChatSearchService:
 
         current_date = get_current_date()
         prompt = (
-            f"Rewrite the user query into a concise web search query. "
+            f"Rewrite the user query into a precise, focused web search query that will find relevant results. "
+            f"IMPORTANT: Preserve the core meaning and key terms from the original query. "
             f"Use the chat history for context if needed. "
             f"Current date: {current_date} - consider this when rewriting queries about recent events. "
-            f"Return only the rewritten query."
+            f"Return only the rewritten query, without quotes or explanations. "
+            f"Example: 'расскажи про сорта пива' -> 'сорта пива типы классификация' (NOT 'какие-то' or unrelated terms)."
         )
         history_block = chat_history or "Chat history: None."
         try:
@@ -485,6 +499,7 @@ class ChatSearchService:
                 search_mode=SearchMode.HYBRID,
                 limit=self.settings.memory_context_limit,
             )
+            filtered_results = [result for result in results if result.file_category != "chat"]
             memory_context = [
                 {
                     "file_path": result.file_path,
@@ -492,7 +507,7 @@ class ChatSearchService:
                     "content": result.content,
                     "score": result.score,
                 }
-                for result in results[:3]
+                for result in filtered_results[:3]
             ]
             if stream:
                 stream.emit_memory_context(
@@ -672,7 +687,9 @@ class ChatSearchService:
             return "Memory Context: None."
         lines = ["Memory Context (from prior notes):"]
         for item in memory_context:
-            lines.append(f"- {item['title']} ({item['file_path']}): {item['content'][:200]}")
+            lines.append(
+                f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 260)}"
+            )
         return "\n".join(lines)
 
     def _emit_status(self, stream: Any | None, message: str, step: str) -> None:

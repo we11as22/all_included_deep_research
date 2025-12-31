@@ -14,7 +14,7 @@ logger = structlog.get_logger(__name__)
 class FileManager:
     """Manages markdown memory files on filesystem."""
 
-    def __init__(self, memory_dir: str = "/home/asudakov/projects/memory_files"):
+    def __init__(self, memory_dir: str = "./memory_files"):
         """
         Initialize file manager.
 

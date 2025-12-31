@@ -49,7 +49,7 @@ class MemoryManager:
         """Ensure base folder structure and index files exist."""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
-        for subdir in ["projects", "concepts", "conversations", "preferences"]:
+        for subdir in ["projects", "concepts", "conversations", "preferences", "items", "agents"]:
             (self.memory_dir / subdir).mkdir(exist_ok=True)
 
         main_file = self.memory_dir / "main.md"

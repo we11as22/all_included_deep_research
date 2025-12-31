@@ -17,6 +17,7 @@ from src.search.scraper import WebScraper
 from src.workflow.state import ResearchFinding, ResearcherState, SourceReference
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
+from src.utils.text import summarize_text
 from src.workflow.agentic.schemas import SearchQueries, ResearchAnalysis, FollowupQueries
 
 logger = structlog.get_logger(__name__)
@@ -177,7 +178,7 @@ async def researcher_node(
                 scraped_content.append({
                     "url": content.url,
                     "title": content.title,
-                    "content": content.content[:3000],  # Limit content
+                    "content": summarize_text(content.content, 3000),
                 })
             except Exception as e:
                 logger.warning("Scraping failed", url=source.url, error=str(e))
@@ -239,7 +240,7 @@ async def _generate_search_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {ctx.content[:200]}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 240)}" for ctx in memory_context[:3]]
         )
 
     existing_hint = _format_existing_findings(existing_findings)
@@ -298,20 +299,20 @@ async def _analyze_and_synthesize(
     sources_text = "\n\n".join([
         f"**Source {idx + 1}:** {source.title}\n"
         f"URL: {source.url}\n"
-        f"Summary: {source.snippet}"
+        f"Summary: {summarize_text(source.snippet, 260)}"
         for idx, source in enumerate(sources[:5])
     ])
 
     # Format scraped content
     content_text = "\n\n".join([
-        f"**{sc['title']}**\n{sc['content'][:2000]}..."
+        f"**{sc['title']}**\n{summarize_text(sc['content'], 2000)}"
         for sc in scraped_content[:3]
     ])
 
     memory_text = ""
     if memory_context:
         memory_text = "\n\n## Memory Context\n" + "\n".join(
-            [f"- {ctx.file_title}: {ctx.content[:200]}" for ctx in memory_context[:3]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 240)}" for ctx in memory_context[:3]]
         )
 
     existing_text = _format_existing_findings(existing_findings)
@@ -441,7 +442,7 @@ def _format_existing_findings(existing_findings: list[ResearchFinding]) -> str:
         summary = getattr(finding, "summary", "") or ""
         summary = summary.replace("\n", " ")
         if topic or summary:
-            lines.append(f"- {topic}: {summary[:200]}")
+            lines.append(f"- {topic}: {summarize_text(summary, 240)}")
     return "\n" + "\n".join(lines)
 
 
@@ -463,11 +464,11 @@ async def _generate_followup_queries(
     memory_hint = ""
     if memory_context:
         memory_hint = "\nMemory Context:\n" + "\n".join(
-            [f"- {ctx.file_title}: {ctx.content[:160]}" for ctx in memory_context[:2]]
+            [f"- {ctx.file_title}: {summarize_text(ctx.content, 220)}" for ctx in memory_context[:2]]
         )
 
     sources_hint = "\n".join(
-        [f"- {source.title}: {source.snippet[:180]}" for source in sources[:5]]
+        [f"- {source.title}: {summarize_text(source.snippet, 240)}" for source in sources[:5]]
     )
 
     history_block = chat_history or "Chat history: None."

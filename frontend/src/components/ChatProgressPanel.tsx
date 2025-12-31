@@ -264,30 +264,67 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
 
       {Object.keys(progress.agentTodos).length > 0 && (
         <div className="mt-3">
-          <div className="text-xs font-semibold text-foreground">Agent Threads</div>
+          <div className="text-xs font-semibold text-foreground">Agent Tasks</div>
           <div className="mt-2 space-y-2">
             {Object.entries(progress.agentTodos).map(([agentId, todos]) => {
               const notes = progress.agentNotes[agentId] || [];
               const pending = todos.filter((item) => item.status !== 'done');
+              const inProgress = todos.filter((item) => item.status === 'in_progress');
+              const completed = todos.filter((item) => item.status === 'done');
               const accent = getAgentAccent(agentId);
               return (
                 <div
                   key={agentId}
-                  className={`rounded-lg border border-border/60 bg-background/80 dark:bg-background/70 p-2 ${accent.border}`}
+                  className={`rounded-lg border border-border/60 bg-background/80 dark:bg-background/70 p-2 transition-all duration-300 ${accent.border}`}
                 >
                   <div className="flex items-center justify-between text-[11px] font-semibold text-foreground dark:text-foreground">
                     <span>{agentId.replace('agent_', 'agent ')}</span>
-                    <span className={`rounded-full px-2 py-0.5 text-[9px] ${accent.badge} dark:bg-background/80 dark:text-foreground`}>
-                      {pending.length} pending
-                    </span>
+                    <div className="flex items-center gap-2">
+                      {inProgress.length > 0 && (
+                        <span className="rounded-full px-2 py-0.5 text-[9px] bg-amber-500/20 text-amber-600 dark:text-amber-400 animate-pulse">
+                          {inProgress.length} in progress
+                        </span>
+                      )}
+                      <span className={`rounded-full px-2 py-0.5 text-[9px] ${accent.badge} dark:bg-background/80 dark:text-foreground`}>
+                        {pending.length} pending • {completed.length} done
+                      </span>
+                    </div>
                   </div>
                   <div className="mt-2 space-y-1">
                     {todos.map((todo, idx) => (
-                      <div key={`${todo.title}-${idx}`} className="flex items-start gap-2 text-[10px]">
-                        <span className={todo.status === 'done' ? 'text-emerald-600 dark:text-emerald-400' : todo.status === 'in_progress' ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground dark:text-muted-foreground'}>
-                          {todo.status === 'done' ? '●' : todo.status === 'in_progress' ? '◐' : '○'}
+                      <div 
+                        key={`${todo.title}-${idx}`} 
+                        className={`flex items-start gap-2 text-[10px] transition-all duration-300 ${
+                          todo.status === 'done' 
+                            ? 'opacity-60' 
+                            : todo.status === 'in_progress' 
+                            ? 'opacity-100 font-medium' 
+                            : 'opacity-80'
+                        }`}
+                      >
+                        <span className={`transition-colors duration-300 ${
+                          todo.status === 'done' 
+                            ? 'text-emerald-600 dark:text-emerald-400' 
+                            : todo.status === 'in_progress' 
+                            ? 'text-amber-600 dark:text-amber-400 animate-pulse' 
+                            : 'text-muted-foreground dark:text-muted-foreground'
+                        }`}>
+                          {todo.status === 'done' ? '✓' : todo.status === 'in_progress' ? '⟳' : '○'}
                         </span>
-                        <span className="flex-1 text-foreground dark:text-foreground">{todo.title}</span>
+                        <span className={`flex-1 transition-all duration-300 ${
+                          todo.status === 'done' 
+                            ? 'line-through text-foreground/60 dark:text-foreground/60' 
+                            : todo.status === 'in_progress'
+                            ? 'text-foreground dark:text-foreground font-medium'
+                            : 'text-foreground dark:text-foreground'
+                        }`}>
+                          {todo.title}
+                        </span>
+                        {todo.note && (
+                          <span className="text-[9px] text-muted-foreground/70 dark:text-muted-foreground/70" title={todo.note}>
+                            ℹ
+                          </span>
+                        )}
                       </div>
                     ))}
                   </div>

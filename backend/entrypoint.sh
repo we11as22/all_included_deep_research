@@ -1,10 +1,11 @@
 #!/bin/sh
 set -e
 
-echo "Starting SearXNG..."
+echo "Starting SearXNG with uwsgi (production-ready for high load)..."
 
-# Start SearXNG in background
-sudo -H -u searxng bash -c "cd /usr/local/searxng/searxng-src && export SEARXNG_SETTINGS_PATH='/etc/searxng/settings.yml' && export FLASK_APP=searx/webapp.py && /usr/local/searxng/searx-pyenv/bin/python -m flask run --host=0.0.0.0 --port=8080" &
+# Start SearXNG with uwsgi (production-ready, handles high load)
+# Use system uwsgi with virtualenv specified in config
+sudo -H -u searxng bash -c "cd /usr/local/searxng/searxng-src && export SEARXNG_SETTINGS_PATH='/etc/searxng/settings.yml' && /usr/bin/uwsgi --ini /etc/searxng/uwsgi.ini --http-socket 0.0.0.0:8080" &
 SEARXNG_PID=$!
 
 echo "Waiting for SearXNG to be ready..."

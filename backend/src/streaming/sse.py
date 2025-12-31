@@ -175,13 +175,15 @@ class ResearchStreamingGenerator(StreamingGenerator):
 
     def emit_finding(self, researcher_id: str, topic: str, summary: str, key_findings: list[str]) -> None:
         """Emit research finding."""
+        summary_preview = summary[:240] + "..." if isinstance(summary, str) and len(summary) > 240 else summary
         self.add(
             self._create_event(
                 StreamEventType.FINDING,
                 {
                     "researcher_id": researcher_id,
                     "topic": topic,
-                    "summary": summary[:200] + "..." if len(summary) > 200 else summary,
+                    "summary": summary,
+                    "summary_preview": summary_preview,
                     "findings_count": len(key_findings),
                 },
             )
@@ -206,8 +208,8 @@ class ResearchStreamingGenerator(StreamingGenerator):
     def emit_agent_note(self, researcher_id: str, note: dict) -> None:
         """Emit agent note update."""
         summary = note.get("summary", "")
-        trimmed = summary[:200] + "..." if isinstance(summary, str) and len(summary) > 200 else summary
-        payload = {**note, "summary": trimmed}
+        summary_preview = summary[:240] + "..." if isinstance(summary, str) and len(summary) > 240 else summary
+        payload = {**note, "summary_preview": summary_preview}
         self.add(
             self._create_event(
                 StreamEventType.AGENT_NOTE,
