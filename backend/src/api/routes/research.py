@@ -102,6 +102,19 @@ async def start_research(research_request: ResearchRequest, app_request: Request
     task = asyncio.create_task(run_research())
     app_request.app.state.active_tasks[session_id] = task
 
+    async def watch_disconnect() -> None:
+        try:
+            while not task.done():
+                if await app_request.is_disconnected():
+                    if not task.done():
+                        task.cancel()
+                    break
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning("Disconnect watcher failed", session_id=session_id, error=str(exc))
+
+    asyncio.create_task(watch_disconnect())
+
     # Return streaming response
     return StreamingResponse(
         stream_generator.stream(),

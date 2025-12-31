@@ -40,13 +40,16 @@ Your plan should be:
 - **Comprehensive**: Cover all aspects of the query
 - **Actionable**: Topics should be concrete enough for researchers to investigate
 - **Non-redundant**: Avoid overlapping topics
+- **Concise**: Each topic should be a short phrase (<= 12 words), no long clauses
+- **Language-matched**: Use the same language as the user's query
 
 Mode-specific guidance:
 - **Speed mode**: 1-2 topics, very targeted
 - **Balanced mode**: 3-5 topics, balanced coverage
 - **Quality mode**: 5-8 topics, comprehensive exploration
 
-CRITICAL: Every topic MUST explicitly reference the user's query. Do not output generic topics."""
+CRITICAL: Every topic MUST reference the user's query. Do not output generic topics.
+Avoid repeating the full query verbatim; use compact phrasing."""
 
 
 PLANNING_USER_TEMPLATE = """Research Query: {query}
@@ -57,7 +60,8 @@ Research Mode: {mode}
 
 {memory_context}
 
-Based on this information, create a strategic research plan.
+Based on this information, create a strategic research plan. Topics must be short phrases (<= 12 words).
+Use the same language as the query.
 
 Return JSON with fields: reasoning, overview, topics, rationale."""
 
@@ -206,6 +210,7 @@ def _align_topics_with_query(topics: list[str], query: str) -> list[str]:
     anchor_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 4}
     if not anchor_tokens:
         return topics
+    prefix = _compact_query_prefix(query)
 
     aligned: list[str] = []
     for topic in topics:
@@ -215,8 +220,16 @@ def _align_topics_with_query(topics: list[str], query: str) -> list[str]:
         if any(token in topic_text.lower() for token in anchor_tokens):
             aligned.append(topic_text)
         else:
-            aligned.append(f"{query}: {topic_text}")
+            aligned.append(f"{prefix}: {topic_text}")
     return aligned
+
+
+def _compact_query_prefix(query: str) -> str:
+    query_text = str(query).strip()
+    tokens = re.findall(r"\w+", query_text.lower())
+    if not tokens:
+        return query_text[:120].strip()
+    return " ".join(tokens[:5])
 
 
 def _get_max_topics_for_mode(mode: str) -> int:

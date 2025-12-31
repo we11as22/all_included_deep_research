@@ -58,6 +58,10 @@ class AgentMemory:
         note: str | None = None,
         url: str | None = None,
     ) -> AgentTodoItem:
+        normalized = title.strip().lower()
+        for existing in self.todos:
+            if existing.title.strip().lower() == normalized:
+                return existing
         item = AgentTodoItem(
             reasoning=reasoning,
             title=title,

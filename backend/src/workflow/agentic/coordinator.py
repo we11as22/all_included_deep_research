@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -85,10 +86,10 @@ CRITICAL RULES FOR DEEP RESEARCH SUPERVISION:
    - What related areas should be explored?
 
 6. **Task Quality**: Tasks must be:
-   - Short and specific research directions
-   - Focused on deep investigation, not surface-level search
-   - Designed to push agents to explore multiple angles
-   - Include verification and cross-referencing requirements
+   - Short and specific research directions (<= 140 chars in title)
+   - Focused on a single research action
+   - Include objective + expected_output when adding new todos
+   - Avoid boilerplate like "Depth:" or "Primary query:"
    - Avoid duplicating existing topics or findings (but allow different angles on same topic)
 
 7. **Stop Condition**: Only set stop to true when:
@@ -108,6 +109,8 @@ CRITICAL RULES FOR DEEP RESEARCH SUPERVISION:
     - Update their todos to push them deeper
     - Create new agents for specialized sub-topics if needed
     - Write notes to main.md about important findings or gaps
+
+11. **Language Match**: Use the same language as the user's query for tasks and directives.
 """
 
 
@@ -127,6 +130,7 @@ class AgenticResearchCoordinator:
         max_sources: int = 10,
         agent_memory_service: AgentMemoryService | None = None,
         agent_file_service: AgentFileService | None = None,
+        emit_plan: bool = True,
     ) -> None:
         self.llm = llm
         self.llm_planning = llm.with_structured_output(SupervisorTasks, method="function_calling")
@@ -141,6 +145,7 @@ class AgenticResearchCoordinator:
         self.max_sources = max_sources
         self.agent_memory_service = agent_memory_service
         self.agent_file_service = agent_file_service
+        self.emit_plan = emit_plan
         self.shared_memory = SharedResearchMemory()
         self.query = ""
 
@@ -154,7 +159,10 @@ class AgenticResearchCoordinator:
             findings=[],
             max_tasks=max_tasks,
         )
-        return await self._run_prompt(prompt, max_tasks)
+        tasks = await self._run_prompt(prompt, max_tasks)
+        tasks = _normalize_tasks(tasks, query)
+        tasks = _align_tasks_with_query(tasks, query)
+        return _dedupe_tasks(tasks)
 
     async def gap_tasks(
         self,
@@ -171,7 +179,10 @@ class AgenticResearchCoordinator:
             findings=findings,
             max_tasks=max_tasks,
         )
-        return await self._run_prompt(prompt, max_tasks)
+        tasks = await self._run_prompt(prompt, max_tasks)
+        tasks = _normalize_tasks(tasks, query)
+        tasks = _align_tasks_with_query(tasks, query)
+        return _dedupe_tasks(tasks)
 
     async def _build_prompt(
         self,
@@ -185,6 +196,7 @@ class AgenticResearchCoordinator:
         findings_block = _format_findings(findings)
         chat_block = format_chat_history(self.chat_history, limit=len(self.chat_history))
         current_date = get_current_date()
+        language_hint = _language_hint(query)
 
         main_content = ""
         if self.agent_memory_service:
@@ -197,28 +209,26 @@ class AgenticResearchCoordinator:
         return f"""Task: {title}
 Research query: {query}
 Current date: {current_date}
+Language requirement: {language_hint} (use ONLY this language in tasks)
 
 CRITICAL: You MUST create tasks that are DIRECTLY RELATED to the research query: "{query}"
 - DO NOT create tasks about unrelated topics (e.g., if query is about "spirits/alcohols", don't create tasks about "multi-agent systems" or "tanks")
 - Tasks must be SPECIFIC subtopics of the main query
 - Each task should be a focused investigation angle related to: {query}
+- Use the SAME language as the research query for all tasks
 
 IMPORTANT: You must create EXACTLY {max_tasks} tasks or fewer. Do not exceed this limit.
 
-CRITICAL: For DEEP RESEARCH, create DETAILED and SPECIFIC tasks that push agents to:
-- Explore multiple angles and perspectives (e.g., "Investigate X from historical, technical, and economic perspectives")
-- Verify information from multiple sources (e.g., "Verify claim Y by checking at least 3 independent sources")
-- Investigate sub-topics and related areas (e.g., "Deep dive into sub-topic Z: explore origins, evolution, current state, and future trends")
-- Find primary sources, not just summaries (e.g., "Find original research papers, official documents, or expert interviews about X")
-- Check for controversies, limitations, alternatives (e.g., "Identify controversies, limitations, and alternative viewpoints on X")
-- Dig deeper into every interesting lead (e.g., "Follow up on lead X: investigate related aspects Y and Z")
+CRITICAL: For DEEP RESEARCH, create SPECIFIC tasks that push agents to:
+- Find primary sources and verify claims
+- Cover missing angles without repeating what is already done
+- Move from discovery -> evidence -> synthesis
 
-TASK FORMAT: Each task should be:
-- Specific and actionable (not vague like "research X")
-- Include sub-questions or angles to explore
-- Specify what kind of sources to look for
-- Indicate depth level expected (surface, medium, deep)
-- Include verification requirements when relevant
+TASK FORMAT (one line per task, max 140 chars):
+- Start with a verb
+- Include concrete deliverable (e.g., "find 2-3 primary sources + 3 cited facts")
+- Mention source type (e.g., archives, official docs, technical manuals)
+- Avoid boilerplate like "Depth:" or "Primary query:"
 
 {chat_block}
 
@@ -305,7 +315,9 @@ Provide up to {max_tasks} tasks in JSON only with fields: reasoning, tasks, stop
                 directives.extend(result.get("directives") or [])
                 tasks.extend(result.get("tasks") or [])
 
-            tasks = _dedupe_tasks(tasks)
+            tasks = _normalize_tasks(tasks, query)
+            tasks = _align_tasks_with_query(_dedupe_tasks(tasks), query)
+            tasks = tasks[:2]
 
             return {
                 "actions": action_names,
@@ -353,6 +365,7 @@ Provide up to {max_tasks} tasks in JSON only with fields: reasoning, tasks, stop
         findings_block = _format_findings(findings)
         chat_block = format_chat_history(self.chat_history, limit=len(self.chat_history))
         current_date = get_current_date()
+        language_hint = _language_hint(query)
 
         main_content = ""
         if self.agent_memory_service:
@@ -373,6 +386,7 @@ Provide up to {max_tasks} tasks in JSON only with fields: reasoning, tasks, stop
         return f"""Supervisor ReAct Step
 Research query: {query}
 Current date: {current_date}
+Language requirement: {language_hint} (use ONLY this language in directives/tasks)
 
 Agent {agent_id} just performed: {agent_action}
 Result: {summarize_text(str(action_result), 12000)}
@@ -413,6 +427,7 @@ YOU MUST BE PROACTIVE AND ACTIVELY MANAGE PLANS:
 - ADD cross-reference tasks when information seems incomplete
 - Don't wait for agents to ask - actively guide them to deeper research
 - MODIFY agent plans in real-time based on what you see in their file
+- Use the SAME language as the research query for directives and tasks
 
 Decide what to do next. You can:
 - update_agent_todo: Add/modify agent's todos to push deeper research (USE THIS OFTEN)
@@ -421,6 +436,9 @@ Decide what to do next. You can:
 - read_agent_file: Check progress (already shown above, but you can read again)
 - plan_tasks: Plan new high-level tasks (but prefer update_agent_todo for specific agent guidance)
 - Do nothing ONLY if research is truly deep and comprehensive AND agent is actively updating todos
+
+LIMITS:
+- Add at most 2 new todo items per wake-up (keep them short and actionable)
 
 You may return multiple actions in order. Respond with JSON containing reasoning and an actions list."""
 
@@ -748,11 +766,13 @@ You may return multiple actions in order. Respond with JSON containing reasoning
                 logger.warning("Failed to initialize main agent memory file", error=str(exc))
 
         if seed_tasks:
-            tasks = seed_tasks[: self.max_concurrent]
+            tasks = _normalize_tasks(seed_tasks, query)
+            tasks = _align_tasks_with_query(tasks, query)
+            tasks = tasks[: self.max_concurrent]
         else:
             tasks = await self.initial_tasks(query, max_tasks=self.max_concurrent)
 
-        if self.stream and tasks:
+        if self.stream and tasks and self.emit_plan:
             plan_text = "Research Plan:\n\n"
             plan_text += "\n".join([f"{i+1}. {task}" for i, task in enumerate(tasks)])
             plan_text += f"\n\nTotal tasks: {len(tasks)}"
@@ -1009,3 +1029,76 @@ def _dedupe_tasks(tasks: list[str]) -> list[str]:
         seen.add(key)
         unique.append(task_text)
     return unique
+
+
+def _align_tasks_with_query(tasks: list[str], query: str) -> list[str]:
+    if not query:
+        return tasks
+    anchor_tokens = {token for token in re.findall(r"\w+", query.lower()) if len(token) >= 4}
+    if not anchor_tokens:
+        return tasks
+    prefix = _compact_query_prefix(query)
+
+    aligned: list[str] = []
+    for task in tasks:
+        task_text = str(task).strip()
+        if not task_text:
+            continue
+        if any(token in task_text.lower() for token in anchor_tokens):
+            aligned.append(task_text)
+        else:
+            aligned.append(f"{prefix}: {task_text}")
+    return aligned
+
+
+def _compact_query_prefix(query: str) -> str:
+    query_text = str(query).strip()
+    tokens = re.findall(r"\w+", query_text.lower())
+    if not tokens:
+        return query_text[:120].strip()
+    return " ".join(tokens[:5])
+
+
+def _language_hint(text: str) -> str:
+    if re.search(r"[\u0400-\u04FF]", text):
+        return "Russian"
+    return "English"
+
+
+def _normalize_tasks(tasks: list[str], query: str) -> list[str]:
+    normalized = []
+    for task in tasks:
+        text = _normalize_task_text(task, query)
+        if text:
+            normalized.append(text)
+    return normalized
+
+
+def _normalize_task_text(task: str, query: str) -> str:
+    text = str(task).strip()
+    if not text:
+        return ""
+    if query:
+        prefix = _compact_query_prefix(query)
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+        text = pattern.sub(prefix, text)
+    text = re.sub(r"\s*Depth:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*Primary query:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*Your focus:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*Chat history:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^Task:\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" -;")
+    if query and text.lower().startswith(query.lower()):
+        text = text[len(query):].lstrip(" :-—")
+    if len(text) > 160:
+        for sep in [". ", "; ", " — ", " - "]:
+            idx = text.find(sep)
+            if 0 < idx <= 160:
+                text = text[:idx].rstrip()
+                break
+    if len(text) > 160:
+        trimmed = text[:160].rstrip()
+        if " " in trimmed:
+            trimmed = trimmed.rsplit(" ", 1)[0]
+        text = trimmed
+    return text

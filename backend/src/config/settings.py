@@ -175,6 +175,16 @@ class Settings(BaseSettings):
     allow_clarification: bool = Field(default=True, description="Allow clarification questions in quality mode")
     debug_mode: bool = Field(default=False, description="Enable debug logging for streams and frontend sync")
 
+    # Search result filtering (optional)
+    search_blocked_domains: str = Field(
+        default="",
+        description="Comma-separated domains to skip in search results",
+    )
+    search_blocked_keywords: str = Field(
+        default="",
+        description="Comma-separated keywords/phrases to skip in search results",
+    )
+
 
 @lru_cache
 def get_settings() -> Settings:

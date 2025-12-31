@@ -228,6 +228,19 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     task = asyncio.create_task(run_task())
     app_request.app.state.active_tasks[session_id] = task
 
+    async def watch_disconnect() -> None:
+        try:
+            while not task.done():
+                if await app_request.is_disconnected():
+                    if not task.done():
+                        task.cancel()
+                    break
+                await asyncio.sleep(0.5)
+        except Exception as exc:
+            logger.warning("Disconnect watcher failed", session_id=session_id, error=str(exc))
+
+    asyncio.create_task(watch_disconnect())
+
     return StreamingResponse(
         stream_generator.stream(),
         media_type="text/event-stream",

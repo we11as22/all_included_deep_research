@@ -134,6 +134,7 @@ class QualityResearchWorkflow:
             max_sources=10,
             agent_memory_service=agent_memory_service,
             agent_file_service=agent_file_service,
+            emit_plan=False,
         )
 
         # Limit research topics to max_concurrent to prevent too many agents

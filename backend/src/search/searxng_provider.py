@@ -39,10 +39,11 @@ class SearXNGSearchProvider(SearchProvider):
         logger.info("SearXNGSearchProvider initialized", instance_url=self.instance_url)
 
     def _build_params(self, query: str, engines_override: list[str] | None) -> dict[str, str | int]:
+        language = self._select_language(query)
         params: dict[str, str | int] = {
             "q": query,
             "format": "json",
-            "language": self.language,
+            "language": language,
             "safesearch": self.safesearch,
         }
         if self.categories:
@@ -51,6 +52,17 @@ class SearXNGSearchProvider(SearchProvider):
         if engines:
             params["engines"] = ",".join(engines)
         return params
+
+    def _select_language(self, query: str) -> str:
+        if not query:
+            return self.language
+        if self._contains_cyrillic(query) and self.language in {"en", ""}:
+            return "ru"
+        return self.language
+
+    @staticmethod
+    def _contains_cyrillic(text: str) -> bool:
+        return bool(re.search(r"[\u0400-\u04FF]", text))
 
     async def _search_once(
         self,
@@ -232,7 +244,7 @@ class SearXNGSearchProvider(SearchProvider):
             tokens = set(self._tokenize(haystack))
             return len(query_tokens & tokens)
 
-        min_overlap = 2 if len(query_tokens) >= 5 else 1
+        min_overlap = 2 if len(query_tokens) >= 4 else 1
         filtered = [item for item in results if overlap_count(item) >= min_overlap]
 
         if filtered:
@@ -246,14 +258,6 @@ class SearXNGSearchProvider(SearchProvider):
                 )
             return filtered
 
-        if len(query_tokens) <= 2:
-            logger.info(
-                "Keeping unfiltered SearXNG results for short query",
-                query=query,
-                before=len(results),
-            )
-            return results
-
         logger.info(
             "No SearXNG results matched query tokens; returning empty",
             query=query,
@@ -261,6 +265,7 @@ class SearXNGSearchProvider(SearchProvider):
             min_overlap=min_overlap,
         )
         return []
+
 
     def _prefer_fallback(
         self,
@@ -294,7 +299,7 @@ class SearXNGSearchProvider(SearchProvider):
                     label="primary",
                 )
 
-                if self.engines or not self._should_fallback(primary.results, max_results):
+                if not self._should_fallback(primary.results, max_results):
                     return primary
 
                 fallback = await self._search_once(

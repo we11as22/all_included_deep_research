@@ -109,6 +109,8 @@ class ChatSearchService:
             max_scrolls=settings.scraper_max_scrolls,
         )
         self.reranker = SemanticReranker(embedding_provider)
+        self.blocked_domains = _parse_blocklist(settings.search_blocked_domains)
+        self.blocked_keywords = _parse_blocklist(settings.search_blocked_keywords)
 
         self.chat_llm = create_chat_model(
             settings.chat_model,
@@ -268,6 +270,7 @@ class ChatSearchService:
                     queries = [item for item in followups if item.lower() not in {q.lower() for q in all_queries}]
 
             results = self._dedupe_results(results, per_domain_limit=2)
+            results = self._filter_blocked_results(results)
             results = await self._rerank_results(rewritten, results, top_k=tuning.rerank_top_k)
             self._emit_sources(stream, results, label=tuning.label)
 
@@ -328,6 +331,7 @@ class ChatSearchService:
         prompt = (
             f"Rewrite the user query into a precise, focused web search query that will find relevant results. "
             f"IMPORTANT: Preserve the core meaning and key terms from the original query. "
+            f"Keep the query language the same as the original (do not translate unless asked). "
             f"Use the chat history for context if needed. "
             f"Current date: {current_date} - consider this when rewriting queries about recent events. "
             f"Return JSON with fields reasoning, rewritten_query. "
@@ -373,6 +377,7 @@ class ChatSearchService:
         prompt = (
             f"Generate concise web search queries for deeper research. "
             f"Use memory context if relevant. "
+            f"Use the same language as the original query and avoid mixing languages. "
             f"Current date: {current_date} - consider this when generating queries about recent events. "
             f"Return JSON with fields reasoning, queries."
         )
@@ -418,6 +423,7 @@ class ChatSearchService:
         prompt = (
             f"Given the original query and existing search queries, propose follow-up queries "
             f"that would fill gaps or validate key claims. "
+            f"Use the same language as the original query and avoid mixing languages. "
             f"Current date: {current_date} - consider this when proposing queries about recent events. "
             f"Return JSON with fields reasoning, should_continue, gap_summary, queries."
         )
@@ -547,6 +553,27 @@ class ChatSearchService:
             seen.add(result.url)
             deduped.append(result)
         return deduped
+
+    def _filter_blocked_results(self, results: list[SearchResult]) -> list[SearchResult]:
+        if not results:
+            return results
+        if not self.blocked_domains and not self.blocked_keywords:
+            return results
+        filtered: list[SearchResult] = []
+        for result in results:
+            domain = _normalize_domain(result.url)
+            blocked = False
+            for item in self.blocked_domains:
+                if domain == item or domain.endswith(f".{item}"):
+                    blocked = True
+                    break
+            if blocked:
+                continue
+            haystack = f"{result.title} {result.snippet}".lower()
+            if any(keyword in haystack for keyword in self.blocked_keywords):
+                continue
+            filtered.append(result)
+        return filtered
 
     async def _scrape_results(
         self,
@@ -729,3 +756,14 @@ def _normalize_domain(url: str) -> str:
     if netloc.startswith("www."):
         netloc = netloc[4:]
     return netloc
+
+
+def _parse_blocklist(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    items = []
+    for part in raw.split(","):
+        item = part.strip().lower()
+        if item:
+            items.append(item)
+    return items

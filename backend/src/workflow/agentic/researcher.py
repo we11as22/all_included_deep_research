@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,6 +13,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from src.search.base import SearchProvider
 from src.search.scraper import WebScraper
+from src.search.models import SearchResult
+from src.config.settings import get_settings
 from src.workflow.agentic.models import AgentMemory, SharedResearchMemory
 from src.workflow.agentic.schemas import AgentAction, SummarizedContent, TodoItemSchema, TodoUpdateSchema
 from src.workflow.nodes.memory_search import format_memory_context_for_prompt
@@ -23,6 +26,38 @@ from src.memory.agent_memory_service import AgentMemoryService
 from src.memory.agent_file_service import AgentFileService
 
 logger = structlog.get_logger(__name__)
+
+
+def _parse_blocklist(raw: str | None) -> list[str]:
+    if not raw:
+        return []
+    items = []
+    for part in raw.split(","):
+        item = part.strip().lower()
+        if item:
+            items.append(item)
+    return items
+
+
+def _normalize_todo_title(title: str) -> str:
+    text = str(title).strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s*Depth:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*Primary query:.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+", " ", text).strip(" -;")
+    if len(text) > 140:
+        for sep in [". ", "; ", " — ", " - "]:
+            idx = text.find(sep)
+            if 0 < idx <= 140:
+                text = text[:idx].rstrip()
+                break
+    if len(text) > 140:
+        trimmed = text[:140].rstrip()
+        if " " in trimmed:
+            trimmed = trimmed.rsplit(" ", 1)[0]
+        text = trimmed
+    return text
 
 
 def get_agentic_system_prompt() -> str:
@@ -71,6 +106,7 @@ CRITICAL RULES FOR DEEP RESEARCH:
    - Look for primary sources, original research papers, official documents, expert interviews
    - If you find conflicting information, investigate both sides thoroughly
    - Don't just summarize - analyze, compare, synthesize, and identify patterns
+   - Use summarize_content ONLY for very long sources; avoid summarizing short texts
    - When you find something interesting, ask "what else should I know about this?" and add todos to explore further
    - Minimum 5-8 different search queries per topic, scraping at least 3-5 most promising sources
    - Read full articles, not just snippets - use scroll_page for dynamic content
@@ -185,6 +221,9 @@ class AgenticResearcher:
         self.agent_memory_service = agent_memory_service
         self.agent_file_service = agent_file_service
         self.supervisor = supervisor
+        settings = get_settings()
+        self.blocked_domains = _parse_blocklist(settings.search_blocked_domains)
+        self.blocked_keywords = _parse_blocklist(settings.search_blocked_keywords)
         self.sources: list[SourceReference] = []
         self.current_topic: str | None = None
         self.existing_findings: list[ResearchFinding] = []
@@ -324,7 +363,7 @@ class AgenticResearcher:
                             if tasks:
                                 task_updates = []
                                 for task in tasks:
-                                    task_title = str(task).strip()
+                                    task_title = _normalize_todo_title(str(task))
                                     if not task_title:
                                         continue
                                     task_updates.append(
@@ -400,7 +439,7 @@ class AgenticResearcher:
                     if tasks:
                         task_updates = []
                         for task in tasks:
-                            task_title = str(task).strip()
+                            task_title = _normalize_todo_title(str(task))
                             if not task_title:
                                 continue
                             task_updates.append(
@@ -443,37 +482,38 @@ class AgenticResearcher:
     def _seed_todos(self, topic: str) -> None:
         if self.agent_memory.todos:
             return
+        topic_label = _normalize_todo_title(topic) or topic
         self.agent_memory.add_todo(
-            title=f"Run broad search on {topic}",
-            objective="Collect an overview to map key subtopics and stakeholders",
-            expected_output="3-5 high-quality sources with short summaries",
-            sources_needed=["overview articles", "industry reports", "official pages"],
-            reasoning="A broad scan prevents missing core subtopics early.",
+            title=_normalize_todo_title(f"Run broad search on {topic_label}"),
+            objective="Map key subtopics and stakeholders quickly",
+            expected_output="List 3-5 relevant sources + 3 bullet notes",
+            sources_needed=["official pages", "credible overviews", "industry reports"],
+            reasoning="Start with a scoped landscape pass before deep dives.",
             priority="high",
         )
         self.agent_memory.add_todo(
-            title="Identify authoritative sources",
-            objective="Find primary or official sources relevant to the topic",
-            expected_output="List of primary sources with URLs and credibility notes",
-            sources_needed=["official documents", "peer-reviewed papers", "regulator sites"],
-            reasoning="Primary sources reduce misinformation and improve confidence.",
+            title=_normalize_todo_title(f"Identify authoritative sources for {topic_label}"),
+            objective="Find primary/official sources for core claims",
+            expected_output="List of 2-4 primary sources with URLs + credibility notes",
+            sources_needed=["official documents", "technical manuals", "archives"],
+            reasoning="Primary sources anchor the evidence base.",
             priority="high",
             note="Prefer official or primary sources",
         )
         self.agent_memory.add_todo(
-            title="Extract key facts and evidence",
-            objective="Pull out facts, metrics, and quoted evidence from sources",
-            expected_output="Bullet list of key facts with citations",
+            title=_normalize_todo_title(f"Extract key facts and evidence on {topic_label}"),
+            objective="Extract concrete facts and citations",
+            expected_output="5-8 bullet facts with source links",
             sources_needed=["reports", "datasets", "expert interviews"],
-            reasoning="Concrete evidence is required for strong findings.",
+            reasoning="Findings must be evidence-backed.",
             priority="medium",
         )
         self.agent_memory.add_todo(
-            title="Check for gaps or conflicting claims",
+            title=_normalize_todo_title(f"Check gaps or conflicts on {topic_label}"),
             objective="Identify contradictions and missing angles",
-            expected_output="List of gaps/contradictions with follow-up tasks",
+            expected_output="List of gaps + suggested follow-ups",
             sources_needed=["multiple independent sources"],
-            reasoning="Deep research must surface inconsistencies and gaps.",
+            reasoning="Cross-checking improves reliability.",
             priority="medium",
         )
 
@@ -608,6 +648,35 @@ Choose the next action (JSON only)."""
         seen_queries = set()
         topic_hint = self.current_topic or ""
         topic_tokens = {token for token in re.findall(r"\w+", topic_hint.lower()) if len(token) > 3}
+        anchor_tokens = {token for token in re.findall(r"\w+", topic_hint.lower()) if len(token) >= 3}
+        focus_tokens = {token for token in anchor_tokens if len(token) >= 4 and not token.isdigit()}
+        min_overlap = 2 if len(anchor_tokens) >= 4 else 1
+
+        def _compact_topic_hint(text: str) -> str:
+            tokens = re.findall(r"\w+", text.lower())
+            return " ".join(tokens[:6]).strip()
+
+        topic_hint_compact = _compact_topic_hint(topic_hint) or topic_hint
+
+        def _compact_query_text(text: str) -> str:
+            if len(text) <= 140 and len(text.split()) <= 18:
+                return text
+            prefix, _, rest = text.partition(":")
+            prefix = prefix.strip()
+            rest = rest.strip()
+            prefix_tokens = {token for token in re.findall(r"\w+", prefix.lower()) if len(token) >= 3}
+            extra_tokens: list[str] = []
+            for token in re.findall(r"\w+", rest.lower()):
+                if len(token) < 4 or token in prefix_tokens:
+                    continue
+                extra_tokens.append(token)
+                if len(extra_tokens) >= 6:
+                    break
+            compact = prefix if prefix else " ".join(re.findall(r"\w+", text.lower())[:6])
+            if extra_tokens:
+                compact = f"{compact} {' '.join(extra_tokens)}"
+            return compact[:200].strip()
+
         for query in raw_queries:
             query_text = str(query).strip()
             if not query_text or query_text in seen_queries:
@@ -615,7 +684,8 @@ Choose the next action (JSON only)."""
             if topic_tokens:
                 overlap = sum(1 for token in topic_tokens if token in query_text.lower())
                 if overlap < 2:
-                    query_text = f"{topic_hint} {query_text}".strip()
+                    query_text = f"{topic_hint_compact} {query_text}".strip()
+            query_text = _compact_query_text(query_text)
             seen_queries.add(query_text)
             queries.append(query_text)
 
@@ -624,9 +694,50 @@ Choose the next action (JSON only)."""
 
         seen_urls = {source.url for source in self.sources}
         summaries = []
+        def _is_relevant_result(result: SearchResult) -> bool:
+            if not anchor_tokens:
+                return True
+            haystack = f"{result.title} {result.snippet}".lower()
+            tokens = set(re.findall(r"\w+", haystack))
+            overlap = sum(1 for token in anchor_tokens if token in tokens)
+            if overlap < min_overlap:
+                return False
+            if focus_tokens:
+                focus_overlap = sum(1 for token in focus_tokens if token in tokens)
+                required_focus = 2 if len(focus_tokens) >= 4 else 1
+                if focus_overlap < required_focus:
+                    return False
+            return True
+
+        def _is_low_quality(result: SearchResult) -> bool:
+            if not self.blocked_domains and not self.blocked_keywords:
+                return False
+            if not result.url:
+                return False
+            try:
+                domain = urlparse(result.url).netloc.lower()
+            except Exception:
+                domain = ""
+            for blocked in self.blocked_domains:
+                if domain == blocked or domain.endswith(f".{blocked}"):
+                    return True
+            haystack = f"{result.title} {result.snippet}".lower()
+            return any(keyword in haystack for keyword in self.blocked_keywords)
+
         for query in queries[:3]:
             response = await self.search_provider.search(query, max_results=max_results)
+            filtered_results = []
             for result in response.results[:max_results]:
+                if not result.url or result.url in seen_urls:
+                    continue
+                if not _is_relevant_result(result):
+                    continue
+                if _is_low_quality(result):
+                    continue
+                else:
+                    filtered_results.append(result)
+
+            for result in filtered_results:
                 if not result.url or result.url in seen_urls:
                     continue
                 seen_urls.add(result.url)
@@ -640,7 +751,11 @@ Choose the next action (JSON only)."""
                 )
                 if self.stream:
                     self.stream.emit_source(agent_id, {"url": result.url, "title": result.title})
-            top = response.results[:3]
+
+            if not filtered_results:
+                summaries.append(f"{query}: no relevant results after filtering")
+                continue
+            top = filtered_results[:3]
             summary = "; ".join([f"{item.title} ({item.url})" for item in top])
             summaries.append(f"{query}: {summary}")
 
@@ -1158,9 +1273,13 @@ Choose the next action (JSON only)."""
                 logger.warning("Invalid supervisor directive", agent_id=agent_id, error=str(exc))
                 continue
 
+            normalized_title = _normalize_todo_title(update.title)
+            if not normalized_title:
+                continue
+
             matched = False
             for todo in self.agent_memory.todos:
-                if todo.title == update.title:
+                if todo.title == normalized_title:
                     matched = True
                     if update.status:
                         todo.status = update.status
@@ -1184,7 +1303,7 @@ Choose the next action (JSON only)."""
             if not matched:
                 if update.objective and update.expected_output:
                     self.agent_memory.add_todo(
-                        title=update.title,
+                        title=normalized_title,
                         objective=update.objective,
                         expected_output=update.expected_output,
                         sources_needed=update.sources_needed or [],
