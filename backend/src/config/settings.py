@@ -23,34 +23,63 @@ class Settings(BaseSettings):
     debug: bool = Field(default=False, description="Debug mode")
     log_level: str = Field(default="INFO", description="Log level")
 
-    # Database Settings
-    postgres_host: str = Field(default="localhost", description="PostgreSQL host")
-    postgres_port: int = Field(default=5432, description="PostgreSQL port")
-    postgres_db: str = Field(default="deep_research", description="PostgreSQL database")
-    postgres_user: str = Field(default="postgres", description="PostgreSQL user")
-    postgres_password: str = Field(..., description="PostgreSQL password")
-    database_pool_size: int = Field(default=10, description="Database connection pool size")
+    # Database Settings (SQLite)
+    sqlite_db_path: str = Field(
+        default="./data/research.db",
+        description="SQLite database file path"
+    )
+    use_postgres: bool = Field(
+        default=False,
+        description="Use PostgreSQL instead of SQLite (deprecated, for migration only)"
+    )
+
+    # PostgreSQL settings (deprecated, kept for migration)
+    postgres_host: str = Field(default="localhost", description="PostgreSQL host (deprecated)")
+    postgres_port: int = Field(default=5432, description="PostgreSQL port (deprecated)")
+    postgres_db: str = Field(default="deep_research", description="PostgreSQL database (deprecated)")
+    postgres_user: str = Field(default="postgres", description="PostgreSQL user (deprecated)")
+    postgres_password: str = Field(default="", description="PostgreSQL password (deprecated)")
+    database_pool_size: int = Field(default=10, description="Database connection pool size (deprecated)")
+
+    # Vector Store Settings
+    vector_store_type: str = Field(
+        default="faiss",
+        description="Vector store backend: faiss, chroma, or mock"
+    )
+    vector_store_persist_dir: str = Field(
+        default="./data/vector_store",
+        description="Directory for persistent vector storage (Chroma)"
+    )
 
     @property
     def database_url(self) -> str:
-        """Construct database URL."""
-        return (
-            f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        """Construct database URL (SQLite or PostgreSQL)."""
+        if self.use_postgres:
+            return (
+                f"postgresql+asyncpg://{self.postgres_user}:{self.postgres_password}"
+                f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+            )
+        return f"sqlite+aiosqlite:///{self.sqlite_db_path}"
 
     @property
     def sync_database_url(self) -> str:
-        """Construct sync database URL for Alembic."""
-        return (
-            f"postgresql://{self.postgres_user}:{self.postgres_password}"
-            f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
-        )
+        """Construct sync database URL for migrations."""
+        if self.use_postgres:
+            return (
+                f"postgresql://{self.postgres_user}:{self.postgres_password}"
+                f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
+            )
+        return f"sqlite:///{self.sqlite_db_path}"
 
     # Memory Settings
     memory_dir: str = Field(default="./memory_files", description="Memory files directory")
     chunk_size: int = Field(default=800, description="Chunk size for text splitting")
     chunk_overlap: int = Field(default=200, description="Chunk overlap")
+
+    # Deep Research Multi-Agent Settings
+    deep_research_num_agents: int = Field(default=4, description="Number of researcher agents for Deep Research mode")
+    deep_research_enable_clarifying_questions: bool = Field(default=True, description="Enable clarifying questions in Deep Research mode")
+    deep_research_run_deep_search_first: bool = Field(default=True, description="Run deep search before spawning agents in Deep Research mode")
 
     # Embedding Settings
     embedding_provider: Literal["openai", "ollama", "cohere", "huggingface", "mock"] = Field(

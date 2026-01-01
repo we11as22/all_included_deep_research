@@ -48,11 +48,11 @@ const modes = [
     id: 'deep_research' as const,
     name: 'Deep Research',
     icon: Brain,
-    description: 'Full multi-agent report synthesis',
-    fullDescription: 'Comprehensive multi-agent research system. Creates a research plan, deploys multiple specialized agents in parallel, synthesizes findings, and generates a detailed report. Perfect for in-depth research requiring multiple perspectives and thorough analysis.',
-    color: 'text-slate-700 dark:text-slate-300',
-    bgColor: 'bg-slate-50 dark:bg-slate-950',
-    borderColor: 'border-slate-200 dark:border-slate-800',
+    description: 'Multi-agent research with maximum accuracy',
+    fullDescription: 'Advanced multi-agent research system with parallel specialist agents. Supervisor creates research plan, spawns 4 specialized researcher agents who work in parallel, maintain agent memory, and collaborate to produce comprehensive validated reports. Maximum accuracy and depth.',
+    color: 'text-purple-700 dark:text-purple-400',
+    bgColor: 'bg-purple-50 dark:bg-purple-950',
+    borderColor: 'border-purple-200 dark:border-purple-800',
   },
 ];
 

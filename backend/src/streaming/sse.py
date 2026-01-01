@@ -46,6 +46,16 @@ class StreamEventType(str, Enum):
     ERROR = "error"
     DONE = "done"
 
+    # NEW: LangGraph deep research events
+    GRAPH_STATE_UPDATE = "graph_state_update"
+    SUPERVISOR_REACT = "supervisor_react"
+    SUPERVISOR_DIRECTIVE = "supervisor_directive"
+    AGENT_ACTION = "agent_action"
+    AGENT_REASONING = "agent_reasoning"
+    REPLAN = "replan"
+    GAP_IDENTIFIED = "gap_identified"
+    DEBUG = "debug"
+
 
 class StreamingGenerator:
     """Base streaming generator with async queue."""
@@ -182,8 +192,18 @@ class ResearchStreamingGenerator(StreamingGenerator):
             self._create_event(StreamEventType.PLANNING, {"plan": plan, "topics": topics, "topic_count": len(topics)})
         )
 
-    def emit_research_start(self, researcher_id: str, topic: str) -> None:
+    def emit_planning(self, data: dict) -> None:
+        """Emit planning event (alias for backward compatibility)."""
+        topics = data.get("topics", [])
+        reasoning = data.get("reasoning", "")
+        self.add(
+            self._create_event(StreamEventType.PLANNING, {"reasoning": reasoning, "topics": topics, "topic_count": len(topics)})
+        )
+
+    def emit_research_start(self, data: dict) -> None:
         """Emit researcher start event."""
+        researcher_id = data.get("researcher_id", "")
+        topic = data.get("topic", "")
         self.add(self._create_event(StreamEventType.RESEARCH_START, {"researcher_id": researcher_id, "topic": topic}))
 
     def emit_source(self, researcher_id: str, source: dict) -> None:
@@ -195,8 +215,22 @@ class ResearchStreamingGenerator(StreamingGenerator):
             )
         )
 
-    def emit_finding(self, researcher_id: str, topic: str, summary: str, key_findings: list[str]) -> None:
+    def emit_source_found(self, data: dict) -> None:
+        """Emit source found event (alias for backward compatibility)."""
+        researcher_id = data.get("researcher_id", "")
+        self.add(
+            self._create_event(
+                StreamEventType.SOURCE_FOUND,
+                {"researcher_id": researcher_id, "url": data.get("url"), "title": data.get("title")},
+            )
+        )
+
+    def emit_finding(self, data: dict) -> None:
         """Emit research finding."""
+        researcher_id = data.get("researcher_id", "")
+        topic = data.get("topic", "")
+        summary = data.get("summary", "")
+        key_findings = data.get("key_findings", [])
         summary_preview = summary[:240] + "..." if isinstance(summary, str) and len(summary) > 240 else summary
         self.add(
             self._create_event(
@@ -207,6 +241,19 @@ class ResearchStreamingGenerator(StreamingGenerator):
                     "summary": summary,
                     "summary_preview": summary_preview,
                     "findings_count": len(key_findings),
+                },
+            )
+        )
+
+    def emit_supervisor_react(self, data: dict) -> None:
+        """Emit supervisor reaction event."""
+        self.add(
+            self._create_event(
+                StreamEventType.SUPERVISOR_REACT,
+                {
+                    "reasoning": data.get("reasoning", ""),
+                    "should_continue": data.get("should_continue", False),
+                    "gaps": data.get("gaps", []),
                 },
             )
         )
@@ -239,8 +286,12 @@ class ResearchStreamingGenerator(StreamingGenerator):
             )
         )
 
-    def emit_compression(self, compressed_text: str) -> None:
+    def emit_compression(self, data: dict | str) -> None:
         """Emit compression event."""
+        if isinstance(data, str):
+            compressed_text = data
+        else:
+            compressed_text = data.get("message", "")
         self.add(
             self._create_event(
                 StreamEventType.COMPRESSION,

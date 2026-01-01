@@ -6,9 +6,9 @@ import structlog
 from src.config.settings import Settings
 from src.llm.factory import create_chat_model
 from src.memory.hybrid_search import HybridSearchEngine
-from src.workflow.balanced_research import BalancedResearchWorkflow
-from src.workflow.quality_research import QualityResearchWorkflow
-from src.workflow.speed_research import SpeedResearchWorkflow
+from src.workflow.legacy.balanced_research import BalancedResearchWorkflow
+from src.workflow.legacy.quality_research import QualityResearchWorkflow
+from src.workflow.legacy.speed_research import SpeedResearchWorkflow
 
 logger = structlog.get_logger(__name__)
 

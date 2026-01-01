@@ -24,10 +24,17 @@ services:
       context: .
       dockerfile: ./backend/Dockerfile
     container_name: deep_research_backend
-    depends_on:
-      postgres:
-        condition: service_healthy
+    # SQLite mode - no longer depends on postgres
+    # depends_on:
+    #   postgres:
+    #     condition: service_healthy
     environment:
+      # SQLite configuration
+      SQLITE_DB_PATH: /app/data/research.db
+      VECTOR_STORE_TYPE: faiss
+      VECTOR_STORE_PERSIST_DIR: /app/data/vector_store
+      USE_POSTGRES: "false"
+      # PostgreSQL (deprecated, kept for reference)
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: deep_research
@@ -41,6 +48,7 @@ services:
       - ./backend/.env
     volumes:
       - ${MEMORY_HOST_PATH:-/home/asudakov/projects/memory_files}:/memory_files
+      - backend_data:/app/data  # SQLite and vector store data
     ports:
       - "8000:8000"
       - "8080:8080"
@@ -103,6 +111,8 @@ volumes:
     driver: local
   ollama_data:
     driver: local
+  backend_data:
+    driver: local  # SQLite database and vector store
 
 networks:
   deep_research_network:

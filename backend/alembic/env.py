@@ -41,10 +41,11 @@ def run_migrations_offline() -> None:
 
 
 def do_run_migrations(connection: Connection) -> None:
-    # Create pgvector extension before migrations (outside transaction)
-    connection.execute(sa_text('CREATE EXTENSION IF NOT EXISTS vector'))
-    connection.commit()
-    
+    # Create pgvector extension before migrations (PostgreSQL only)
+    if settings.use_postgres:
+        connection.execute(sa_text('CREATE EXTENSION IF NOT EXISTS vector'))
+        connection.commit()
+
     context.configure(connection=connection, target_metadata=target_metadata)
 
     with context.begin_transaction():

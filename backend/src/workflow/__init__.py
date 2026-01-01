@@ -1,31 +1,50 @@
-"""Research workflow orchestration with LangGraph."""
+"""Research workflow orchestration with new architecture.
 
-from src.workflow.balanced_research import BalancedResearchWorkflow
-from src.workflow.factory import WorkflowFactory
-from src.workflow.quality_research import QualityResearchWorkflow
-from src.workflow.speed_research import SpeedResearchWorkflow
-from src.workflow.state import (
-    MemoryContext,
-    ResearchFinding,
+NEW:
+- src.workflow.search - Perplexica-style two-stage search
+- src.workflow.research - LangGraph multi-agent deep research
+"""
+
+# New Search Workflow (Perplexica pattern)
+from src.workflow.search import (
+    SearchService,
+    create_search_service,
+    classify_query,
+    QueryClassification,
+    research_agent,
+    writer_agent,
+    CitedAnswer,
+    ActionRegistry,
+)
+
+# New Deep Research Workflow (LangGraph)
+from src.workflow.research import (
+    create_research_graph,
     ResearchState,
-    ResearcherState,
-    SourceReference,
-    SupervisorState,
+    create_initial_state,
+    SupervisorQueue,
+    get_supervisor_queue,
+    cleanup_supervisor_queue,
+    run_researcher_agent,
 )
 
 __all__ = [
-    # Workflows
-    "SpeedResearchWorkflow",
-    "BalancedResearchWorkflow",
-    "QualityResearchWorkflow",
-    # Factory
-    "WorkflowFactory",
-    # States
-    "ResearchState",
-    "SupervisorState",
-    "ResearcherState",
-    "MemoryContext",
-    "SourceReference",
-    "ResearchFinding",
-]
+    # New Search Workflow
+    "SearchService",
+    "create_search_service",
+    "classify_query",
+    "QueryClassification",
+    "research_agent",
+    "writer_agent",
+    "CitedAnswer",
+    "ActionRegistry",
 
+    # New Deep Research Workflow
+    "create_research_graph",
+    "ResearchState",
+    "create_initial_state",
+    "SupervisorQueue",
+    "get_supervisor_queue",
+    "cleanup_supervisor_queue",
+    "run_researcher_agent",
+]

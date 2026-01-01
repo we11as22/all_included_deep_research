@@ -15,7 +15,7 @@ from src.database.connection import create_database_engine, create_db_pool, crea
 from src.embeddings.factory import create_embedding_provider
 from src.memory.hybrid_search import HybridSearchEngine
 from src.memory.manager import MemoryManager
-from src.workflow.factory import WorkflowFactory
+from src.llm.factory import create_chat_model
 
 # Import routers
 from src.api.routes import (
@@ -112,13 +112,29 @@ async def lifespan(app: FastAPI):
     )
     app.state.memory_manager = memory_manager
 
-    # Initialize workflow factory
-    logger.info("Initializing workflow factory...")
-    workflow_factory = WorkflowFactory(
-        settings=settings,
-        search_engine=search_engine,
+    # Initialize LLMs for research workflows
+    logger.info("Initializing research LLMs...")
+    research_llm = create_chat_model(
+        settings.research_model,
+        settings,
+        max_tokens=settings.research_model_max_tokens,
+        temperature=0.7,
     )
-    app.state.workflow_factory = workflow_factory
+    compression_llm = create_chat_model(
+        settings.compression_model,
+        settings,
+        max_tokens=settings.compression_model_max_tokens,
+        temperature=0.3,
+    )
+    final_report_llm = create_chat_model(
+        settings.final_report_model,
+        settings,
+        max_tokens=settings.final_report_model_max_tokens,
+        temperature=0.7,
+    )
+    app.state.research_llm = research_llm
+    app.state.compression_llm = compression_llm
+    app.state.final_report_llm = final_report_llm
 
     # Initialize chat search service
     logger.info("Initializing chat search service...")
@@ -135,7 +151,7 @@ async def lifespan(app: FastAPI):
 
     logger.info(
         "All-Included Deep Research API started successfully",
-        available_modes=workflow_factory.get_available_modes(),
+        available_modes=["chat", "search", "deep_search", "deep_research"],
     )
 
     yield

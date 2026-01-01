@@ -23,7 +23,7 @@ from src.search.scraper import WebScraper
 from src.utils.chat_history import format_chat_history
 from src.utils.date import get_current_date
 from src.utils.text import summarize_text
-from src.workflow.agentic.schemas import QueryRewrite, SearchQueries, FollowupQueries, SummarizedContent, SynthesizedAnswer
+from src.workflow.legacy.agentic.schemas import QueryRewrite, SearchQueries, FollowupQueries, SummarizedContent, SynthesizedAnswer
 
 logger = structlog.get_logger(__name__)
 

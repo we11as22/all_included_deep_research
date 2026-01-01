@@ -5,7 +5,7 @@ import { Card } from '@/components/ui/card';
 import { cn } from '@/lib/utils';
 import { Brain, Radar, Search } from 'lucide-react';
 
-export type ChatMode = 'search' | 'deep_search' | 'deep_research';
+export type ChatMode = 'chat' | 'search' | 'deep_search' | 'deep_research';
 
 interface ModeSelectorProps {
   selected: ChatMode;
@@ -14,11 +14,19 @@ interface ModeSelectorProps {
 
 const modes = [
   {
+    id: 'chat' as const,
+    name: 'Simple Chat',
+    icon: Brain,
+    description: 'Direct conversation without web search',
+    details: 'Fast • conversational • no sources',
+    color: 'text-blue-600',
+  },
+  {
     id: 'search' as const,
     name: 'Web Search',
     icon: Search,
-    description: 'Query rewriting + multi-query web search',
-    details: 'Expand • rerank • summarize',
+    description: 'Fast web search with multi-query expansion',
+    details: 'Quick • balanced • cited',
     color: 'text-amber-600',
   },
   {
@@ -26,16 +34,16 @@ const modes = [
     name: 'Deep Search',
     icon: Radar,
     description: 'Quality web search with deeper iterations',
-    details: 'More rounds • broader sources',
+    details: 'Thorough • quality • comprehensive',
     color: 'text-teal-600',
   },
   {
     id: 'deep_research' as const,
     name: 'Deep Research',
     icon: Brain,
-    description: 'Full multi-agent report synthesis',
-    details: 'Plan • parallel • report',
-    color: 'text-slate-700',
+    description: 'Multi-agent research with maximum accuracy',
+    details: 'Parallel agents • memory • validation',
+    color: 'text-purple-700',
   },
 ];
 

@@ -153,13 +153,32 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 stream_generator.emit_done()
                 return
 
-            workflow_factory = app_request.app.state.workflow_factory
-            workflow = workflow_factory.create_workflow("quality")
-            final_state = await workflow.run(
-                query,
+            # Use new LangGraph research system for deep_research mode
+            from src.workflow.research import run_research_graph
+            from src.config.modes import ResearchMode
+
+            # Get settings and services
+            settings = app_request.app.state.settings
+
+            # Create mode config
+            research_mode = ResearchMode.QUALITY
+            mode_config = {
+                "max_iterations": research_mode.get_max_iterations(),
+                "max_concurrent": research_mode.get_max_concurrent(),
+            }
+
+            # Run new LangGraph research
+            final_state = await run_research_graph(
+                query=query,
+                chat_history=chat_history,
+                mode="quality",
+                llm=app_request.app.state.research_llm,
+                search_provider=app_request.app.state.chat_service.search_provider,
+                scraper=app_request.app.state.chat_service.scraper,
                 stream=stream_generator,
-                messages=chat_history,
-                suppress_final_report_stream=True,
+                session_id=session_id,
+                mode_config=mode_config,
+                settings=settings,
             )
 
             # Extract final_report - handle both dict with override and direct value

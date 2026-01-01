@@ -11,11 +11,11 @@ from src.config.settings import Settings
 from src.memory.hybrid_search import HybridSearchEngine
 from src.search.factory import create_search_provider
 from src.search.scraper import WebScraper
-from src.workflow.nodes.memory_search import search_memory_node
-from src.workflow.nodes.planner import plan_research_node
-from src.workflow.nodes.reporter import generate_final_report_node
+from src.workflow.legacy.nodes.memory_search import search_memory_node
+from src.workflow.legacy.nodes.planner import plan_research_node
+from src.workflow.legacy.nodes.reporter import generate_final_report_node
 from src.workflow.agentic.coordinator import AgenticResearchCoordinator
-from src.workflow.state import ResearchFinding, ResearchState
+from src.workflow.legacy.state import ResearchFinding, ResearchState
 from src.workflow.agentic.schemas import CompressedFindings
 
 logger = structlog.get_logger(__name__)
