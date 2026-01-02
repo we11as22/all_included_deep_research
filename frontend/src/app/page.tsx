@@ -364,7 +364,7 @@ export default function HomePage() {
     }
   };
 
-  const handleChatSelect = async (chatId: string) => {
+  const handleChatSelect = async (chatId: string, messageId?: string) => {
     try {
       const chatData = await getChat(chatId);
       setCurrentChatId(chatId);
@@ -379,7 +379,22 @@ export default function HomePage() {
       setProgressByMessage({});
       localStorage.removeItem('progressByMessage');
       if (DEBUG_MODE) {
-        console.debug('[debug] chat selected', { chatId, messages: dbMessages.length });
+        console.debug('[debug] chat selected', { chatId, messages: dbMessages.length, targetMessageId: messageId });
+      }
+
+      // If a specific message was requested, scroll to it after messages are rendered
+      if (messageId) {
+        setTimeout(() => {
+          const messageElement = document.querySelector(`[data-message-id="${messageId}"]`);
+          if (messageElement) {
+            messageElement.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            // Highlight the message briefly
+            messageElement.classList.add('ring-2', 'ring-primary', 'ring-offset-2');
+            setTimeout(() => {
+              messageElement.classList.remove('ring-2', 'ring-primary', 'ring-offset-2');
+            }, 2000);
+          }
+        }, 100);
       }
     } catch (error) {
       console.error('Failed to load chat:', error);
@@ -494,8 +509,9 @@ export default function HomePage() {
                   {messages.map((message, index) => (
                     <div
                       key={message.id}
+                      data-message-id={message.id}
                       className={cn(
-                        'max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm animate-fade-rise',
+                        'max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm animate-fade-rise transition-all',
                         message.role === 'user'
                           ? 'ml-auto bg-primary text-primary-foreground dark:bg-primary dark:text-primary-foreground'
                           : 'border border-border/60 bg-white/90 dark:bg-background/80 text-foreground'

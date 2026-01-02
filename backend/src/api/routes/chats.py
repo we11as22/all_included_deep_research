@@ -41,63 +41,33 @@ async def list_chats(app_request: Request):
 async def search_chats(
     app_request: Request,
     q: str = Query(..., description="Search query"),
-    limit: int = Query(10, ge=1, le=50, description="Maximum results"),
+    limit: int = Query(5, ge=1, le=20, description="Maximum results (top N messages)"),
 ):
-    """Search chats by message content using hybrid search."""
+    """
+    Search chat messages using hybrid search (vector + fulltext).
+    Returns top N most relevant messages with their chat context.
+    """
     if not q.strip():
-        return {"chats": []}
-    
-    session_factory = app_request.app.state.session_factory
+        return {"messages": []}
 
-    logger.info("Searching chats", query=q, limit=limit)
+    chat_message_search_engine = app_request.app.state.chat_message_search_engine
 
-    async with session_factory() as session:
-        pattern = f"%{q}%"
+    logger.info("Searching chat messages", query=q, limit=limit)
 
-        match_subquery = (
-            select(
-                ChatMessageModel.chat_id.label("chat_id"),
-                ChatMessageModel.content.label("content"),
-                ChatMessageModel.created_at.label("created_at"),
-                func.row_number()
-                .over(
-                    partition_by=ChatMessageModel.chat_id,
-                    order_by=ChatMessageModel.created_at.desc(),
-                )
-                .label("rn"),
-                func.count().over(partition_by=ChatMessageModel.chat_id).label("match_count"),
-            )
-            .where(ChatMessageModel.content.ilike(pattern))
-            .subquery()
-        )
+    try:
+        # Search messages using hybrid search
+        results = await chat_message_search_engine.search(query=q, limit=limit)
 
-        latest_matches = (
-            select(
-                ChatModel,
-                match_subquery.c.content,
-                match_subquery.c.created_at.label("match_time"),
-                match_subquery.c.match_count,
-            )
-            .join(match_subquery, ChatModel.id == match_subquery.c.chat_id)
-            .where(match_subquery.c.rn == 1)
-            .order_by(match_subquery.c.match_count.desc(), match_subquery.c.created_at.desc())
-            .limit(limit)
-        )
+        # Convert results to dict
+        messages = [result.to_dict() for result in results]
 
-        result = await session.execute(latest_matches)
-        rows = result.all()
-
-        chats = []
-        for chat, content, match_time, match_count in rows:
-            chat_dict = chat.to_dict()
-            chat_dict["metadata"] = {
-                "preview": summarize_text(content or "", 240),
-                "match_count": int(match_count or 0),
-                "match_time": match_time.isoformat() if match_time else None,
-            }
-            chats.append(chat_dict)
-
-        return {"chats": chats}
+        return {
+            "messages": messages,
+            "count": len(messages),
+        }
+    except Exception as e:
+        logger.error("Chat message search failed", error=str(e), query=q)
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 
 @router.post("")
@@ -206,28 +176,47 @@ async def add_message(
         
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
-        
+
+        # Generate embedding for message content
+        embedding = None
+        if content.strip():
+            try:
+                embedding_provider = app_request.app.state.embedding_provider
+                embedding_vector = await embedding_provider.embed_text(content)
+
+                # Normalize embedding to 1536 dimensions (database schema requirement)
+                if len(embedding_vector) < 1536:
+                    embedding_vector = list(embedding_vector) + [0.0] * (1536 - len(embedding_vector))
+                elif len(embedding_vector) > 1536:
+                    embedding_vector = embedding_vector[:1536]
+
+                embedding = embedding_vector
+            except Exception as e:
+                logger.warning("Failed to generate embedding for message", error=str(e), chat_id=chat_id)
+
         # Create message
         message = ChatMessageModel(
             chat_id=chat_id,
             message_id=msg_id,
             role=role,
             content=content,
+            embedding=embedding,
         )
         session.add(message)
-        
+
         # Update chat updated_at
         chat.updated_at = datetime.now()
-        
+
         await session.commit()
         await session.refresh(message)
-        
+
         # Log message addition (content already decoded above)
         logger.info(
-            "Message added", 
-            chat_id=chat_id, 
-            message_id=msg_id, 
+            "Message added",
+            chat_id=chat_id,
+            message_id=msg_id,
             role=role,
-            content_preview=content[:100] if content else ""
+            content_preview=content[:100] if content else "",
+            has_embedding=embedding is not None
         )
         return message.to_dict()

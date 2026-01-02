@@ -155,7 +155,7 @@ class ChatModel(Base):
 
 
 class ChatMessageModel(Base):
-    """Chat message model."""
+    """Chat message model with embedding support."""
 
     __tablename__ = "chat_messages"
 
@@ -164,6 +164,7 @@ class ChatMessageModel(Base):
     message_id = Column(String(64), nullable=False, index=True)
     role = Column(String(16), nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
+    embedding = Column(Vector(1536))  # Default dimension, will be configurable
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     message_metadata = Column("metadata", JSONB, default=dict)
 
@@ -173,6 +174,8 @@ class ChatMessageModel(Base):
     __table_args__ = (
         Index("idx_chat_messages_chat_id", "chat_id"),
         Index("idx_chat_messages_created", "created_at"),
+        Index("idx_chat_messages_embedding", "embedding", postgresql_using="ivfflat"),
+        # Full-text search index will be created via migration SQL
     )
 
     def to_dict(self) -> dict[str, Any]:

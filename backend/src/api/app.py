@@ -11,6 +11,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config.settings import get_settings
 from src.chat.service import ChatSearchService
+from src.chat.search import ChatMessageSearchEngine
 from src.database.connection import create_database_engine, create_db_pool, create_session_factory
 from src.embeddings.factory import create_embedding_provider
 from src.memory.hybrid_search import HybridSearchEngine
@@ -99,6 +100,15 @@ async def lifespan(app: FastAPI):
         rrf_k=settings.rrf_k,
     )
     app.state.search_engine = search_engine
+
+    # Initialize chat message search engine
+    logger.info("Initializing chat message search engine...")
+    chat_message_search_engine = ChatMessageSearchEngine(
+        db_pool=db_pool,
+        embedding_provider=embedding_provider,
+        rrf_k=settings.rrf_k,
+    )
+    app.state.chat_message_search_engine = chat_message_search_engine
 
     # Initialize memory manager
     logger.info("Initializing memory manager...")
