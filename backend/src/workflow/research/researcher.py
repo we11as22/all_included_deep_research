@@ -252,7 +252,8 @@ Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not ju
 
     # Get tool definitions for LLM
     from langchain_core.tools import StructuredTool
-    from pydantic import BaseModel, Field
+    from pydantic import BaseModel, Field, create_model
+    from typing import Any
     
     # Create LangChain tools from ActionRegistry
     def create_tool_from_action(action_name: str, action_def: dict):
@@ -260,23 +261,34 @@ Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not ju
         schema = action_def["args_schema"]
         
         # Create Pydantic model dynamically from schema
-        fields = {}
+        field_definitions = {}
         for prop_name, prop_def in schema.get("properties", {}).items():
-            field_type = str  # Default to str
+            # Determine field type with proper annotations
             if prop_def.get("type") == "integer":
                 field_type = int
             elif prop_def.get("type") == "array":
-                field_type = list
+                # Check items type for arrays
+                items_type = prop_def.get("items", {}).get("type", "string")
+                if items_type == "string":
+                    field_type = list[str]
+                else:
+                    field_type = list[Any]
             elif prop_def.get("type") == "boolean":
                 field_type = bool
+            else:
+                field_type = str  # Default to str
             
-            fields[prop_name] = (
+            # Use tuple format for create_model: (type, Field(...))
+            field_definitions[prop_name] = (
                 field_type,
                 Field(description=prop_def.get("description", ""))
             )
         
-        # Create dynamic model class
-        ArgsModel = type(f"{action_name}Args", (BaseModel,), fields)
+        # Create dynamic model class using create_model (Pydantic v2 way)
+        ArgsModel = create_model(
+            f"{action_name}Args",
+            **field_definitions
+        )
         
         async def tool_handler(**kwargs):
             context = {
