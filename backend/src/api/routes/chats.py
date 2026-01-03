@@ -232,15 +232,25 @@ async def delete_chat(chat_id: str, app_request: Request):
         chat = result.scalar_one_or_none()
 
         if not chat:
-            raise HTTPException(status_code=404, detail="Chat not found")
+            # Return 200 OK if chat doesn't exist (idempotent delete)
+            # This allows bulk delete to continue even if some chats are already deleted
+            logger.info("Chat not found (already deleted or never existed)", chat_id=chat_id)
+            return {"status": "deleted", "chat_id": chat_id, "note": "Chat not found"}
+
+        # Count messages before deletion for logging
+        messages_result = await session.execute(
+            select(func.count(ChatMessageModel.id)).where(ChatMessageModel.chat_id == chat_id)
+        )
+        messages_count = messages_result.scalar() or 0
 
         # Delete chat from database (cascades to messages via ondelete="CASCADE" in ForeignKey)
         # SQLAlchemy's session.delete() is synchronous, but we need to await commit
+        # The cascade="all, delete-orphan" in relationship ensures messages are deleted
         session.delete(chat)
         await session.commit()
 
-        logger.info("Chat deleted", chat_id=chat_id)
-        return {"status": "deleted", "chat_id": chat_id}
+        logger.info("Chat deleted successfully", chat_id=chat_id, messages_count=messages_count)
+        return {"status": "deleted", "chat_id": chat_id, "messages_deleted": messages_count}
 
 
 @router.post("/{chat_id}/messages")

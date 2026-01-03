@@ -142,7 +142,7 @@ class ReportSection(BaseModel):
     """Section of the final report."""
 
     title: str = Field(description="Section title")
-    content: str = Field(description="Section content in markdown")
+    content: str = Field(description="Detailed section content in markdown (300-800 words, comprehensive analysis with specific facts, data, and evidence)")
     sources: list[str] = Field(description="Source URLs cited in this section", default_factory=list)
 
 
@@ -151,9 +151,9 @@ class FinalReport(BaseModel):
 
     reasoning: str = Field(description="Explanation of report structure and content choices")
     title: str = Field(description="Report title")
-    executive_summary: str = Field(description="Brief executive summary")
-    sections: list[ReportSection] = Field(description="Report sections", min_length=1)
-    conclusion: str = Field(description="Final conclusion")
+    executive_summary: str = Field(description="Comprehensive executive summary (200-400 words, not brief)")
+    sections: list[ReportSection] = Field(description="Report sections with detailed content (each section 300-800 words, multiple sections required)", min_length=3)  # Require at least 3 sections
+    conclusion: str = Field(description="Comprehensive final conclusion (200-400 words, not brief)")
     total_sources: int = Field(description="Total number of sources used", ge=1)
     confidence_level: Literal["low", "medium", "high", "very high"] = Field(
         description="Confidence in report accuracy"

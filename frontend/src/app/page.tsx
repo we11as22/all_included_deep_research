@@ -501,9 +501,10 @@ export default function HomePage() {
       setCurrentSessionId(null);
       setError(null);
       
-      const chatData = await getChat(chatId);
-      setCurrentChatId(chatId);
-      const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
+      try {
+        const chatData = await getChat(chatId);
+        setCurrentChatId(chatId);
+        const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
       
       // CRITICAL: Load ALL messages from DB, including assistant messages
       // Sort by created_at to maintain order

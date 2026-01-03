@@ -911,17 +911,20 @@ Your role:
 4. **CRITICAL**: Assign DIFFERENT tasks to different agents to cover ALL aspects of the topic
 5. Decide when research is complete - only when truly comprehensive
 
-Current query: {query}
+**ORIGINAL USER QUERY:** {query}
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
 
 **INITIAL DEEP SEARCH CONTEXT:**
 {deep_search_result[:2000] if deep_search_result else "No initial deep search context available."}
+{clarification_context}
 
-IMPORTANT: 
-- Use the initial deep search context above to understand the topic and guide research direction.
-- If user provided clarification answers in chat history, use them to guide research direction.
-- User's clarification answers should be considered when creating agent todos and evaluating findings.
+**CRITICAL CONTEXT USAGE:**
+- **ALWAYS refer to the ORIGINAL USER QUERY above** - this is what the user actually asked for
+- Use the initial deep search context to understand the topic and guide research direction
+- **MANDATORY**: User's clarification answers (if provided) MUST be used when creating agent todos and evaluating findings
+- Ensure all agent tasks and research findings directly relate to the ORIGINAL USER QUERY
+- If research is going off-topic, redirect agents back to the original query
 
 CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
 - Each agent should research DIFFERENT aspects/aspects of the topic
@@ -1022,7 +1025,7 @@ Be thorough but efficient. Use structured reasoning. FORCE agents to dig deeper 
                 # Check if next message is from user (user answered)
                 if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
                     user_answer = chat_history[i + 1].get("content", "")
-                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n\nUse these answers to guide research direction and agent task assignment.\n"
+                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - USE THESE TO GUIDE RESEARCH):**\n{user_answer}\n\n**MANDATORY**: Use these answers to guide research direction, create relevant agent todos, and ensure research addresses what the user actually asked for.\n"
                     logger.info("Found user clarification answers in chat history", answer_preview=user_answer[:200])
                     break
     

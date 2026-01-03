@@ -41,16 +41,38 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
     }
   }, [refreshTrigger]);
 
+  // Listen for chat-not-found events to reload chat list
+  useEffect(() => {
+    const handleChatNotFound = () => {
+      loadChats();
+    };
+    window.addEventListener('chat-not-found', handleChatNotFound);
+    return () => {
+      window.removeEventListener('chat-not-found', handleChatNotFound);
+    };
+  }, []);
+
   const handleDelete = async (chatId: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    
+    // Confirm deletion
+    const chatTitle = chats.find(c => c.id === chatId)?.title || 'this chat';
+    if (!confirm(`Are you sure you want to delete "${chatTitle}"? This action cannot be undone.`)) {
+      return;
+    }
+    
     try {
       await deleteChat(chatId);
-      setChats(chats.filter((c) => c.id !== chatId));
+      // Reload chat list to ensure sync with server
+      await loadChats();
       if (currentChatId === chatId) {
         onNewChat();
       }
     } catch (error) {
       console.error('Failed to delete chat:', error);
+      // Reload chat list anyway to sync with server state
+      await loadChats();
+      alert(`Failed to delete chat: ${error instanceof Error ? error.message : 'Unknown error'}`);
     }
   };
 
@@ -72,12 +94,30 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
 
     try {
       setLoading(true);
-      // Delete all chats one by one
-      await Promise.all(chats.map(chat => deleteChat(chat.id)));
-      setChats([]);
-      onNewChat();
+      // Delete all chats - use allSettled to continue even if some fail
+      const results = await Promise.allSettled(
+        chats.map(chat => deleteChat(chat.id))
+      );
+      
+      // Count successful deletions
+      const successful = results.filter(r => r.status === 'fulfilled').length;
+      const failed = results.filter(r => r.status === 'rejected').length;
+      
+      if (failed > 0) {
+        console.warn(`Failed to delete ${failed} chat(s)`, results.filter(r => r.status === 'rejected'));
+      }
+      
+      // Reload chat list to get current state from server
+      await loadChats();
+      
+      // If all chats were deleted, switch to new chat
+      if (successful === chats.length) {
+        onNewChat();
+      }
     } catch (error) {
       console.error('Failed to clear all chats:', error);
+      // Reload chat list anyway to sync with server
+      await loadChats();
     } finally {
       setLoading(false);
     }

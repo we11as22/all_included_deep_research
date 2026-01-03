@@ -225,11 +225,34 @@ Create a detailed research plan for completing this task.
     notes = []
     agent_history = []
 
+    # Get original user query and context from state
+    original_query = state.get("query", "")
+    user_language = state.get("user_language", "English")
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
+    
+    # Extract user clarification answers from chat history
+    clarification_context = ""
+    chat_history = state.get("chat_history", [])
+    if chat_history:
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    user_answer = chat_history[i + 1].get("content", "")
+                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n"
+                    break
+
     system_prompt = f"""You are {role}.
 
 Expertise: {expertise}
 Personality: {personality}
 Character: {character}
+
+**ORIGINAL USER QUERY:** {original_query}
+**IMPORTANT: Respond in {user_language} whenever generating text for the user.**
 
 Current task: {current_task.title}
 Objective: {current_task.objective}
@@ -238,6 +261,10 @@ Research plan:
 Goal: {plan.current_goal}
 Next steps: {', '.join(plan.next_steps)}
 Strategy: {plan.search_strategy}
+
+**INITIAL DEEP SEARCH CONTEXT:**
+{deep_search_result[:1500] if deep_search_result else "No initial deep search context available."}
+{clarification_context}
 
 Your previous notes (recent important findings):
 {notes_context}
@@ -264,9 +291,25 @@ CRITICAL INSTRUCTIONS FOR NOTES AND MEMORY:
 - **Think before saving**: "Does this note contain valuable information that will help complete the research?" If not, don't save it.
 
 Available actions:
-- web_search(query: str): Search the web
-- scrape_url(url: str): Get full content from URL
+- web_search(queries: list[str]): Search the web with natural queries (write as you would in a browser)
+- scrape_url(urls: list[str]): Get full content from URLs
 - done(): Signal completion
+
+**CRITICAL: Evaluating search results before scraping:**
+- When you receive search results, CAREFULLY evaluate each result's RELEVANCE to your current task
+- Look at the TITLE and SNIPPET - do they relate to your task objective?
+- Only scrape URLs that are CLEARLY relevant to your task
+- If a result's title/snippet doesn't match your task, SKIP it - don't waste time scraping irrelevant content
+- Example: If your task is "ВВС Германии техника", skip results about "ВВС США" or "техника вообще"
+- Focus on scraping sources that directly help answer your specific task
+
+**CRITICAL: Query reformulation strategy (to avoid getting stuck):**
+- If your search results are NOT relevant to your task, you MUST try DIFFERENT search queries
+- Don't repeat the same query multiple times - reformulate it with different keywords or phrasing
+- Try different angles: synonyms, related terms, more specific or more general queries
+- Example: If "ВВС Германии" gives irrelevant results, try "Luftwaffe техника", "немецкая военная авиация", "современные самолеты Германии"
+- You have up to {max_steps} steps - use them wisely to try different search approaches
+- If after 2-3 different search attempts you still don't find relevant results, signal done() and report what you found (even if limited)
 
 Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not just surface-level!
 """
@@ -353,6 +396,18 @@ Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not ju
             tools.append(create_tool_from_action(action_name, action_def))
     
     logger.debug(f"Agent {agent_id} tools prepared", tool_count=len(tools), tool_names=[t.name for t in tools])
+
+    # Get max_steps from settings if not provided
+    if max_steps is None:
+        from src.workflow.research.nodes import _get_runtime_deps
+        runtime_deps = _get_runtime_deps()
+        settings = runtime_deps.get("settings")
+        if settings:
+            max_steps = settings.deep_research_agent_max_steps
+        else:
+            max_steps = 5  # Default fallback
+    
+    logger.info(f"Agent {agent_id} starting ReAct loop", max_steps=max_steps)
 
     # ReAct loop
     for step in range(max_steps):

@@ -330,20 +330,22 @@ def register_actions():
     # Web Search (always available)
     ActionRegistry.register(
         name="web_search",
-        description="Search the web for information. Provide up to 3 targeted search queries. "
-        "CRITICAL: When generating queries, ALWAYS preserve the core meaning and key terms from the original user query. "
-        "Use the SAME LANGUAGE as the original query. Generate SEO-friendly keywords (2-5 words), NOT full sentences. "
+        description="Search the web for information. Provide up to 3 search queries. "
+        "CRITICAL: Write queries EXACTLY as you would type them in a browser search box - natural, complete questions or phrases. "
+        "Use the SAME LANGUAGE as the original user query. "
         "**IMPORTANT**: If the user query contains a word that might be a typo (e.g., 'гинеса' -> 'Гиннесса'), intelligently correct it. "
-        "Example: User asks 'расскажи про историю гинеса' -> queries should be ['Гиннесса история', 'Книга рекордов Гиннесса', 'Guinness World Records']. "
-        "Example: User asks 'расскажи про саблю' -> queries should be ['сабля', 'сабля история', 'сабля виды']. "
-        "DO NOT add unrelated terms. DO NOT drop key terms from the original query. Returns list of search results with title, URL, and snippet.",
+        "Examples: "
+        "- User asks 'расскажи про историю гинеса' -> queries: ['история Книги рекордов Гиннесса', 'Guinness World Records история', 'когда создана Книга рекордов Гиннесса'] "
+        "- User asks 'расскажи про саблю' -> queries: ['что такое сабля', 'история сабли', 'виды сабель'] "
+        "- User asks 'ВВС Германии техника' -> queries: ['ВВС Германии современная техника', 'Luftwaffe самолеты', 'военная авиация Германии'] "
+        "Write natural queries that a person would use in a search engine. Returns list of search results with title, URL, and snippet.",
         args_schema={
             "type": "object",
             "properties": {
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of 1-3 search queries (SEO-friendly keywords, preserve original query's key terms and language)",
+                    "description": "List of 1-3 natural search queries (as you would type in a browser, preserve original query's meaning and language)",
                     "minItems": 1,
                     "maxItems": 3,
                 },

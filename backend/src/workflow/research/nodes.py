@@ -576,14 +576,36 @@ async def create_agent_characteristics_enhanced_node(state: Dict[str, Any]) -> D
     if stream:
         stream.emit_status(f"Creating {agent_count} specialized research agents...", step="agent_characteristics")
 
+    # Get deep search result and user clarification answers
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
+    
+    clarification_context = ""
+    chat_history = state.get("chat_history", [])
+    if chat_history:
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    user_answer = chat_history[i + 1].get("content", "")
+                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n"
+                    break
+
     prompt = f"""Create a team of {agent_count} specialized research agents for this project:
 
-Query: {query}
+**ORIGINAL USER QUERY:** {query}
+
+**INITIAL DEEP SEARCH CONTEXT:**
+{deep_search_result[:2000] if deep_search_result else "No initial deep search context available."}
+{clarification_context}
 
 Research topics:
 {chr(10).join([f"- {t.get('topic')}: {t.get('description')}" for t in research_topics])}
 
 CRITICAL: Each agent must research DIFFERENT aspects to build a complete picture!
+**IMPORTANT: Use the original user query, deep search context, and user clarification answers above to create relevant agent characteristics and tasks that directly address what the user asked for.**
 
 For each agent, create:
 1. A unique role (e.g., "Senior Aviation Historian", "Economic Policy Analyst", "Technical Specifications Expert", "Case Study Researcher")
@@ -1315,10 +1337,10 @@ Research completed with {len(findings)} findings from multiple agents covering v
         except Exception as e:
             logger.warning("Could not read main document", error=str(e))
 
-    # Compile all findings
+    # Compile all findings (NO TRUNCATION - use ALL key findings)
     findings_text = "\n\n".join([
         f"### {f.get('topic')}\n{f.get('summary', '')}\n\nKey findings:\n" +
-        "\n".join([f"- {kf}" for kf in f.get('key_findings', [])[:5]])
+        "\n".join([f"- {kf}" for kf in f.get('key_findings', [])])  # NO [:5] truncation - use ALL findings
         for f in findings
     ])
 
@@ -1331,29 +1353,54 @@ Research completed with {len(findings)} findings from multiple agents covering v
     # Build main document section separately (avoid backslash in f-string expression)
     main_doc_section = ""
     if main_document and main_document != primary_source:
-        main_doc_preview = main_document[:5000]
+        # Use more of main document (up to 10000 chars for context)
+        main_doc_preview = main_document[:10000] if len(main_document) > 10000 else main_document
+        if len(main_document) > 10000:
+            main_doc_preview += f"\n\n[... {len(main_document) - 10000} more characters in main document]"
         main_doc_section = f"\nMain document (key insights):\n{main_doc_preview}\n\n"
 
-    prompt = f"""Generate a comprehensive final research report.
+    # CRITICAL: Use FULL draft_report (no truncation) - it's the supervisor's comprehensive synthesis
+    # If draft_report is very large (>50000 chars), we'll use intelligent summarization for the prompt
+    # but still instruct LLM to generate a COMPREHENSIVE report
+    draft_report_for_prompt = primary_source
+    if len(primary_source) > 50000:
+        # For very large draft reports, use first 40000 chars + summary of rest
+        from src.utils.text import summarize_text
+        draft_report_for_prompt = primary_source[:40000] + "\n\n[... additional content summarized below ...]\n\n" + summarize_text(primary_source[40000:], 10000)
+        logger.info("Draft report is very large - using first 40k chars + summary for prompt", 
+                   total_length=len(primary_source), prompt_length=len(draft_report_for_prompt))
+    elif len(primary_source) > 30000:
+        # For large draft reports, use full content but note it
+        logger.info("Draft report is large - using full content in prompt", length=len(primary_source))
+
+    prompt = f"""Generate a COMPREHENSIVE, DETAILED final research report. This should be a FULL, SUBSTANTIAL research document, not a brief summary.
 
 Query: {query}
 
-**IMPORTANT**: Use the Draft Research Report as the PRIMARY source - it contains the supervisor's comprehensive synthesis of all agent findings.
+**CRITICAL**: Use the Draft Research Report as the PRIMARY source - it contains the supervisor's comprehensive synthesis of all agent findings.
+**IMPORTANT**: Generate a FULL, DETAILED report with extensive analysis, multiple sections, and comprehensive coverage. The report should be SUBSTANTIAL and COMPLETE.
 
-Draft Research Report (supervisor's working document):
-{primary_source[:15000] if len(primary_source) > 15000 else primary_source}
+Draft Research Report (supervisor's working document - PRIMARY SOURCE):
+{draft_report_for_prompt}
 {main_doc_section}
 Additional findings (for reference if draft is incomplete):
-{findings_text[:5000] if findings_text else "None"}
+{findings_text[:10000] if len(findings_text) > 10000 else findings_text if findings_text else "None"}
 
-Create a well-structured, comprehensive report with:
-1. Executive summary (synthesize the draft report's main points)
-2. Detailed sections with analysis (use the draft report's sections and findings)
-3. Evidence-based conclusions (based on draft report's analysis)
-4. Citations to sources (include all sources mentioned in draft report)
+Create a well-structured, COMPREHENSIVE, DETAILED report with:
+1. Executive summary (synthesize the draft report's main points - should be substantial, 200-400 words, not brief)
+2. Multiple detailed sections with extensive analysis (use ALL sections and findings from draft report - each section should be 300-800 words with specific facts, data, and evidence)
+3. Evidence-based conclusions (based on draft report's analysis - should be 200-400 words, not brief)
+4. Citations to sources (include ALL sources mentioned in draft report)
 
-CRITICAL: The draft report should be your PRIMARY source. It contains the supervisor's comprehensive synthesis.
-If draft report is incomplete or missing, use fallback sources but note this in the report.
+**CRITICAL REQUIREMENTS:**
+- The report MUST be COMPREHENSIVE and SUBSTANTIAL - aim for 2000-5000+ words total
+- Use ALL information from the draft report - don't skip or summarize too much
+- Each section should be DETAILED with specific facts, data, and analysis
+- Include ALL key findings from all agents
+- Create at least 3-5 major sections covering different aspects of the topic
+- The draft report should be your PRIMARY source - it contains the supervisor's comprehensive synthesis
+- If draft report is incomplete or missing, use fallback sources but note this in the report
+- DO NOT create a brief summary - create a FULL research document with extensive detail
 """
 
     try:
@@ -1385,14 +1432,25 @@ Check for completeness, accuracy, and quality.
             {"role": "user", "content": validation_prompt}
         ])
 
+        # Check if report is comprehensive enough BEFORE formatting
+        total_content_length = len(report.executive_summary) + sum(len(s.content) for s in report.sections) + len(report.conclusion)
         logger.info(
             "Report generated and validated",
             is_complete=validation.is_complete,
             quality_score=validation.quality_score,
-            sections=len(report.sections)
+            sections=len(report.sections),
+            total_length=total_content_length,
+            executive_summary_length=len(report.executive_summary),
+            conclusion_length=len(report.conclusion)
         )
+        
+        if total_content_length < 1500:
+            logger.warning("CRITICAL: Final report is too short! Report may be incomplete.", 
+                         total_length=total_content_length, sections=len(report.sections))
+            if stream:
+                stream.emit_status("⚠️ Warning: Report may be incomplete - check draft_report.md for full content", step="report")
 
-        # Format as markdown
+        # Format as markdown - include ALL sections with FULL content (no truncation)
         report_markdown = f"""# {report.title}
 
 ## Executive Summary
