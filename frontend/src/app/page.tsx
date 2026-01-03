@@ -67,6 +67,7 @@ export default function HomePage() {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const [showChatSearch, setShowChatSearch] = useState(false);
+  const [chatListRefreshTrigger, setChatListRefreshTrigger] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -371,6 +372,42 @@ export default function HomePage() {
             )
           );
           
+          // CRITICAL: Save final report to DB immediately
+          const targetChatIdForFinalReport = chatId || currentChatId;
+          if (targetChatIdForFinalReport && finalContent.trim()) {
+            // Save immediately without setTimeout - this is the final content
+            addMessage(targetChatIdForFinalReport, 'assistant', finalContent, assistantMessage.id)
+              .then(() => {
+                messageSaved = true;
+                if (DEBUG_MODE) {
+                  console.debug('[debug] saved final report to DB', { 
+                    messageId: assistantMessage.id,
+                    chatId: targetChatIdForFinalReport,
+                    contentLength: finalContent.length 
+                  });
+                }
+              })
+              .catch((err) => {
+                console.error('Failed to save final report to DB:', err);
+                // Retry once after a short delay
+                setTimeout(async () => {
+                  try {
+                    await addMessage(targetChatIdForFinalReport, 'assistant', finalContent, assistantMessage.id);
+                    messageSaved = true;
+                    console.log('Final report saved to DB on retry');
+                  } catch (retryErr) {
+                    console.error('Failed to save final report to DB on retry:', retryErr);
+                  }
+                }, 1000);
+              });
+          } else if (!targetChatIdForFinalReport) {
+            console.warn('Cannot save final report - no chat ID available', {
+              chatId,
+              currentChatId,
+              messageId: assistantMessage.id
+            });
+          }
+          
           // CRITICAL: Save assistant message to DB - use chatId from closure or currentChatId
           const targetChatId = chatId || currentChatId;
           if (targetChatId && finalContent.trim() && !messageSaved) {
@@ -445,6 +482,8 @@ export default function HomePage() {
         try {
           const { generateChatTitle } = await import('@/lib/api');
           await generateChatTitle(chatId);
+          // Trigger chat list refresh to show updated title
+          setChatListRefreshTrigger(prev => prev + 1);
           if (DEBUG_MODE) {
             console.debug('[debug] Title auto-generated for new chat');
           }
@@ -465,11 +504,22 @@ export default function HomePage() {
       const chatData = await getChat(chatId);
       setCurrentChatId(chatId);
       const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
-      const loadedMessages = dbMessages.map((msg) => ({
-        id: msg.message_id,
+      
+      // CRITICAL: Load ALL messages from DB, including assistant messages
+      // Sort by created_at to maintain order
+      const sortedMessages = [...dbMessages].sort((a, b) => {
+        const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+        const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+        return aTime - bTime;
+      });
+      
+      const loadedMessages = sortedMessages.map((msg) => ({
+        id: msg.message_id || makeId(), // Use message_id from DB
         role: msg.role as 'user' | 'assistant',
-        content: msg.content,
+        content: msg.content || '', // Ensure content is never undefined
       }));
+      
+      // CRITICAL: Set messages state - this ensures all messages from DB are displayed
       setMessages(loadedMessages);
       
       // Mark all loaded messages as complete (they're in DB, so they're finished)
@@ -535,6 +585,7 @@ export default function HomePage() {
         currentChatId={currentChatId}
         onChatSelect={handleChatSelect}
         onNewChat={handleNewChat}
+        refreshTrigger={chatListRefreshTrigger}
       />
       <main className="flex-1 relative flex flex-col min-h-0 overflow-hidden bg-[radial-gradient(circle_at_top,_#f8fbff,_#f4f5f7_50%,_#eef2f7_100%)] dark:bg-[radial-gradient(circle_at_top,_#0f172a,_#1e293b_50%,_#334155_100%)]">
       <div className="pointer-events-none absolute inset-0">

@@ -234,8 +234,9 @@ async def delete_chat(chat_id: str, app_request: Request):
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
 
-        # Delete chat from database (cascades to messages)
-        await session.delete(chat)
+        # Delete chat from database (cascades to messages via ondelete="CASCADE" in ForeignKey)
+        # SQLAlchemy's session.delete() is synchronous, but we need to await commit
+        session.delete(chat)
         await session.commit()
 
         logger.info("Chat deleted", chat_id=chat_id)
@@ -274,36 +275,63 @@ async def add_message(
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
 
-        # Generate embedding for message content
-        embedding = None
-        if content.strip():
-            try:
-                embedding_provider = app_request.app.state.embedding_provider
-                embedding_vector = await embedding_provider.embed_text(content)
-
-                # Normalize embedding to database schema dimension (not provider dimension!)
-                # Database schema uses EMBEDDING_DIMENSION from settings/environment
-                from src.database.schema import EMBEDDING_DIMENSION
-                db_dimension = EMBEDDING_DIMENSION
-                
-                if len(embedding_vector) < db_dimension:
-                    embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
-                elif len(embedding_vector) > db_dimension:
-                    embedding_vector = embedding_vector[:db_dimension]
-
-                embedding = embedding_vector
-            except Exception as e:
-                logger.warning("Failed to generate embedding for message", error=str(e), chat_id=chat_id)
-
-        # Create message
-        message = ChatMessageModel(
-            chat_id=chat_id,
-            message_id=msg_id,
-            role=role,
-            content=content,
-            embedding=embedding,
+        # Check if message with this message_id already exists (upsert logic)
+        existing_message_result = await session.execute(
+            select(ChatMessageModel).where(ChatMessageModel.message_id == msg_id)
         )
-        session.add(message)
+        existing_message = existing_message_result.scalar_one_or_none()
+        
+        if existing_message:
+            # Update existing message (in case of retry or duplicate)
+            logger.info("Message with message_id already exists, updating", message_id=msg_id, chat_id=chat_id)
+            existing_message.content = content
+            existing_message.role = role
+            # Update embedding if content changed
+            if content.strip():
+                try:
+                    embedding_provider = app_request.app.state.embedding_provider
+                    embedding_vector = await embedding_provider.embed_text(content)
+                    from src.database.schema import EMBEDDING_DIMENSION
+                    db_dimension = EMBEDDING_DIMENSION
+                    if len(embedding_vector) < db_dimension:
+                        embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                    elif len(embedding_vector) > db_dimension:
+                        embedding_vector = embedding_vector[:db_dimension]
+                    existing_message.embedding = embedding_vector
+                except Exception as e:
+                    logger.warning("Failed to update embedding for existing message", error=str(e), chat_id=chat_id)
+            message = existing_message
+        else:
+            # Generate embedding for new message content
+            embedding = None
+            if content.strip():
+                try:
+                    embedding_provider = app_request.app.state.embedding_provider
+                    embedding_vector = await embedding_provider.embed_text(content)
+
+                    # Normalize embedding to database schema dimension (not provider dimension!)
+                    # Database schema uses EMBEDDING_DIMENSION from settings/environment
+                    from src.database.schema import EMBEDDING_DIMENSION
+                    db_dimension = EMBEDDING_DIMENSION
+                    
+                    if len(embedding_vector) < db_dimension:
+                        embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                    elif len(embedding_vector) > db_dimension:
+                        embedding_vector = embedding_vector[:db_dimension]
+
+                    embedding = embedding_vector
+                except Exception as e:
+                    logger.warning("Failed to generate embedding for message", error=str(e), chat_id=chat_id)
+
+            # Create new message
+            message = ChatMessageModel(
+                chat_id=chat_id,
+                message_id=msg_id,
+                role=role,
+                content=content,
+                embedding=embedding,
+            )
+            session.add(message)
 
         # Update chat updated_at
         chat.updated_at = datetime.now()

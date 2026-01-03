@@ -810,6 +810,13 @@ async def run_supervisor_agent(
     research_plan = state.get("research_plan", {})
     iteration = state.get("iteration", 0)
     
+    # Get deep_search_result for context (from initial deep search before multi-agent system)
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
+    
     # Get memory services
     agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
     agent_file_service = stream.app_state.get("agent_file_service") if stream else None
@@ -908,8 +915,13 @@ Current query: {query}
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
 
-IMPORTANT: If user provided clarification answers in chat history, use them to guide research direction.
-User's clarification answers should be considered when creating agent todos and evaluating findings.
+**INITIAL DEEP SEARCH CONTEXT:**
+{deep_search_result[:2000] if deep_search_result else "No initial deep search context available."}
+
+IMPORTANT: 
+- Use the initial deep search context above to understand the topic and guide research direction.
+- If user provided clarification answers in chat history, use them to guide research direction.
+- User's clarification answers should be considered when creating agent todos and evaluating findings.
 
 CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
 - Each agent should research DIFFERENT aspects/aspects of the topic

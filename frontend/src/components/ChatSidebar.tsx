@@ -9,11 +9,12 @@ import { cn } from '@/lib/utils';
 
 interface ChatSidebarProps {
   currentChatId: string | null;
-  onChatSelect: (chatId: string) => void;
+  onChatSelect: (chatId: string, messageId?: string) => void;
   onNewChat: () => void;
+  refreshTrigger?: number; // Trigger to refresh chat list
 }
 
-export function ChatSidebar({ currentChatId, onChatSelect, onNewChat }: ChatSidebarProps) {
+export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTrigger }: ChatSidebarProps) {
   const [chats, setChats] = useState<Chat[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -32,6 +33,13 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat }: ChatSide
   useEffect(() => {
     loadChats();
   }, []);
+
+  // Refresh chat list when refreshTrigger changes (e.g., after title generation)
+  useEffect(() => {
+    if (refreshTrigger !== undefined && refreshTrigger > 0) {
+      loadChats();
+    }
+  }, [refreshTrigger]);
 
   const handleDelete = async (chatId: string, e: React.MouseEvent) => {
     e.stopPropagation();

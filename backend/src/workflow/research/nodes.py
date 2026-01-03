@@ -412,15 +412,24 @@ async def analyze_query_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if stream:
         stream.emit_status("Analyzing query complexity...", step="analysis")
 
+    # Get deep_search_result for context
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
+    
+    deep_search_context = f"\n\n**Initial Deep Search Context:**\n{deep_search_result[:1500] if deep_search_result else 'No initial deep search context available.'}\n" if deep_search_result else ""
+    
     prompt = f"""Analyze this research query to determine the best approach:
 
 Query: {query}
-
+{deep_search_context}
 Assess:
 1. What are the main topics/subtopics?
 2. How complex is this query?
-3. Do we need deep search context first?
-4. How many specialized research agents would be optimal?
+3. How many specialized research agents would be optimal?
+4. What research angles should different agents cover?
 """
 
     try:
@@ -761,6 +770,14 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
             logger.info(f"Emitting progress: cycle {iteration_count}/{max_iterations}, supervisor calls {supervisor_call_count}/{max_supervisor_calls}")
         
         # Launch all agents in parallel for this iteration
+        # Get max_steps from settings (centralized config)
+        if settings:
+            agent_max_steps = settings.deep_research_agent_max_steps
+        else:
+            from src.config.settings import get_settings
+            settings_obj = get_settings()
+            agent_max_steps = settings_obj.deep_research_agent_max_steps
+        
         agent_tasks = []
         for agent_id in agent_characteristics.keys():
             task = asyncio.create_task(
