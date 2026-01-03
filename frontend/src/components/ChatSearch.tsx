@@ -102,8 +102,21 @@ export function ChatSearch({ onChatSelect, onClose }: ChatSearchProps) {
                 <button
                   key={`${message.chat_id}-${message.message_id}`}
                   onClick={() => {
-                    onChatSelect(message.chat_id, message.message_message_id);
-                    onClose();
+                    // Use message_message_id if available, otherwise message_id
+                    const targetMessageId = message.message_message_id || message.message_id?.toString();
+                    try {
+                      onChatSelect(message.chat_id, targetMessageId);
+                      onClose();
+                    } catch (error) {
+                      console.error('Failed to select chat from search result:', error);
+                      // Fallback: try without messageId
+                      try {
+                        onChatSelect(message.chat_id);
+                        onClose();
+                      } catch (fallbackError) {
+                        console.error('Failed to select chat (fallback):', fallbackError);
+                      }
+                    }
                   }}
                   className={cn(
                     "w-full rounded-lg p-4 text-left transition-colors",

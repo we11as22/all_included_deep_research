@@ -20,7 +20,7 @@ async def run_researcher_agent_enhanced(
     scraper: Any,
     stream: Any,
     supervisor_queue: Any,
-    max_steps: int = 8,
+    max_steps: int = None,  # If None, will use settings.deep_research_agent_max_steps (old default: 8)
 ) -> Dict:
     """Enhanced researcher agent - main implementation."""
     return await _run_researcher_agent_impl(
@@ -52,7 +52,7 @@ async def _run_researcher_agent_impl(
     scraper: Any,
     stream: Any,
     supervisor_queue: Any,
-    max_steps: int = 8,
+    max_steps: int = None,  # If None, will use settings.deep_research_agent_max_steps (old default: 8)
 ) -> Dict:
     """
     Enhanced researcher agent with full memory integration.
@@ -119,6 +119,17 @@ async def _run_researcher_agent_impl(
     character = agent_file.get("character", "")
     preferences = agent_file.get("preferences", "")
     todos = agent_file.get("todos", [])
+    
+    # Get recent notes - LIMIT to prevent context bloat
+    # Only include last 10 most recent important notes in context
+    all_notes = agent_file.get("notes", [])
+    # Notes are already limited to 20 in read_agent_file, but we limit further for context
+    recent_notes = all_notes[-10:] if len(all_notes) > 10 else all_notes
+    notes_context = "\n".join([f"- {note}" for note in recent_notes]) if recent_notes else "No previous notes."
+    
+    # Log note count for debugging
+    if all_notes:
+        logger.debug(f"Agent {agent_id} notes", total=agent_file.get("all_notes_count", len(all_notes)), in_context=len(recent_notes))
 
     # Get agent characteristics from state
     agent_characteristics = state.get("agent_characteristics", {}).get(agent_id, {})
@@ -228,14 +239,29 @@ Goal: {plan.current_goal}
 Next steps: {', '.join(plan.next_steps)}
 Strategy: {plan.search_strategy}
 
-CRITICAL INSTRUCTIONS FOR NOTES:
-- When you save notes, ALWAYS include clickable links (URLs) to all sources you found
-- In your notes, include:
-  1. Links to all relevant sources you discovered
-  2. Possible research directions or questions that need further investigation
-  3. Specific areas that might need deeper exploration
-  4. Any gaps or limitations you noticed in the information found
-- Your notes should help guide future research and provide clear paths for deeper investigation
+Your previous notes (recent important findings):
+{notes_context}
+
+CRITICAL INSTRUCTIONS FOR NOTES AND MEMORY:
+- **DO NOT save notes automatically** - you must THINK and decide what's truly important
+- **ONLY save notes when you have SUBSTANTIAL, ACTIONABLE INFORMATION**:
+  1. Key discoveries, important facts, or significant insights that answer the research question
+  2. Critical information that directly relates to your current task objective
+  3. Important patterns, trends, or conclusions you've identified
+  4. Gaps or limitations that need further investigation
+  5. Research directions or questions that are critical for completing the task
+- **NEVER save routine notes** like:
+  - "Found X sources" (this is not information, just metadata)
+  - "Search: query" (this is not a finding)
+  - Lists of URLs without context (this is not useful)
+  - Generic summaries without specific facts
+- **When you DO save a note, it must contain**:
+  - Specific facts, data, or insights (not just "found sources")
+  - Clear explanation of WHY this information is important
+  - How it relates to the research objective
+  - Clickable links (URLs) to all sources
+- **Your notes should help guide future research** - they must be informative and actionable
+- **Think before saving**: "Does this note contain valuable information that will help complete the research?" If not, don't save it.
 
 Available actions:
 - web_search(query: str): Search the web
@@ -487,35 +513,14 @@ Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not ju
                                     "title": src.get("title")
                                 })
 
-                        # Create note for this search
-                        if new_sources:
-                            # Extract query from tool_args
-                            queries = tool_args.get("queries", []) if isinstance(tool_args, dict) else []
-                            query_text = queries[0] if queries else "search"
-                            
-                            note = AgentNote(
-                                title=f"Search results for {query_text}",
-                                summary=f"Found {len(new_sources)} sources: {', '.join([s.get('title', 'Unknown')[:50] for s in new_sources[:3]])}",
-                                urls=[s.get("url") for s in new_sources[:5] if s.get("url")],
-                                tags=["web_search", current_task.title]
-                            )
-                            # Save note to file
-                            try:
-                                file_path = await agent_memory_service.save_agent_note(note, agent_id)
-                                logger.info(f"Agent {agent_id} saved note", file_path=file_path)
-                            except Exception as e:
-                                logger.error(f"Agent {agent_id} failed to save note", error=str(e))
-
-                            notes.append(note)
-
-                            # Emit note to UI
-                            if stream:
-                                stream.emit_agent_note(agent_id, {
-                                    "title": note.title,
-                                    "summary": note.summary,
-                                    "urls": note.urls,
-                                    "shared": True
-                                })
+                        # DO NOT automatically create notes for every search
+                        # Notes should only be created when agent finds IMPORTANT information
+                        # The agent will decide what to save based on actual findings
+                        # We only track sources here for the agent's context
+                    
+                    # Handle scrape_url results - DO NOT automatically create notes
+                    # The agent should analyze scraped content and decide what's important to save
+                    # Only save notes when agent explicitly identifies valuable information
 
                     # Extract tool_call_id
                     tool_call_id = None
@@ -568,35 +573,13 @@ Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not ju
                                     "title": src.get("title")
                                 })
 
-                        # Create note for this search
-                        if new_sources:
-                            # Extract query from tool_args
-                            queries = tool_args.get("queries", []) if isinstance(tool_args, dict) else []
-                            query_text = queries[0] if queries else "search"
-                            
-                            note = AgentNote(
-                                title=f"Search results for {query_text}",
-                                summary=f"Found {len(new_sources)} sources: {', '.join([s.get('title', 'Unknown')[:50] for s in new_sources[:3]])}",
-                                urls=[s.get("url") for s in new_sources[:5] if s.get("url")],
-                                tags=["web_search", current_task.title]
-                            )
-                            # Save note to file
-                            try:
-                                file_path = await agent_memory_service.save_agent_note(note, agent_id)
-                                logger.info(f"Agent {agent_id} saved note", file_path=file_path)
-                            except Exception as e:
-                                logger.error(f"Agent {agent_id} failed to save note", error=str(e))
-
-                            notes.append(note)
-
-                            # Emit note to UI
-                            if stream:
-                                stream.emit_agent_note(agent_id, {
-                                    "title": note.title,
-                                    "summary": note.summary,
-                                    "urls": note.urls,
-                                    "shared": True
-                                })
+                        # DO NOT automatically create notes for search results
+                        # Agent should analyze results and decide what's important to save
+                        # Notes should only be created when agent finds IMPORTANT information
+                    
+                    # Handle scrape_url results - DO NOT automatically create notes
+                    # Agent should analyze scraped content and decide what's important to save
+                    # Only save notes when agent explicitly identifies valuable information
 
                     # Extract tool_call_id
                     tool_call_id = None
@@ -675,18 +658,107 @@ Create an updated research plan incorporating this new direction.
             logger.error(f"Agent {agent_id} step {step} failed", error=str(e))
             break
 
-    # Task completion
-    summary = f"Completed '{current_task.title}' with {len(sources)} sources and {len(notes)} research notes."
-    key_findings = [note.summary for note in notes[:5]]
-
+    # Task completion - create finding with ONLY useful information, NO metadata spam
+    # Filter out metadata and garbage, keep only actual findings
+    
+    # Extract REAL findings from sources (snippets with actual information, not just titles)
+    real_findings_from_sources = []
+    for src in sources:
+        snippet = src.get("snippet", "").strip()
+        title = src.get("title", "").strip()
+        
+        # Skip if snippet is too short or just metadata
+        if not snippet or len(snippet) < 30:
+            continue
+        
+        # Skip if snippet is just metadata (contains "found", "sources", "query" etc.)
+        snippet_lower = snippet.lower()
+        is_metadata = any([
+            "found" in snippet_lower and "sources" in snippet_lower,
+            "search:" in snippet_lower,
+            "query:" in snippet_lower,
+            snippet_lower.count("http") > 1,  # Multiple URLs = likely metadata
+        ])
+        
+        if not is_metadata and len(snippet) > 30:
+            # Extract meaningful information
+            finding_text = f"{title}: {snippet[:250]}" if title else snippet[:250]
+            real_findings_from_sources.append(finding_text)
+    
+    # Extract REAL findings from notes (only informative ones, not metadata)
+    important_notes = []
+    for note in notes:
+        if not note.summary or len(note.summary) < 100:
+            continue
+        
+        # Skip metadata notes
+        summary_lower = note.summary.lower()
+        is_metadata = any([
+            "found" in summary_lower and "sources" in summary_lower and "query" in summary_lower,
+            "search:" in note.title.lower() and len(note.summary) < 150,
+            "key sources:" in summary_lower and len(note.summary) < 200,
+        ])
+        
+        if not is_metadata:
+            important_notes.append(note)
+    
+    # Build summary with ONLY real findings, NO metadata
+    summary_parts = []
+    
+    # Add real findings from sources
+    if real_findings_from_sources:
+        findings_text = "\n".join([f"- {f}" for f in real_findings_from_sources[:10]])
+        summary_parts.append(f"Key findings from research:\n{findings_text}")
+    
+    # Add real findings from notes
+    if important_notes:
+        notes_text = "\n".join([f"- {note.title}: {note.summary[:200]}..." for note in important_notes[:8]])
+        summary_parts.append(f"\nImportant discoveries:\n{notes_text}")
+    
+    # If no real findings, indicate that research needs to go deeper
+    if not summary_parts:
+        summary_parts.append(f"Research completed on '{current_task.title}' but no substantial findings extracted. May need deeper investigation.")
+    
+    # Create summary (NO metadata like "Found X sources")
+    summary = "\n".join(summary_parts)
+    
+    # Extract key findings - ONLY real information, NO metadata
+    key_findings = []
+    
+    # From sources - only real findings
+    for finding in real_findings_from_sources[:12]:
+        key_findings.append(finding)
+    
+    # From notes - only informative ones
+    for note in important_notes[:8]:
+        if note.summary and len(note.summary) > 100:
+            key_findings.append(f"{note.title}: {note.summary[:200]}")
+    
+    # Filter sources - keep only ones with actual content (NO metadata spam)
+    filtered_sources = []
+    for src in sources:
+        snippet = src.get("snippet", "").strip()
+        if snippet and len(snippet) > 30:
+            snippet_lower = snippet.lower()
+            # Skip metadata sources
+            if not ("found" in snippet_lower and "sources" in snippet_lower):
+                filtered_sources.append(src)
+    
+    # Use filtered sources, but keep reasonable limit
+    useful_sources = filtered_sources[:30] if filtered_sources else sources[:10]
+    
+    # Create finding - ONLY real information, NO metadata spam
     finding = {
         "agent_id": agent_id,
         "topic": current_task.title,
-        "summary": summary,
-        "key_findings": key_findings,
-        "sources": sources[:20],
-        "confidence": "high" if len(sources) >= 5 else "medium",
-        "notes": notes
+        "summary": summary,  # Only real findings, no metadata
+        "key_findings": key_findings,  # Only real findings, filtered
+        "sources": useful_sources,  # Only sources with actual content
+        "confidence": "high" if len(useful_sources) >= 5 else "medium",
+        "notes": important_notes,  # Only informative notes, filtered
+        "sources_count": len(useful_sources),
+        "notes_count": len(important_notes),
+        "key_findings_count": len(key_findings)
     }
 
     # Mark task as done

@@ -188,6 +188,21 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
             # Run new LangGraph research
             try:
+                # Check if this is a continuation after clarification
+                # If last assistant message has clarification and current user message exists, we're continuing
+                is_continuation = False
+                if len(chat_history) >= 2:
+                    for i in range(len(chat_history) - 1, -1, -1):
+                        msg = chat_history[i]
+                        if msg.get("role") == "assistant":
+                            content = msg.get("content", "").lower()
+                            if "clarification" in content or "🔍" in content or "clarify" in content:
+                                # Check if there's a user message after this
+                                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                                    is_continuation = True
+                                    logger.info("Detected continuation after user clarification answer")
+                                break
+                
                 final_state = await run_research_graph(
                     query=query,
                     chat_history=chat_history,
@@ -200,6 +215,17 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     mode_config=mode_config,
                     settings=settings,
                 )
+                
+                # Check if graph stopped waiting for user (clarification needed but no answer yet)
+                if isinstance(final_state, dict):
+                    clarification_needed = final_state.get("clarification_needed", False)
+                    if clarification_needed and not is_continuation:
+                        # Graph stopped waiting for user - don't emit final report yet
+                        logger.info("Graph stopped waiting for user clarification - not emitting final report")
+                        # Emit status that we're waiting
+                        stream_generator.emit_status("Waiting for your clarification answers...", step="clarification")
+                        stream_generator.emit_done()
+                        return
 
                 # Extract final_report - handle both dict with override and direct value
                 logger.info("Extracting final report from state", state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
@@ -230,18 +256,52 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     # Store final report in session for PDF generation
                     _store_session_report(app_request.app.state, session_id, final_report, query, mode)
                 else:
-                    logger.warning("No final report generated from research graph", final_state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
-                    # Try to get main document as fallback
+                    logger.warning("No final report generated from research graph, creating fallback", final_state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
+                    # Try to get draft_report, main document, or findings as fallback
+                    fallback_report = None
                     if isinstance(final_state, dict):
-                        main_doc = final_state.get("main_document", "")
-                        if main_doc:
-                            logger.info("Using main document as fallback report")
-                            stream_generator.emit_final_report(main_doc)
-                            _store_session_report(app_request.app.state, session_id, main_doc, query, mode)
-                        else:
-                            stream_generator.emit_error(error="No report generated", details="Research completed but no final report was generated")
+                        # Try draft_report first
+                        agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                        if agent_memory_service:
+                            try:
+                                draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+                                if len(draft_report) > 500:
+                                    fallback_report = draft_report
+                                    logger.info("Using draft_report.md as fallback report", length=len(draft_report))
+                            except Exception as e:
+                                logger.warning("Could not read draft_report", error=str(e))
+                        
+                        # Try main document
+                        if not fallback_report:
+                            main_doc = final_state.get("main_document", "")
+                            if main_doc and len(main_doc) > 500:
+                                fallback_report = main_doc
+                                logger.info("Using main document as fallback report", length=len(main_doc))
+                        
+                        # Try findings
+                        if not fallback_report:
+                            findings = final_state.get("findings", final_state.get("agent_findings", []))
+                            if findings:
+                                findings_text = "\n\n".join([
+                                    f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
+                                    for f in findings
+                                ])
+                                fallback_report = f"# Research Report: {query}\n\n## Findings\n\n{findings_text}"
+                                logger.info("Using findings as fallback report", findings_count=len(findings))
+                    
+                    if fallback_report:
+                        logger.info("Emitting fallback report", report_length=len(fallback_report))
+                        stream_generator.emit_status("Finalizing report...", step="report")
+                        for chunk in _chunk_text(fallback_report, size=200):
+                            stream_generator.emit_report_chunk(chunk)
+                            await asyncio.sleep(0.02)
+                        stream_generator.emit_final_report(fallback_report)
+                        _store_session_report(app_request.app.state, session_id, fallback_report, query, mode)
+                        logger.info("Fallback report emitted successfully")
                     else:
-                        stream_generator.emit_error(error="No report generated", details="Research completed but no final report was generated")
+                        error_msg = "Research completed but no final report, draft report, main document, or findings were available"
+                        logger.error(error_msg)
+                        stream_generator.emit_error(error="No report generated", details=error_msg)
                     
                 logger.info("Emitting done signal")
                 stream_generator.emit_done()
@@ -261,6 +321,11 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             logger.info("Chat task cancelled", session_id=session_id)
             stream_generator.emit_status("Chat cancelled by user", step="cancelled")
             stream_generator.emit_done()
+            # Cleanup agent session dir on cancellation
+            if session_agent_dir:
+                memory_root = Path(app_request.app.state.memory_manager.memory_dir)
+                cleanup_agent_session_dir(memory_root, session_agent_dir)
+                logger.info("Agent session cleaned after cancellation", session_id=session_id)
         except Exception as exc:
             error_str = str(exc)
             error_details = "Chat stream failed"
@@ -288,23 +353,42 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 stream_generator.emit_done()
             except Exception:
                 pass  # Ignore errors during cleanup
-        finally:
-            # Remove task from active tasks
-            app_request.app.state.active_tasks.pop(session_id, None)
+            
+            # Cleanup agent session dir on error
             if session_agent_dir:
                 memory_root = Path(app_request.app.state.memory_manager.memory_dir)
                 cleanup_agent_session_dir(memory_root, session_agent_dir)
+                logger.info("Agent session cleaned after error", session_id=session_id)
+        finally:
+            # Remove task from active tasks
+            app_request.app.state.active_tasks.pop(session_id, None)
+            # DON'T cleanup session dir here - only cleanup on cancellation or error
+            # This allows successful sessions to keep their files for debugging
+            logger.debug("Task finished, session files preserved", session_id=session_id, preserved=session_agent_dir is not None)
 
     # Start background task and store it
     task = asyncio.create_task(run_task())
     app_request.app.state.active_tasks[session_id] = task
 
     async def watch_disconnect() -> None:
+        """
+        Watch for client disconnection, but DON'T cancel deep_research tasks.
+        Deep research can take a long time and should complete even if client disconnects.
+        Client can reconnect and get the result.
+        """
         try:
             while not task.done():
                 if await app_request.is_disconnected():
-                    if not task.done():
-                        task.cancel()
+                    # For deep_research mode, log but don't cancel - let it complete
+                    if mode == "deep_research":
+                        logger.info("Client disconnected during deep_research, but continuing task to completion", session_id=session_id)
+                        # Don't cancel - let the research complete
+                        # Client can reconnect and get the result
+                    else:
+                        # For other modes, cancel on disconnect
+                        logger.warning("Client disconnected, cancelling task", session_id=session_id)
+                        if not task.done():
+                            task.cancel()
                     break
                 await asyncio.sleep(0.5)
         except Exception as exc:

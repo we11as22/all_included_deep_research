@@ -222,9 +222,14 @@ class AgentFileService:
             elif current_section == "preferences" and line.strip() and not line.startswith("#"):
                 preferences += line + "\n"
         
+        # Limit notes to prevent context bloat - only return last 20 notes
+        # Even if file contains more, we only use recent important ones
+        limited_notes = notes[-20:] if len(notes) > 20 else notes
+        
         return {
             "todos": todos,
-            "notes": notes,
+            "notes": limited_notes,  # Limited to prevent context bloat
+            "all_notes_count": len(notes),  # Total count for reference
             "character": character.strip(),
             "preferences": preferences.strip(),
         }
@@ -276,11 +281,18 @@ class AgentFileService:
             "",
             "## Notes",
             "",
+            "<!-- Only important notes are stored here to prevent context bloat -->",
+            "",
         ])
         
         if notes:
-            for note in notes:
+            # Only show last 20 notes in file (even if more are stored)
+            # This prevents file from becoming too large
+            display_notes = notes[-20:] if len(notes) > 20 else notes
+            for note in display_notes:
                 lines.append(f"- {note}")
+            if len(notes) > 20:
+                lines.append(f"\n<!-- {len(notes) - 20} older notes not shown -->")
         else:
             lines.append("<!-- No notes -->")
         

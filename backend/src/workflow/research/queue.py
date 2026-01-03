@@ -143,6 +143,26 @@ class SupervisorQueue:
     def is_empty(self) -> bool:
         """Check if queue is empty."""
         return len(self.queue) == 0
+    
+    async def agent_completed_task(self, agent_id: str, task_title: str, result: Any):
+        """
+        Agent reports task completion and requests supervisor review.
+        
+        Args:
+            agent_id: ID of the agent
+            task_title: Title of the completed task
+            result: Finding result from the agent
+        """
+        await self.enqueue(agent_id, "task_completed", {
+            "task_title": task_title,
+            "result": result
+        })
+        logger.info(
+            "Agent task completion queued for supervisor",
+            agent_id=agent_id,
+            queue_size=len(self.queue),
+            task_title=task_title
+        )
 
 
 # ==================== Global Queue Instance ==========

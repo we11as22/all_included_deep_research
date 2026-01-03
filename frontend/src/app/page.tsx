@@ -284,30 +284,49 @@ export default function HomePage() {
             case 'done':
               next.isComplete = true;
               // Save assistant message to DB if not already saved and chat exists
-              if (currentChatId && !messageSaved) {
+              // CRITICAL: Use chatId from closure (created in handleSubmit) or currentChatId
+              const targetChatIdForDone = chatId || currentChatId;
+              if (targetChatIdForDone && !messageSaved) {
                 // Use setTimeout to ensure messages state is updated from report_chunk events
                 setTimeout(async () => {
                   setMessages((prev) => {
                     const currentMessage = prev.find(m => m.id === assistantMessage.id);
                     if (currentMessage && currentMessage.content.trim()) {
                       // Save asynchronously without blocking
-                      addMessage(currentChatId, 'assistant', currentMessage.content, assistantMessage.id)
+                      addMessage(targetChatIdForDone, 'assistant', currentMessage.content, assistantMessage.id)
                         .then(() => {
                           messageSaved = true;
                           if (DEBUG_MODE) {
                             console.debug('[debug] saved assistant message on done', { 
-                              messageId: assistantMessage.id, 
+                              messageId: assistantMessage.id,
+                              chatId: targetChatIdForDone,
                               contentLength: currentMessage.content.length 
                             });
                           }
                         })
                         .catch((err) => {
                           console.error('Failed to save assistant message on done:', err);
+                          // Retry once after a short delay
+                          setTimeout(async () => {
+                            try {
+                              await addMessage(targetChatIdForDone, 'assistant', currentMessage.content, assistantMessage.id);
+                              messageSaved = true;
+                              console.log('Assistant message saved on retry (done event)');
+                            } catch (retryErr) {
+                              console.error('Failed to save assistant message on retry (done event):', retryErr);
+                            }
+                          }, 1000);
                         });
                     }
                     return prev;
                   });
-                }, 100);
+                }, 500);
+              } else if (!targetChatIdForDone) {
+                console.warn('Cannot save assistant message on done - no chat ID available', {
+                  chatId,
+                  currentChatId,
+                  messageId: assistantMessage.id
+                });
               }
               break;
           }
@@ -334,6 +353,16 @@ export default function HomePage() {
 
         if (event.type === 'final_report') {
           const finalContent = event.data.report || '';
+          if (DEBUG_MODE) {
+            console.debug('[debug] final report received', { 
+              length: finalContent.length,
+              assistantMessageId: assistantMessage.id,
+              currentChatId: chatId || currentChatId,
+              preview: finalContent.substring(0, 200)
+            });
+          }
+          
+          // CRITICAL: Update message content immediately
           setMessages((prev) =>
             prev.map((message) =>
               message.id === assistantMessage.id
@@ -341,24 +370,39 @@ export default function HomePage() {
                 : message
             )
           );
-          if (DEBUG_MODE) {
-            console.debug('[debug] final report', { length: finalContent.length });
-          }
           
-          // Save assistant message to DB if chat exists and not already saved
-          if (currentChatId && finalContent.trim() && !messageSaved) {
+          // CRITICAL: Save assistant message to DB - use chatId from closure or currentChatId
+          const targetChatId = chatId || currentChatId;
+          if (targetChatId && finalContent.trim() && !messageSaved) {
             try {
-              await addMessage(currentChatId, 'assistant', finalContent, assistantMessage.id);
+              await addMessage(targetChatId, 'assistant', finalContent, assistantMessage.id);
               messageSaved = true;
               if (DEBUG_MODE) {
                 console.debug('[debug] saved assistant message on final_report', { 
                   messageId: assistantMessage.id, 
+                  chatId: targetChatId,
                   contentLength: finalContent.length 
                 });
               }
             } catch (err) {
               console.error('Failed to save assistant message:', err);
+              // Retry once after a short delay
+              setTimeout(async () => {
+                try {
+                  await addMessage(targetChatId, 'assistant', finalContent, assistantMessage.id);
+                  messageSaved = true;
+                  console.log('Assistant message saved on retry');
+                } catch (retryErr) {
+                  console.error('Failed to save assistant message on retry:', retryErr);
+                }
+              }, 1000);
             }
+          } else if (!targetChatId) {
+            console.warn('Cannot save assistant message - no chat ID available', {
+              chatId,
+              currentChatId,
+              messageId: assistantMessage.id
+            });
           }
         }
       }

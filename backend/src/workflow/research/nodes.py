@@ -25,8 +25,13 @@ def _restore_runtime_deps(state: Dict[str, Any]) -> Dict[str, Any]:
     """Restore runtime dependencies to state from context variable."""
     deps = _get_runtime_deps()
     for key, value in deps.items():
-        if value is not None and key not in state:
-            state[key] = value
+        # CRITICAL: Always restore stream if it's in deps, even if already in state
+        # This ensures stream is never lost
+        if value is not None:
+            if key == "stream" or key not in state:
+                state[key] = value
+                if key == "stream":
+                    logger.debug("Stream restored to state", has_stream=value is not None)
     return state
 
 from src.workflow.research.state import (
@@ -90,8 +95,25 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
     chat_history = state.get("chat_history", [])
     stream = state.get("stream")
 
+    # CRITICAL: Always try to restore stream from context if missing
+    if not stream:
+        logger.warning("Stream missing in state, restoring from runtime deps", state_keys=list(state.keys()))
+        deps = _get_runtime_deps()
+        stream = deps.get("stream")
+        if stream:
+            state["stream"] = stream
+            logger.info("Stream restored from runtime deps context")
+        else:
+            logger.error("CRITICAL: stream is None even after restoring from context!", deps_keys=list(deps.keys()) if deps else "no deps")
+
     if stream:
-        stream.emit_status("Running deep search for initial context...", step="deep_search")
+        try:
+            stream.emit_status("Running deep search for initial context...", step="deep_search")
+            logger.info("✅ Progress emitted: Running deep search")
+        except Exception as e:
+            logger.error("Failed to emit progress", error=str(e), exc_info=True)
+    else:
+        logger.error("❌ Cannot emit progress - stream is None!", node="run_deep_search_node")
 
     logger.info("Running deep search before agent spawning")
 
@@ -166,20 +188,50 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     stream = state.get("stream")
     settings = state.get("settings")
     
-    # Check if clarifying questions are enabled
-    if not settings or not settings.deep_research_enable_clarifying_questions:
-        logger.info("Clarifying questions disabled, skipping")
-        return {"clarification_needed": False}
+    # CRITICAL: Log if stream is missing and try to restore from context
+    if not stream:
+        logger.error("CRITICAL: stream is None in clarify_with_user_node!", state_keys=list(state.keys()))
+        deps = _get_runtime_deps()
+        stream = deps.get("stream")
+        if stream:
+            state["stream"] = stream
+            logger.info("Stream restored from runtime deps context")
+        else:
+            logger.error("CRITICAL: stream is None even after restoring from context!")
     
-    # Check if we already asked questions (look at chat history)
-    # Only skip if there are multiple exchanges (user has already answered)
-    if len(chat_history) > 4:  # More than 2 exchanges (user + assistant pairs)
-        # User has already interacted extensively, skip clarification
-        logger.info("Chat history is extensive, skipping clarification")
+    # ALWAYS generate clarifying questions about the research topic and approach
+    # This helps ensure we understand what the user wants to research
+    # Only skip if user has already answered in recent chat history
+    has_recent_clarification = False
+    if len(chat_history) >= 2:
+        # Check if last assistant message contains clarification questions
+        last_assistant_msg = None
+        for msg in reversed(chat_history):
+            if msg.get("role") == "assistant":
+                last_assistant_msg = msg.get("content", "")
+                break
+        if last_assistant_msg and ("clarification" in last_assistant_msg.lower() or "clarify" in last_assistant_msg.lower() or "🔍" in last_assistant_msg):
+            # Check if user responded (next message is from user)
+            if len(chat_history) >= 3:
+                # Check if there's a user message after the clarification
+                found_clarification = False
+                for i, msg in enumerate(chat_history):
+                    if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                        # Check if next message is from user
+                        if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                            has_recent_clarification = True
+                            logger.info("User has already answered clarification questions")
+                            break
+    
+    if has_recent_clarification:
+        logger.info("Clarification already provided, skipping")
         return {"clarification_needed": False}
     
     if stream:
         stream.emit_status("Analyzing if clarification is needed...", step="clarification")
+        logger.info("Progress emitted: Analyzing clarification")
+    else:
+        logger.warning("Cannot emit progress - stream is None!", node="clarify_with_user_node")
         logger.info("Clarification node: deep_search_result available", 
                    has_result=bool(deep_search_result), 
                    result_length=len(deep_search_result) if deep_search_result else 0,
@@ -192,23 +244,31 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     deep_search_context = f"\n\nDeep search provided this context:\n{deep_search_summary}" if deep_search_summary else ""
     logger.info("Deep search context prepared", context_length=len(deep_search_context))
     
-    prompt = f"""Analyze if this research query needs clarification from the user.
+    prompt = f"""Generate clarifying questions about the research topic and approach.
 
 Query: {query}
 {deep_search_context}
 
-Assess whether:
-1. The query is clear and specific enough to conduct research
-2. There are ambiguous terms that need clarification
-3. The scope is well-defined or too broad
+You MUST always generate 2-3 clarifying questions about:
+1. The specific aspect or focus of the research (what exactly should be researched)
+2. The depth and scope of the research (how detailed should it be)
+3. The type of information needed (technical details, historical context, comparisons, etc.)
 
-If clarification is needed, ask 1-2 specific questions.
-If you can proceed with reasonable assumptions, indicate so.
+These questions help guide the research direction and ensure comprehensive coverage.
+Even if the query seems clear, ask questions to refine the research approach.
+
+IMPORTANT: You MUST always return at least 2 questions in the questions list, even if the query seems clear.
+Set needs_clarification=True and provide meaningful questions that help improve research quality.
+
+Format questions with:
+- question: The actual question
+- why_needed: Why this clarification helps improve research
+- default_assumption: What we'll assume if not answered
 """
     
     try:
         clarification = await llm.with_structured_output(ClarificationNeeds).ainvoke([
-            {"role": "system", "content": "You are a research planning expert."},
+            {"role": "system", "content": "You are a research planning expert. You MUST always generate clarifying questions to help improve research quality."},
             {"role": "user", "content": prompt}
         ])
         
@@ -219,12 +279,41 @@ If you can proceed with reasonable assumptions, indicate so.
             can_proceed=clarification.can_proceed_without
         )
         
-        if clarification.needs_clarification and clarification.questions:
+        # ALWAYS send questions if they exist, regardless of needs_clarification flag
+        # If no questions generated, create default ones
+        questions_to_send = clarification.questions if clarification.questions else []
+        
+        # If LLM didn't generate questions, create default ones based on query and deep search
+        if not questions_to_send:
+            logger.warning("LLM didn't generate questions, creating default ones")
+            from src.workflow.research.models import ClarifyingQuestion
+            
+            # Create default questions based on query and deep search context
+            questions_to_send = [
+                ClarifyingQuestion(
+                    question="What specific aspect of this topic should be the primary focus of the research?",
+                    why_needed="This helps narrow down the research scope and ensure we cover the most important aspects.",
+                    default_assumption="We'll research all major aspects comprehensively."
+                ),
+                ClarifyingQuestion(
+                    question="What level of detail do you need? (e.g., overview, technical deep-dive, historical context, practical applications)",
+                    why_needed="This determines the depth and type of information we'll gather.",
+                    default_assumption="We'll provide a comprehensive overview with key technical details."
+                ),
+                ClarifyingQuestion(
+                    question="Are there any specific sources, perspectives, or angles you want us to prioritize?",
+                    why_needed="This helps us focus on the most relevant information sources.",
+                    default_assumption="We'll use diverse sources and perspectives for balanced coverage."
+                )
+            ]
+        
+        # ALWAYS send questions to user - this is mandatory after deep search
+        if questions_to_send:
             # Send clarifying questions to user via stream
             if stream:
                 questions_text = "\n\n".join([
                     f"**Q{i+1}:** {q.question}\n\n*Why needed:* {q.why_needed}\n\n*Default assumption if not answered:* {q.default_assumption}"
-                    for i, q in enumerate(clarification.questions)
+                    for i, q in enumerate(questions_to_send)
                 ])
                 
                 clarification_message = f"""## 🔍 Clarification Needed
@@ -235,37 +324,34 @@ Before starting the research, I need to clarify a few points:
 
 ---
 
-*Note: Research will proceed with the default assumptions listed above. 
-These questions help guide the research direction.*
+*Note: Please answer these questions to help guide the research direction. 
+Research will proceed after you provide your answers.*
 """
                 
-                stream.emit_status(clarification_message, step="clarification")
-                
-                # Emit as report chunk so it's visible to user in the main chat
+                # CRITICAL: Emit as report chunk FIRST so it appears in the assistant message
+                # This ensures questions are visible to user before research continues
                 stream.emit_report_chunk(clarification_message)
                 
+                # Also emit as status for progress tracking
+                stream.emit_status("Waiting for your clarification answers...", step="clarification")
+                
                 # Also emit as a separate message event to ensure it's visible
-                logger.info("Clarifying questions sent to user", 
-                           questions_count=len(clarification.questions),
-                           message_length=len(clarification_message))
+                logger.info("MANDATORY: Clarifying questions sent to user after deep search", 
+                           questions_count=len(questions_to_send),
+                           message_length=len(clarification_message),
+                           deep_search_used=bool(deep_search_result))
             
-            # Check if we can proceed without answers
-            if not clarification.can_proceed_without:
-                logger.warning("Clarification needed but cannot proceed without - proceeding anyway with assumptions")
+            # Always proceed with assumptions (user can answer later, but research continues)
+            logger.info("Clarifying questions shown to user, proceeding with default assumptions. User can provide answers in chat.")
             
-            # For now, always proceed with assumptions
-            # To implement true interactive: would need to:
-            # 1. Pause graph execution
-            # 2. Store graph state in checkpoint
-            # 3. Wait for user response via API
-            # 4. Resume graph with user answers
-            logger.info("Clarifying questions shown, proceeding with default assumptions")
             return {
-                "clarification_needed": False,  # Always proceed for now
-                "clarification_questions": [q.dict() for q in clarification.questions]  # Store for reference
+                "clarification_needed": True,  # Questions were sent
+                "clarification_questions": [q.dict() if hasattr(q, "dict") else {"question": q.question, "why_needed": q.why_needed, "default_assumption": q.default_assumption} for q in questions_to_send]  # Store for reference
             }
-        
-        return {"clarification_needed": False}
+        else:
+            # This should never happen, but log if it does
+            logger.error("CRITICAL: No questions generated and no fallback questions created!")
+            return {"clarification_needed": False}
         
     except Exception as e:
         logger.error("Clarification analysis failed", error=str(e))
@@ -275,6 +361,39 @@ These questions help guide the research direction.*
 # ==================== Analysis Node (Enhanced) ====================
 
 async def analyze_query_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analyze query and prepare for research planning.
+    
+    CRITICAL: If clarification was needed but user hasn't answered yet, stop here.
+    """
+    # Check if clarification was needed and user hasn't answered
+    clarification_needed = state.get("clarification_needed", False)
+    chat_history = state.get("chat_history", [])
+    
+    if clarification_needed:
+        # Check if user has answered
+        has_user_answer = False
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "").lower()
+                if "clarification" in content or "🔍" in content or "clarify" in content:
+                    # Check if next message is from user (user answered)
+                    if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                        has_user_answer = True
+                        logger.info("User answered clarification, proceeding with analysis")
+                        break
+        
+        if not has_user_answer:
+            # User hasn't answered yet - stop graph execution
+            logger.info("CRITICAL: Clarification needed but user hasn't answered - STOPPING GRAPH")
+            stream = state.get("stream")
+            if stream:
+                stream.emit_status("⏸️ Waiting for your clarification answers before proceeding...", step="clarification")
+            # Return state that will stop the graph
+            return {
+                "clarification_waiting": True,
+                "should_stop": True
+            }
     """
     Analyze query to determine research approach.
 
@@ -490,6 +609,23 @@ DIVERSITY REQUIREMENT:
         agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
         agent_file_service = stream.app_state.get("agent_file_service") if stream else None
 
+        # Create supervisor file if services available
+        if agent_file_service:
+            try:
+                await agent_file_service.write_agent_file(
+                    agent_id="supervisor",
+                    todos=[],
+                    notes=[],
+                    character="""**Role**: Research Supervisor
+**Expertise**: Coordinating research teams, synthesizing findings, identifying gaps
+**Personality**: Analytical, strategic, thorough
+""",
+                    preferences="Focus on comprehensive, diverse research coverage. Keep main.md minimal with only essential shared information."
+                )
+                logger.info("Supervisor file created")
+            except Exception as e:
+                logger.error("Failed to create supervisor file", error=str(e))
+
         # Create agent files with initial todos
         agent_chars = {}
         for i, agent_char in enumerate(characteristics.agents):
@@ -580,7 +716,13 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
     scraper = state.get("scraper")
     stream = state.get("stream")
     settings = state.get("settings")
-    max_iterations = state.get("max_iterations", 25)
+    # Get max_iterations from settings (centralized config)
+    if settings:
+        max_iterations = state.get("max_iterations", settings.deep_research_default_max_iterations)
+    else:
+        from src.config.settings import get_settings
+        settings_obj = get_settings()
+        max_iterations = state.get("max_iterations", settings_obj.deep_research_default_max_iterations)
     current_iteration = state.get("iteration", 0)
 
     if stream:
@@ -591,9 +733,20 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # Store in state for agents to access
     state["supervisor_queue"] = supervisor_queue
-    
+
     # All collected findings from all agent iterations
     all_findings = []
+    
+    # Track supervisor calls (not ReAct iterations, but actual supervisor invocations)
+    supervisor_call_count = state.get("supervisor_call_count", 0)
+    # Get max_supervisor_calls from settings (centralized config)
+    settings = state.get("settings")
+    if settings:
+        max_supervisor_calls = settings.deep_research_max_supervisor_calls
+    else:
+        from src.config.settings import get_settings
+        settings_obj = get_settings()
+        max_supervisor_calls = settings_obj.deep_research_max_supervisor_calls
     
     # Run agents in continuous mode until all todos complete or max iterations
     agents_active = True
@@ -602,6 +755,10 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
     while agents_active and iteration_count < max_iterations:
         iteration_count += 1
         logger.info(f"Agent execution cycle {iteration_count}")
+        
+        if stream:
+            stream.emit_status(f"🔄 Agent execution cycle {iteration_count}/{max_iterations} (Supervisor calls: {supervisor_call_count}/{max_supervisor_calls})", step="agents")
+            logger.info(f"Emitting progress: cycle {iteration_count}/{max_iterations}, supervisor calls {supervisor_call_count}/{max_supervisor_calls}")
         
         # Launch all agents in parallel for this iteration
         agent_tasks = []
@@ -615,12 +772,15 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     scraper=scraper,
                     stream=stream,
                     supervisor_queue=supervisor_queue,
-                    max_steps=8
+                    max_steps=agent_max_steps
                 )
             )
             agent_tasks.append((agent_id, task))
 
         logger.info(f"Launched {len(agent_tasks)} agents for cycle {iteration_count}")
+        
+        if stream:
+            stream.emit_status(f"🚀 Launched {len(agent_tasks)} agents for cycle {iteration_count}", step="agents")
 
         # Collect results from this cycle - wait for all agents in parallel
         cycle_findings = []
@@ -647,28 +807,83 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
         # If all agents report no tasks, stop
         if no_tasks_count == len(agent_tasks):
-            logger.info("All agents report no tasks, stopping agent execution")
+            logger.info("All agents report no tasks, stopping agent execution", 
+                       no_tasks_count=no_tasks_count, total_agents=len(agent_tasks))
+            if stream:
+                stream.emit_status("✅ All agents completed their tasks", step="agents")
             agents_active = False
             break
         
         # After each cycle, process supervisor queue if there are completions
         if supervisor_queue.size() > 0:
-            logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue")
+            # Check supervisor call limit BEFORE calling
+            if supervisor_call_count >= max_supervisor_calls:
+                logger.warning(f"Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}), agents will complete tasks without supervisor")
+                # Don't break - let agents complete their tasks without supervisor
+                # Just clear the queue and continue
+                while not supervisor_queue.queue.empty():
+                    try:
+                        supervisor_queue.queue.get_nowait()
+                        supervisor_queue.queue.task_done()
+                    except:
+                        break
+                # Continue loop - agents will finish their tasks
+                continue  # Skip supervisor call but continue agent execution
+            
+            logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (supervisor call {supervisor_call_count + 1}/{max_supervisor_calls})")
+            
+            if stream:
+                stream.emit_status(f"👔 Supervisor reviewing findings (call {supervisor_call_count + 1}/{max_supervisor_calls})", step="supervisor")
             
             # Call supervisor agent to review and assign new tasks
             from src.workflow.research.supervisor_agent import run_supervisor_agent
             
             try:
+                supervisor_call_count += 1
+                state["supervisor_call_count"] = supervisor_call_count
+                
+                # Get max_iterations from settings (centralized config)
+                if settings:
+                    supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
+                else:
+                    from src.config.settings import get_settings
+                    settings_obj = get_settings()
+                    supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
+                
                 decision = await run_supervisor_agent(
                     state=state,
                     llm=llm,
                     stream=stream,
-                    max_iterations=10
+                    supervisor_queue=supervisor_queue,  # Pass supervisor_queue
+                    max_iterations=supervisor_max_iterations
                 )
                 
                 # Update state with supervisor decision
                 state["should_continue"] = decision.get("should_continue", False)
                 state["replanning_needed"] = decision.get("replanning_needed", False)
+                
+                # If supervisor says stop, break the loop
+                if not decision.get("should_continue", False):
+                    logger.info("Supervisor decided to stop, breaking agent execution loop", 
+                               decision_reasoning=decision.get("reasoning", "")[:200])
+                    if stream:
+                        stream.emit_status("✅ Supervisor decided research is complete", step="supervisor")
+                    agents_active = False
+                    break
+                
+                # Check if we've reached the limit after this call
+                if supervisor_call_count >= max_supervisor_calls:
+                    logger.warning(f"Supervisor call limit reached after decision ({supervisor_call_count}/{max_supervisor_calls}), agents will complete tasks without supervisor")
+                    # Don't break - let agents complete their tasks
+                    # Clear queue and continue
+                    while not supervisor_queue.queue.empty():
+                        try:
+                            supervisor_queue.queue.get_nowait()
+                            supervisor_queue.queue.task_done()
+                        except:
+                            break
+                    # Continue loop - agents will finish their tasks
+                    continue  # Skip further supervisor calls but continue agent execution
                 
                 # Clear the queue after processing
                 while not supervisor_queue.queue.empty():
@@ -684,11 +899,135 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 logger.error("Supervisor processing failed", error=str(e))
 
     # Add findings to agent_findings (using reducer)
+    # Update iteration in state
+    new_iteration = current_iteration + iteration_count
+    logger.info(f"Agent execution completed", cycles=iteration_count, total_iteration=new_iteration, max_iterations=max_iterations, supervisor_calls=supervisor_call_count)
+    
+    # CRITICAL: If supervisor call limit reached, MUST finalize draft_report with ALL findings (no truncation)
+    # This is MANDATORY to ensure a comprehensive report is always available even if supervisor couldn't complete it
+    if supervisor_call_count >= max_supervisor_calls:
+        logger.info("MANDATORY: Supervisor call limit reached - finalizing draft_report with ALL findings", 
+                   supervisor_calls=supervisor_call_count, max_calls=max_supervisor_calls, findings_count=len(all_findings))
+    agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+    agent_file_service = stream.app_state.get("agent_file_service") if stream else None
+
+    if agent_memory_service and agent_file_service:
+        try:
+            # Read current draft_report
+            try:
+                draft_content = await agent_memory_service.file_manager.read_file("draft_report.md")
+            except FileNotFoundError:
+                draft_content = ""
+            
+            # Get ALL findings with FULL content (no truncation)
+            from datetime import datetime
+            query = state.get("query", "")
+            
+            # Build comprehensive findings section with ALL findings (no truncation)
+            findings_sections = []
+            for f in all_findings:
+                # Get FULL summary (no truncation)
+                full_summary = f.get('summary', 'No summary')
+                # Get ALL key findings (no truncation)
+                all_key_findings = f.get('key_findings', [])
+                # Get ALL sources info
+                sources = f.get('sources', [])
+                
+                findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+
+### Summary
+
+{full_summary}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
+
+### Sources ({len(sources)})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:20]]) if sources else "No sources"}
+""")
+            
+            findings_text = "\n\n".join(findings_sections)
+            
+            # Append to existing draft or create new
+            if len(draft_content) > 500:
+                # Append to existing draft
+                final_draft = f"""{draft_content}
+
+---
+
+## Final Synthesis (After Supervisor Limit)
+
+**Completed:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(all_findings)}
+**Supervisor Calls:** {supervisor_call_count}/{max_supervisor_calls}
+
+### Complete Findings from All Agents
+
+{findings_text}
+
+### Final Conclusion
+
+Research completed with {len(all_findings)} comprehensive findings from {len(agent_characteristics)} research agents. All agents have completed their tasks and provided full results.
+"""
+            else:
+                # Create new comprehensive draft
+                final_draft = f"""# Research Report Draft
+
+**Query:** {query}
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(all_findings)}
+**Supervisor Calls:** {supervisor_call_count}/{max_supervisor_calls}
+
+## Executive Summary
+
+This report synthesizes findings from {len(agent_characteristics)} research agents working on: {query}
+
+## Detailed Findings (Complete, No Truncation)
+
+{findings_text}
+
+## Conclusion
+
+Research completed with {len(all_findings)} findings from multiple agents covering various aspects of the topic. All agents have completed their tasks and provided comprehensive results.
+"""
+            
+            await agent_memory_service.file_manager.write_file("draft_report.md", final_draft)
+            logger.info("MANDATORY: Draft report finalized with ALL findings after supervisor limit (no truncation)", 
+                      draft_length=len(final_draft), findings_count=len(all_findings), supervisor_calls=supervisor_call_count)
+            if stream:
+                stream.emit_status(f"📝 Draft report finalized after supervisor limit ({len(final_draft)} chars, {len(all_findings)} findings)", step="supervisor")
+        except Exception as e:
+            logger.error("CRITICAL: Failed to finalize draft_report after supervisor limit - this must not happen!", 
+                       error=str(e), findings_count=len(all_findings), supervisor_calls=supervisor_call_count)
+            # Try to create at least a minimal draft report as last resort
+            try:
+                minimal_draft = f"""# Research Report
+
+**Query:** {state.get('query', 'Unknown')}
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(all_findings)}
+**Note:** Draft report creation failed, but findings are available.
+
+## Findings Summary
+
+{len(all_findings)} findings collected from research agents.
+"""
+                await agent_memory_service.file_manager.write_file("draft_report.md", minimal_draft)
+                logger.warning("Created minimal draft report as fallback after error", draft_length=len(minimal_draft))
+            except Exception as e2:
+                logger.error("CRITICAL: Even minimal draft report creation failed! Report generation will use raw findings.", error=str(e2))
+
     return {
         "agent_findings": all_findings,
         "findings": all_findings,  # Keep for supervisor review
         "findings_count": len(all_findings),
-        "iteration": current_iteration + iteration_count
+        "iteration": new_iteration,
+        "supervisor_call_count": supervisor_call_count
     }
 
 
@@ -713,16 +1052,25 @@ async def supervisor_review_enhanced_node(state: Dict[str, Any]) -> Dict[str, An
 
     # Use new supervisor agent with ReAct format
     try:
+        # Get max_iterations from settings (centralized config)
+        settings = state.get("settings")
+        if settings:
+            supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
+        else:
+            from src.config.settings import get_settings
+            settings_obj = get_settings()
+            supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
+        
         decision = await run_supervisor_agent(
             state=state,
             llm=llm,
             stream=stream,
-            max_iterations=10
+            max_iterations=supervisor_max_iterations
         )
         
         logger.info("Supervisor agent completed", decision=decision)
         return decision
-        
+
     except Exception as e:
         logger.error("Supervisor agent failed", error=str(e), exc_info=True)
         # Fallback: stop research
@@ -805,12 +1153,145 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
     stream = state.get("stream")
 
     if stream:
-        stream.emit_status("Generating final report...", step="report")
+        stream.emit_status("📄 Generating final report from draft...", step="report")
+        logger.info("Starting final report generation", findings_count=len(findings))
 
-    # Get memory service to read main document
+    # Get memory service to read draft report (supervisor's working document)
     agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+    draft_report = ""
     main_document = ""
+    
     if agent_memory_service:
+        try:
+            # Read draft_report.md - this is what supervisor wrote
+            draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+            logger.info("Read draft report", length=len(draft_report))
+            
+            # CRITICAL: Check if draft report is properly filled
+            # If draft report is too short or empty, create it from all findings
+            if len(draft_report) < 1000:
+                logger.warning("Draft report is too short or empty - creating comprehensive draft from all findings", 
+                             draft_length=len(draft_report), findings_count=len(findings))
+                
+                # Create comprehensive draft report from ALL findings (no truncation)
+                from datetime import datetime
+                query = state.get("query", "Unknown query")
+                
+                findings_sections = []
+                for f in findings:
+                    full_summary = f.get('summary', 'No summary')
+                    all_key_findings = f.get('key_findings', [])
+                    sources = f.get('sources', [])
+                    
+                    findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+
+### Summary
+
+{full_summary}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
+
+### Sources ({len(sources)})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:20]]) if sources else "No sources"}
+""")
+                
+                findings_text = "\n\n".join(findings_sections)
+                
+                # Create comprehensive draft
+                draft_report = f"""# Research Report Draft
+
+**Query:** {query}
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(findings)}
+
+## Executive Summary
+
+This report synthesizes findings from research agents working on: {query}
+
+## Detailed Findings (Complete, No Truncation)
+
+{findings_text}
+
+## Conclusion
+
+Research completed with {len(findings)} findings from multiple agents covering various aspects of the topic. All agents have completed their tasks and provided comprehensive results.
+"""
+                
+                # Save the created draft report
+                await agent_memory_service.file_manager.write_file("draft_report.md", draft_report)
+                logger.info("Created comprehensive draft report from all findings", 
+                          draft_length=len(draft_report), findings_count=len(findings))
+            else:
+                logger.info("Draft report contains comprehensive research", draft_length=len(draft_report))
+        except FileNotFoundError:
+            logger.warning("Draft report not found - MANDATORY: creating comprehensive draft from all findings", findings_count=len(findings))
+            if stream:
+                stream.emit_status("Creating draft report from all findings...", step="report")
+            
+            # MANDATORY: Create comprehensive draft report from ALL findings (no truncation)
+            from datetime import datetime
+            query = state.get("query", "Unknown query")
+            
+            findings_sections = []
+            for f in findings:
+                full_summary = f.get('summary', 'No summary')
+                all_key_findings = f.get('key_findings', [])
+                sources = f.get('sources', [])
+                
+                findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+
+### Summary
+
+{full_summary}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
+
+### Sources ({len(sources)})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:20]]) if sources else "No sources"}
+""")
+            
+            findings_text = "\n\n".join(findings_sections)
+            
+            # Create comprehensive draft
+            draft_report = f"""# Research Report Draft
+
+**Query:** {query}
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(findings)}
+
+## Executive Summary
+
+This report synthesizes findings from research agents working on: {query}
+
+## Detailed Findings (Complete, No Truncation)
+
+{findings_text}
+
+## Conclusion
+
+Research completed with {len(findings)} findings from multiple agents covering various aspects of the topic. All agents have completed their tasks and provided comprehensive results.
+"""
+            
+            # Save the created draft report
+            await agent_memory_service.file_manager.write_file("draft_report.md", draft_report)
+            logger.info("MANDATORY: Created comprehensive draft report from all findings (file was missing)", 
+                      draft_length=len(draft_report), findings_count=len(findings))
+        except Exception as e:
+            logger.warning("Could not read draft report", error=str(e))
+        
+        # Also read main.md for additional context (key insights only)
         try:
             main_document = await agent_memory_service.read_main_file()
             logger.info("Read main document", length=len(main_document))
@@ -824,21 +1305,38 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
         for f in findings
     ])
 
+    # Use draft_report as primary source, fallback to main_document and findings
+    primary_source = draft_report if draft_report else main_document
+    if not primary_source:
+        primary_source = findings_text
+        logger.error("CRITICAL: No draft report or main document - supervisor should have written draft_report.md")
+    
+    # Build main document section separately (avoid backslash in f-string expression)
+    main_doc_section = ""
+    if main_document and main_document != primary_source:
+        main_doc_preview = main_document[:5000]
+        main_doc_section = f"\nMain document (key insights):\n{main_doc_preview}\n\n"
+
     prompt = f"""Generate a comprehensive final research report.
 
 Query: {query}
 
-Main research document:
-{main_document}
+**IMPORTANT**: Use the Draft Research Report as the PRIMARY source - it contains the supervisor's comprehensive synthesis of all agent findings.
 
-Additional findings:
-{findings_text}
+Draft Research Report (supervisor's working document):
+{primary_source[:15000] if len(primary_source) > 15000 else primary_source}
+{main_doc_section}
+Additional findings (for reference if draft is incomplete):
+{findings_text[:5000] if findings_text else "None"}
 
-Create a well-structured report with:
-1. Executive summary
-2. Detailed sections with analysis
-3. Evidence-based conclusions
-4. Citations to sources
+Create a well-structured, comprehensive report with:
+1. Executive summary (synthesize the draft report's main points)
+2. Detailed sections with analysis (use the draft report's sections and findings)
+3. Evidence-based conclusions (based on draft report's analysis)
+4. Citations to sources (include all sources mentioned in draft report)
+
+CRITICAL: The draft report should be your PRIMARY source. It contains the supervisor's comprehensive synthesis.
+If draft report is incomplete or missing, use fallback sources but note this in the report.
 """
 
     try:
@@ -920,14 +1418,48 @@ Check for completeness, accuracy, and quality.
 
     except Exception as e:
         logger.error("Report generation failed", error=str(e))
-        # Fallback
-        fallback_report = f"""# Research Report: {query}
+        # Fallback - use draft_report if available, otherwise construct from main_document and findings
+        if draft_report and len(draft_report) > 1000:
+            # Use draft_report directly as it contains supervisor's synthesis
+            fallback_report = draft_report
+            logger.info("Using draft_report.md directly as final report (generation failed)")
+        elif main_document and len(main_document) > 500:
+            fallback_report = f"""# Research Report: {query}
 
-{main_document if main_document else findings_text}
+## Overview
+
+This report is based on the main research document due to report generation failure.
+
+{main_document}
+
+## Additional Findings
+
+{findings_text if findings_text else "No additional findings"}
 """
+        else:
+            # Last resort: use findings only
+            fallback_report = f"""# Research Report: {query}
+
+## Findings
+
+{findings_text if findings_text else "No findings available"}
+"""
+        
+        logger.warning("Using fallback report", source="draft_report" if draft_report else "main_document" if main_document else "findings")
+        
+        # Stream fallback report in chunks
+        if stream:
+            logger.info("Streaming fallback report", report_length=len(fallback_report))
+            chunk_size = 500
+            for i in range(0, len(fallback_report), chunk_size):
+                chunk = fallback_report[i:i+chunk_size]
+                stream.emit_report_chunk(chunk)
+                await asyncio.sleep(0.02)  # Small delay for smooth streaming
+            logger.info("Fallback report chunks streamed", total_chunks=(len(fallback_report) + chunk_size - 1) // chunk_size)
+        
         return {
             "final_report": fallback_report,
-            "confidence": "low"
+            "confidence": "medium" if draft_report else "low"
         }
 
 

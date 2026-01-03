@@ -143,22 +143,22 @@ class Settings(BaseSettings):
 
     # LLM Settings
     llm_mode: Literal["live", "mock"] = Field(default="live", description="LLM mode: live or mock")
-    chat_model: str = Field(default="openai:gpt-4.1-mini", description="Chat model for search answers")
-    chat_model_max_tokens: int = Field(default=8192, description="Chat model max tokens for writer synthesis")
+    chat_model: str = Field(default="z-ai:glm-4.7", description="Chat model for search answers")
+    chat_model_max_tokens: int = Field(default=16384, description="Chat model max tokens for writer synthesis")
 
     search_summarization_model: str = Field(
-        default="openai:gpt-4.1-mini", description="Model for summarizing scraped sources"
+        default="z-ai:glm-4.7", description="Model for summarizing scraped sources"
     )
-    search_summarization_model_max_tokens: int = Field(default=1024, description="Summarization model max tokens")
+    search_summarization_model_max_tokens: int = Field(default=16384, description="Summarization model max tokens")
 
-    research_model: str = Field(default="openai:gpt-4.1", description="Research model")
-    research_model_max_tokens: int = Field(default=4096, description="Research model max tokens")
+    research_model: str = Field(default="z-ai:glm-4.7", description="Research model")
+    research_model_max_tokens: int = Field(default=16384, description="Research model max tokens")
 
-    compression_model: str = Field(default="openai:gpt-4.1-mini", description="Compression model")
-    compression_model_max_tokens: int = Field(default=2048, description="Compression model max tokens")
+    compression_model: str = Field(default="z-ai:glm-4.7", description="Compression model")
+    compression_model_max_tokens: int = Field(default=16384, description="Compression model max tokens")
 
-    final_report_model: str = Field(default="openai:gpt-4.1", description="Final report model")
-    final_report_model_max_tokens: int = Field(default=8192, description="Final report model max tokens")
+    final_report_model: str = Field(default="z-ai:glm-4.7", description="Final report model")
+    final_report_model_max_tokens: int = Field(default=16384, description="Final report model max tokens")
 
     # Anthropic (for Claude models)
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API key")
@@ -170,8 +170,14 @@ class Settings(BaseSettings):
     balanced_max_iterations: int = Field(default=6, description="Balanced mode max iterations")
     balanced_max_concurrent: int = Field(default=3, description="Balanced mode max concurrent researchers")
 
-    quality_max_iterations: int = Field(default=25, description="Quality mode max iterations")
-    quality_max_concurrent: int = Field(default=4, description="Quality mode max concurrent researchers")
+    quality_max_iterations: int = Field(default=15, description="Quality mode max iterations")  # Old value: 25
+    quality_max_concurrent: int = Field(default=3, description="Quality mode max concurrent researchers")  # Old value: 4
+    
+    # Deep Research Limits (centralized configuration)
+    deep_research_max_supervisor_calls: int = Field(default=6, description="Max supervisor calls in deep research")  # Old value: 10
+    deep_research_agent_max_steps: int = Field(default=5, description="Max steps per agent task in deep research")  # Old value: 8
+    deep_research_supervisor_max_iterations: int = Field(default=10, description="Max ReAct iterations for supervisor agent")  # Old value: 15 (was increased from 10)
+    deep_research_default_max_iterations: int = Field(default=15, description="Default max iterations for deep research cycles")  # Old value: 25
 
     # Advanced Settings
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")

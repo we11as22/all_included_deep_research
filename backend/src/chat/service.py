@@ -283,23 +283,19 @@ class ChatSearchService:
                 scraped_count=len(scraped_content)
             )
 
-            # Dedupe and filter
-            results = self._dedupe_results(results, per_domain_limit=2)
-            results = self._filter_blocked_results(results)
+            # Like Perplexica: simple deduplication only, no reranking, no filtering
+            # Perplexica doesn't rerank or filter - it trusts SearXNG's ranking completely
+            # Only dedupe by URL (merge content for duplicates)
+            results = self._dedupe_results_simple(results)  # Simple dedupe like Perplexica
+            # NO filtering - Perplexica doesn't filter results
             
-            logger.info("Before reranking", 
+            logger.info("Results after deduplication", 
                        query=query,
                        results_count=len(results),
                        top_titles=[r.title[:50] for r in results[:5]])
             
-            # Final reranking with original query (CRITICAL: use original user query, not generated queries!)
-            results = await self._rerank_results(query, results, top_k=tuning.rerank_top_k)
-            
-            logger.info("After reranking", 
-                       query=query,
-                       results_count=len(results),
-                       top_titles=[r.title[:50] for r in results[:5]],
-                       top_scores=[round(r.score, 3) for r in results[:5]])
+            # NO reranking - like Perplexica, trust SearXNG's ranking
+            # Reranking can actually make results worse if embeddings are not good
             
             self._emit_sources(stream, results, label=tuning.label)
 
@@ -566,25 +562,67 @@ class ChatSearchService:
             logger.error("rerank_failed", error=str(exc), exc_info=True)
             return results[:top_k] if top_k else results
 
+    def _dedupe_results_simple(
+        self,
+        results: list[SearchResult],
+    ) -> list[SearchResult]:
+        """
+        Simple deduplication like Perplexica: merge content for duplicate URLs.
+        No domain limits - Perplexica doesn't limit results per domain.
+        """
+        seen_urls: dict[str, int] = {}  # url -> index in deduped list
+        deduped: list[SearchResult] = []
+        
+        for result in results:
+            if not result.url:
+                # Keep results without URL
+                deduped.append(result)
+                continue
+                
+            normalized_url = result.url.lower().strip()
+            
+            if normalized_url in seen_urls:
+                # Duplicate URL - merge content like Perplexica
+                existing_index = seen_urls[normalized_url]
+                existing_result = deduped[existing_index]
+                # Merge snippets if different
+                if result.snippet and result.snippet not in existing_result.snippet:
+                    existing_result.snippet += f"\n\n{result.snippet}"
+                # Keep the result with better title if available
+                if result.title and len(result.title) > len(existing_result.title):
+                    existing_result.title = result.title
+            else:
+                # New URL - add to results
+                seen_urls[normalized_url] = len(deduped)
+                deduped.append(result)
+        
+        return deduped
+    
     def _dedupe_results(
         self,
         results: list[SearchResult],
         per_domain_limit: int | None = None,
     ) -> list[SearchResult]:
-        seen = set()
-        domain_counts: dict[str, int] = defaultdict(int)
-        deduped = []
-        for result in results:
-            if result.url in seen:
-                continue
-            domain = _normalize_domain(result.url)
-            if per_domain_limit and domain:
-                if domain_counts[domain] >= per_domain_limit:
+        """Legacy method - kept for compatibility."""
+        if per_domain_limit:
+            # Use old method with domain limit
+            seen = set()
+            domain_counts: dict[str, int] = defaultdict(int)
+            deduped = []
+            for result in results:
+                if result.url in seen:
                     continue
-                domain_counts[domain] += 1
-            seen.add(result.url)
-            deduped.append(result)
-        return deduped
+                domain = _normalize_domain(result.url)
+                if per_domain_limit and domain:
+                    if domain_counts[domain] >= per_domain_limit:
+                        continue
+                    domain_counts[domain] += 1
+                seen.add(result.url)
+                deduped.append(result)
+            return deduped
+        else:
+            # Use simple deduplication
+            return self._dedupe_results_simple(results)
 
     def _filter_blocked_results(self, results: list[SearchResult]) -> list[SearchResult]:
         if not results:

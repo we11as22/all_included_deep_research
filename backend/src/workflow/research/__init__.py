@@ -13,7 +13,6 @@ from src.workflow.research.state import ResearchState, create_initial_state
 from src.workflow.research.queue import SupervisorQueue, get_supervisor_queue, cleanup_supervisor_queue
 from src.workflow.research.researcher import run_researcher_agent
 from src.workflow.research.nodes import (
-    search_memory_node,
     run_deep_search_node,
     clarify_with_user_node,
     analyze_query_node,
@@ -34,7 +33,6 @@ __all__ = [
     "get_supervisor_queue",
     "cleanup_supervisor_queue",
     "run_researcher_agent",
-    "search_memory_node",
     "plan_research_node",
     "spawn_agents_node",
     "execute_agents_node",

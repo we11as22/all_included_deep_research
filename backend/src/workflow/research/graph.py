@@ -11,7 +11,6 @@ from langgraph.checkpoint.memory import MemorySaver
 
 from src.workflow.research.state import ResearchState, create_initial_state
 from src.workflow.research.nodes import (
-    search_memory_node,
     run_deep_search_node,
     clarify_with_user_node,
     analyze_query_node,
@@ -99,10 +98,39 @@ def should_continue_research(state: ResearchState) -> str:
 def should_ask_clarification(state: ResearchState) -> str:
     """Conditional routing after clarification check."""
     clarification_needed = state.get("clarification_needed", False)
+    chat_history = state.get("chat_history", [])
     
     if clarification_needed:
-        logger.info("Clarification needed, pausing for user input")
-        return "wait_for_user"
+        # Check if user has answered the clarification questions
+        # Look for assistant message with clarification, then check if there's a user response after it
+        has_user_answer = False
+        found_clarification = False
+        
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "").lower()
+                if "clarification" in content or "🔍" in content or "clarify" in content:
+                    found_clarification = True
+                    # Check if next message is from user (user answered)
+                    if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                        has_user_answer = True
+                        logger.info("User has answered clarification questions", answer_preview=chat_history[i + 1].get("content", "")[:100])
+                        break
+        
+        if found_clarification and not has_user_answer:
+            # Questions were sent but user hasn't answered yet - STOP and wait
+            logger.info("Clarification questions sent, waiting for user answer - INTERRUPTING GRAPH")
+            # Return special value that will trigger interrupt
+            # We'll use interrupt_before on analyze_query node
+            return "wait_for_user"
+        elif has_user_answer:
+            # User answered, proceed with research
+            logger.info("User answered clarification, proceeding with research")
+            return "proceed"
+        else:
+            # Questions were just sent, wait for answer
+            logger.info("Clarification needed, waiting for user input")
+            return "wait_for_user"
     else:
         logger.info("No clarification needed, proceeding with research")
         return "proceed"
@@ -124,7 +152,7 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
     workflow = StateGraph(ResearchState)
 
     # Add nodes
-    workflow.add_node("search_memory", search_memory_node)
+    # Note: search_memory_node removed - agent memory is created empty and populated during research
     workflow.add_node("run_deep_search", run_deep_search_node)
     workflow.add_node("clarify", clarify_with_user_node)
     workflow.add_node("analyze_query", analyze_query_node)
@@ -136,23 +164,36 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
     workflow.add_node("generate_report", generate_final_report_enhanced_node)
 
     # Define edges
-    workflow.set_entry_point("search_memory")
-
-    workflow.add_edge("search_memory", "run_deep_search")
+    workflow.set_entry_point("run_deep_search")
     workflow.add_edge("run_deep_search", "clarify")
     
     # Conditional edge for clarification
-    # For now, always proceed (interactive clarification would require different architecture)
-    # To implement interactive: would need to pause graph, emit questions, wait for user response
+    # If user hasn't answered, stop graph (return END)
+    # When user answers and graph is resumed, it will proceed to analyze_query
     workflow.add_conditional_edges(
         "clarify",
         should_ask_clarification,
         {
-            "wait_for_user": "analyze_query",  # Would pause here in interactive mode
-            "proceed": "analyze_query"
+            "wait_for_user": END,  # Stop graph and wait for user input - graph will be resumed when user answers
+            "proceed": "analyze_query"  # User answered, continue with research
         }
     )
-    workflow.add_edge("analyze_query", "plan_research")
+    # Check if analyze_query stopped waiting for user
+    def should_continue_after_analysis(state: ResearchState) -> str:
+        """Check if we should continue after analysis or stop waiting for user."""
+        if state.get("clarification_waiting", False) or state.get("should_stop", False):
+            logger.info("Stopping graph - waiting for user clarification answer")
+            return "stop"
+        return "continue"
+    
+    workflow.add_conditional_edges(
+        "analyze_query",
+        should_continue_after_analysis,
+        {
+            "stop": END,  # Stop and wait for user
+            "continue": "plan_research"  # Continue with research
+        }
+    )
     workflow.add_edge("plan_research", "spawn_agents")
     workflow.add_edge("spawn_agents", "execute_agents")
     workflow.add_edge("execute_agents", "supervisor_react")
@@ -231,6 +272,17 @@ async def run_research_graph(
         mode_config=mode_config,
         settings=settings,
     )
+    
+    # CRITICAL: Set runtime dependencies in context variable so nodes can restore them
+    from src.workflow.research.nodes import runtime_deps_context
+    runtime_deps_context.set({
+        "stream": stream,
+        "llm": llm,
+        "search_provider": search_provider,
+        "scraper": scraper,
+        "settings": settings,
+    })
+    logger.info("Runtime dependencies set in context", has_stream=stream is not None, has_llm=llm is not None)
 
     # Store runtime dependencies separately (they can't be serialized)
     # Try to get memory services from stream.app_state if available
@@ -268,9 +320,13 @@ async def run_research_graph(
 
     try:
         # Run graph with filtered state (no non-serializable fields)
+        # Increase recursion limit to prevent premature termination
         final_state = await graph.ainvoke(
             filtered_state,
-            config={"configurable": {"thread_id": session_id}}
+            config={
+                "configurable": {"thread_id": session_id},
+                "recursion_limit": 100  # Increased from default 25 to handle complex workflows
+            }
         )
         
         # Restore runtime deps to final_state for return

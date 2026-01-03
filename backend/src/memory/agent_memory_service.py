@@ -33,13 +33,17 @@ class AgentMemoryService:
         self,
         note: AgentNote,
         agent_id: str,
+        agent_file_service: Any = None,
     ) -> str:
         """
-        Save agent note to items/ directory and update main.md.
+        Save agent note to items/ directory.
+        
+        Also adds note to agent's personal file (agents/{agent_id}.md) Notes section.
 
         Args:
             note: Agent note to save
-            agent_id: Optional agent ID for filename
+            agent_id: Agent ID for filename and personal file update
+            agent_file_service: Optional agent file service to update agent's personal file
 
         Returns:
             File path of saved note
@@ -51,13 +55,69 @@ class AgentMemoryService:
         filename = f"{timestamp}_{safe_title}{agent_suffix}.md"
         file_path = f"{self.items_dir}/{filename}"
 
-        # Format note content with agent metadata
+        # Format note content with agent metadata and useful context
         content = self._format_note_content(note, agent_id)
 
-        # Save note file
+        # Save note file to items/
         await self.file_manager.write_file(file_path, content)
 
-        # Update main.md with reference
+        # Add note to agent's personal file Notes section
+        if agent_file_service:
+            try:
+                agent_file = await agent_file_service.read_agent_file(agent_id)
+                existing_notes = agent_file.get("notes", [])
+                
+                # Filter notes by importance - only save informative notes
+                # Check if note contains actual information, not just metadata
+                note_summary_lower = (note.summary or "").lower()
+                note_title_lower = (note.title or "").lower()
+                
+                # Skip notes that are just metadata (not informative)
+                is_metadata_only = any([
+                    "found" in note_summary_lower and "sources" in note_summary_lower and "query" in note_summary_lower,
+                    "search:" in note_title_lower and len(note.summary or "") < 100,
+                    note_summary_lower.count("found") > 0 and "relevant sources" in note_summary_lower,
+                    "key sources:" in note_summary_lower and len(note.summary or "") < 150,
+                ])
+                
+                # Check if note has substantial content (not just links or titles)
+                has_substantial_content = (
+                    len(note.summary or "") > 200 or  # Has detailed summary
+                    any(keyword in note_summary_lower for keyword in [
+                        "discovery", "finding", "insight", "conclusion", "fact", "data",
+                        "information", "evidence", "analysis", "pattern", "trend"
+                    ])
+                )
+                
+                # Format note for agent's personal file
+                note_text = f"{note.title}: {note.summary}"
+                if note.urls:
+                    note_text += f" | Sources: {len(note.urls)}"
+                
+                # Only save if note is informative and not duplicate
+                if note_text and not is_metadata_only and has_substantial_content and note_text not in existing_notes:
+                    existing_notes.append(note_text)
+                    # Keep only last 20 important notes to prevent context bloat
+                    existing_notes = existing_notes[-20:]
+                    await agent_file_service.write_agent_file(
+                        agent_id=agent_id,
+                        notes=existing_notes
+                    )
+                    logger.info(f"Added important note to agent {agent_id} personal file", note_title=note.title, total_notes=len(existing_notes))
+                else:
+                    if is_metadata_only:
+                        logger.debug(f"Metadata-only note skipped for agent {agent_id}", note_title=note.title)
+                    elif not has_substantial_content:
+                        logger.debug(f"Low-content note skipped for agent {agent_id}", note_title=note.title, summary_length=len(note.summary or ""))
+                    elif note_text in existing_notes:
+                        logger.debug(f"Duplicate note skipped for agent {agent_id}", note_title=note.title)
+                    else:
+                        logger.debug(f"Empty note skipped for agent {agent_id}", note_title=note.title)
+            except Exception as e:
+                logger.warning(f"Failed to add note to agent {agent_id} personal file", error=str(e))
+
+        # Don't update main.md - items stay in items/ directory
+        # Main.md should only contain key insights from supervisor
         await self._update_main_file(file_path, note.title, note.summary, note.tags)
 
         logger.info("Agent note saved", file_path=file_path, agent_id=agent_id)
@@ -112,7 +172,7 @@ class AgentMemoryService:
         return safe
 
     def _format_note_content(self, note: AgentNote, agent_id: str) -> str:
-        """Format note as markdown content with agent metadata."""
+        """Format note as markdown content with agent metadata and useful context."""
         lines = [
             f"# {note.title}",
             "",
@@ -121,15 +181,36 @@ class AgentMemoryService:
         ]
         if note.tags:
             lines.append(f"**Tags:** {', '.join(note.tags)}")
-        if note.urls:
-            lines.append("")
-            lines.append("## Sources")
-            for url in note.urls:
-                lines.append(f"- {url}")
+        
         lines.append("")
         lines.append("## Summary")
         lines.append("")
         lines.append(note.summary)
+        
+        # Add detailed findings if available in summary
+        # The summary should contain key findings, not just "Found X sources"
+        if "Found" in note.summary and "sources" in note.summary and len(note.summary) < 200:
+            # This is a basic note, add context about what was found
+            lines.append("")
+            lines.append("## Key Findings")
+            lines.append("")
+            lines.append("<!-- Add specific findings, facts, and insights discovered from these sources -->")
+            lines.append("<!-- Include: important facts, data points, expert opinions, comparisons, historical context -->")
+        
+        if note.urls:
+            lines.append("")
+            lines.append("## Sources")
+            lines.append("")
+            lines.append("Use these sources to gather detailed information:")
+            for i, url in enumerate(note.urls, 1):
+                lines.append(f"{i}. [{url}]({url})")
+            lines.append("")
+            lines.append("**Action Items:**")
+            lines.append("- Review each source for relevant information")
+            lines.append("- Extract key facts, statistics, and expert opinions")
+            lines.append("- Note any contradictions or gaps in information")
+            lines.append("- Identify follow-up research directions")
+        
         return "\n".join(lines)
 
     def _extract_title_from_content(self, content: str) -> str:
@@ -160,57 +241,25 @@ class AgentMemoryService:
         return ""
 
     async def _update_main_file(self, file_path: str, title: str, summary: str, tags: list[str]) -> None:
-        """Update main.md with reference to new item."""
+        """
+        Update main.md with reference to new item.
+        
+        CRITICAL: main.md should only contain KEY INSIGHTS, not all items.
+        Items are stored in items/ directory and can be referenced when needed.
+        Only add to main.md if it contains significant findings or key insights.
+        """
         try:
             content = await self.read_main_file()
         except Exception:
             content = self._get_initial_main_content()
 
-        # Find or create "## Items" section
-        items_section_start = content.find("## Items")
+        # DON'T automatically add all items to main.md
+        # Items are stored in items/ directory for reference
+        # Main.md should only contain key insights and progress updates
+        # This prevents main.md from becoming bloated with duplicate links
         
-        if items_section_start == -1:
-            # Items section doesn't exist, add it after Overview
-            if "## Overview" in content:
-                overview_end = content.find("\n## ", content.find("## Overview") + len("## Overview"))
-                if overview_end != -1:
-                    content = content[:overview_end] + "\n\n## Items\n\n" + content[overview_end:]
-                else:
-                    content += "\n\n## Items\n\n"
-            else:
-                content += "\n\n## Items\n\n"
-            items_section_start = content.find("## Items")
-        
-        # Check if item already exists (by title)
-        items_section = content[items_section_start:]
-        if f"### {title}" in items_section:
-            # Item already exists, skip or update
-            logger.info("Item already exists in main.md", title=title)
-            return
-        
-        # Find where to insert (after ## Items header, before next ## section)
-        items_content_start = items_section.find("\n", items_section.find("## Items")) + 1
-        next_section = items_section.find("\n## ", items_content_start)
-        
-        if next_section != -1:
-            # Insert before next section
-            insert_pos = items_section_start + next_section
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 2000)}\n\n"
-            content = content[:insert_pos] + new_item + content[insert_pos:]
-        else:
-            # Append to end of Items section
-            insert_pos = items_section_start + items_content_start
-            new_item = f"### {title}\n\n**File:** [{file_path}]({file_path})\n\n{summarize_text(summary, 2000)}\n\n"
-            content = content[:insert_pos] + new_item + content[insert_pos:]
-
-        # Update last_updated
-        content = re.sub(
-            r"Last Updated: \d{4}-\d{2}-\d{2}",
-            f"Last Updated: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}",
-            content,
-        )
-
-        await self.file_manager.write_file(self.main_file, content)
+        logger.debug("Item saved to items/ directory", file_path=file_path, title=title)
+        # Items are available in items/ directory, main.md stays focused on key insights
 
     def _get_initial_main_content(self) -> str:
         """Get initial main.md content."""

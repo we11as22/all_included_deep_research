@@ -42,57 +42,53 @@ class SearXNGSearchProvider(SearchProvider):
         """
         Build search parameters for SearXNG.
         
-        Language handling:
-        - If language is empty string, SearXNG will auto-detect
-        - We provide hints for Russian (Cyrillic detection)
-        - Otherwise use configured language
+        Like Perplexica: minimal params - just query and format.
+        Let SearXNG handle language detection, safesearch defaults, etc.
+        Only specify engines if explicitly provided (for specialized searches).
         """
-        language = self._select_language(query)
         params: dict[str, str | int] = {
             "q": query,
             "format": "json",
-            "safesearch": self.safesearch,
         }
         
-        # Only add language parameter if it's not empty (let SearXNG auto-detect if empty)
-        if language:
-            params["language"] = language
+        # Only add safesearch if explicitly configured (not default)
+        if self.safesearch != 0:
+            params["safesearch"] = self.safesearch
         
+        # Like Perplexica: NEVER specify language - always let SearXNG auto-detect
+        # SearXNG is smart enough to detect language from query content
+        
+        # Only add categories if explicitly configured
         if self.categories:
             params["categories"] = ",".join(self.categories)
-        engines = engines_override if engines_override is not None else self.engines
-        if engines:
-            params["engines"] = ",".join(engines)
+        
+        # Handle engines: only specify if explicitly provided (like Perplexica)
+        # For web_search: don't specify engines - let SearXNG auto-select
+        # For specialized searches (academic, social): specify engines
+        if engines_override is not None:
+            # engines_override explicitly provided
+            if engines_override:  # Non-empty list
+                params["engines"] = ",".join(engines_override)
+            # If empty list, don't add engines param - SearXNG auto-selects
+        elif self.engines:
+            # Use configured engines from settings (if any)
+            params["engines"] = ",".join(self.engines)
+        # If no engines specified at all, SearXNG will auto-select (like Perplexica)
         return params
 
     def _select_language(self, query: str) -> str:
         """
         Select language for SearXNG query.
         
-        Universal language support:
-        - SearXNG can auto-detect language from query content
-        - We provide hints for known languages (e.g., Russian from Cyrillic)
-        - If language is empty string, SearXNG will auto-detect
-        - Otherwise use configured language
+        Like Perplexica: ALWAYS return empty string for auto-detect.
+        SearXNG is smart enough to detect language from query content automatically.
+        This works for all languages (English, Russian, Chinese, Japanese, Arabic, etc.)
         
         Returns:
-            Language code (e.g., "en", "ru", "de") or empty string for auto-detect
+            Always empty string (auto-detect)
         """
-        if not query:
-            # If no query, use configured language or auto-detect
-            return self.language if self.language else ""
-        
-        # Auto-detect Russian from Cyrillic characters
-        if self._contains_cyrillic(query):
-            # If default is English or empty, use Russian
-            if self.language in {"en", ""}:
-                return "ru"
-            # Otherwise keep configured language
-        
-        # Use configured language, or empty string to let SearXNG auto-detect
-        # Empty string means SearXNG will auto-detect based on query content
-        # This works for all languages (Chinese, Japanese, Arabic, etc.)
-        return self.language if self.language else ""
+        # Like Perplexica: never specify language, always auto-detect
+        return ""
 
     @staticmethod
     def _contains_cyrillic(text: str) -> bool:
@@ -148,6 +144,20 @@ class SearXNGSearchProvider(SearchProvider):
 
                     if data.get("results") and len(data.get("results", [])) > 0:
                         first_result = data["results"][0]
+                        # Log first few results to debug relevance
+                        top_3_results = []
+                        for r in data.get("results", [])[:3]:
+                            top_3_results.append({
+                                "title": r.get("title", "")[:80] if isinstance(r, dict) else "",
+                                "url": r.get("url", "")[:100] if isinstance(r, dict) else "",
+                                "content_preview": (r.get("content", "") or r.get("snippet", ""))[:100] if isinstance(r, dict) else ""
+                            })
+                        logger.info(
+                            "SearXNG top results preview",
+                            query=query[:100],
+                            top_3_results=top_3_results,
+                            label=label,
+                        )
                         logger.debug(
                             "SearXNG first result structure",
                             result_keys=list(first_result.keys()) if isinstance(first_result, dict) else "not_dict",
@@ -184,7 +194,8 @@ class SearXNGSearchProvider(SearchProvider):
                         logger.debug("Skipping result without URL", index=idx, item_keys=list(item.keys()), label=label)
                         continue
 
-                    content = item.get("content") or item.get("snippet") or ""
+                    # Like Perplexica: use content || title (not snippet)
+                    content = item.get("content") or item.get("title") or ""
                     title = item.get("title") or item.get("url", "")[:100]
 
                     results.append(
@@ -208,6 +219,21 @@ class SearXNGSearchProvider(SearchProvider):
                 # Semantic reranking (embeddings) will handle proper ranking by query similarity
                 filtered_results = self._filter_results_by_query(query, results, max_results)
 
+                # Log top results for debugging relevance
+                top_results_info = []
+                for r in filtered_results[:5]:
+                    domain = ""
+                    try:
+                        from urllib.parse import urlparse
+                        domain = urlparse(r.url).netloc if r.url else ""
+                    except:
+                        pass
+                    top_results_info.append({
+                        "title": r.title[:60] if r.title else "",
+                        "domain": domain,
+                        "url": r.url[:80] if r.url else ""
+                    })
+                
                 logger.info(
                     "SearXNG search completed",
                     query=query[:100],
@@ -215,6 +241,7 @@ class SearXNGSearchProvider(SearchProvider):
                     total_results=total_results,
                     raw_results_processed=len(raw_results),
                     number_of_results_from_api=data.get("number_of_results", 0),
+                    top_results=top_results_info,
                     label=label,
                 )
 
@@ -294,6 +321,9 @@ class SearXNGSearchProvider(SearchProvider):
     async def search(self, query: str, max_results: int = 10) -> SearchResponse:
         """
         Search using SearXNG API.
+        
+        Like Perplexica: simple, single request. No fallback logic.
+        Let SearXNG handle engine selection automatically.
 
         Args:
             query: Search query
@@ -304,41 +334,15 @@ class SearXNGSearchProvider(SearchProvider):
         """
         try:
             async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                primary = await self._search_once(
+                # Simple search like Perplexica: one request, no fallback
+                # SearXNG will automatically choose working engines
+                return await self._search_once(
                     session,
                     query,
                     max_results=max_results,
-                    engines_override=None,
-                    label="primary",
+                    engines_override=[],  # Empty = SearXNG auto-selects engines
+                    label="search",
                 )
-
-                if not self._should_fallback(primary.results, max_results):
-                    return primary
-
-                fallback = await self._search_once(
-                    session,
-                    query,
-                    max_results=max_results,
-                    engines_override=["google", "bing"],
-                    label="fallback",
-                )
-
-                if self._prefer_fallback(primary.results, fallback.results):
-                    primary_domains, primary_total = self._result_diversity(primary.results)
-                    fallback_domains, fallback_total = self._result_diversity(fallback.results)
-                    logger.info(
-                        "SearXNG fallback used",
-                        query=query,
-                        primary_results=len(primary.results),
-                        fallback_results=len(fallback.results),
-                        primary_domains=primary_domains,
-                        fallback_domains=fallback_domains,
-                        primary_total=primary_total,
-                        fallback_total=fallback_total,
-                    )
-                    return fallback
-
-                return primary
         except aiohttp.ClientError as e:
             logger.error("SearXNG search failed - connection error", error=str(e), query=query)
             return SearchResponse(query=query, results=[], total_results=0)
