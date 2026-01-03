@@ -57,12 +57,43 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat }: ChatSide
     }
   };
 
+  const handleClearAll = async () => {
+    if (!confirm('Are you sure you want to delete ALL chats? This action cannot be undone.')) {
+      return;
+    }
+
+    try {
+      setLoading(true);
+      // Delete all chats one by one
+      await Promise.all(chats.map(chat => deleteChat(chat.id)));
+      setChats([]);
+      onNewChat();
+    } catch (error) {
+      console.error('Failed to clear all chats:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   return (
     <div className="w-64 border-r border-border bg-background/50 p-4 flex flex-col h-full">
-      <Button onClick={handleNewChat} className="w-full mb-4" size="sm">
+      <Button onClick={handleNewChat} className="w-full mb-2" size="sm">
         <Plus className="h-4 w-4 mr-2" />
         New Chat
       </Button>
+
+      {chats.length > 0 && (
+        <Button
+          onClick={handleClearAll}
+          variant="destructive"
+          className="w-full mb-4"
+          size="sm"
+          disabled={loading}
+        >
+          <Trash2 className="h-4 w-4 mr-2" />
+          Clear All
+        </Button>
+      )}
 
       <div className="flex-1 overflow-y-auto space-y-1">
         {loading ? (

@@ -5,7 +5,7 @@ Synthesizes research results into cited answers.
 """
 
 import structlog
-from typing import Any, Dict, List, Literal
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -24,8 +24,8 @@ class CitedAnswer(BaseModel):
     answer: str = Field(
         description="Final answer with inline citations [1], [2], etc. in markdown format"
     )
-    citations: List[Dict[str, str]] = Field(
-        description="List of sources: [{number: '1', url: '...', title: '...'}]"
+    citations: list[str] = Field(
+        description="List of source URLs as strings: ['https://example.com', 'https://example2.com', ...]"
     )
     confidence: Literal["low", "medium", "high"] = Field(
         description="Confidence in answer based on source quality and coverage"
@@ -69,22 +69,30 @@ Formatting:
         return base_prompt + """
 MODE: SPEED
 
-Keep it concise but informative:
-- 200-400 words
-- Focus on key points
-- Quick, clear answer
+Provide a complete, informative answer:
+- 400-600 words minimum
+- Focus on key points but cover them fully
+- Use ALL provided sources - each source has valuable information
+- Clear structure with sections
 - Still cite everything!
+
+IMPORTANT: Don't just summarize snippets - synthesize information from ALL sources into a comprehensive answer.
 """
 
     elif mode == "balanced":
         return base_prompt + """
 MODE: BALANCED
 
-Provide thorough coverage:
-- 500-800 words
-- Well-organized sections
-- Comprehensive but not exhaustive
-- Cover main aspects of the topic
+Provide thorough, comprehensive coverage:
+- 800-1200 words minimum
+- Well-organized sections with clear structure
+- Use ALL provided sources - synthesize information from each
+- Cover main aspects of the topic in depth
+- Include specific details, data, and examples from sources
+- Compare different perspectives if sources provide them
+
+IMPORTANT: You have many sources available - use them all! Don't just pick a few.
+Each source adds value - synthesize them into a complete picture.
 """
 
     else:  # quality
@@ -92,12 +100,18 @@ Provide thorough coverage:
 MODE: QUALITY
 
 Create an in-depth, comprehensive response:
-- Minimum 1000-2000 words
-- Multiple sections with clear structure
-- Cover the topic from all angles
-- Include background, details, implications
-- Like a research report or detailed article
-- Deep analysis, not just summary
+- Minimum 1500-3000 words
+- Multiple sections with clear structure (Introduction, Main sections, Conclusion)
+- Cover the topic from ALL angles
+- Include background, detailed analysis, implications, examples
+- Like a comprehensive research report or detailed article
+- Deep analysis with specific data and evidence from sources
+
+CRITICAL: Use EVERY source provided! You have extensive research - leverage all of it!
+- Synthesize information from all sources into a coherent narrative
+- Include specific quotes, data, and facts from sources
+- Compare and contrast different perspectives
+- Build a complete, authoritative answer
 """
 
 
@@ -106,7 +120,7 @@ Create an in-depth, comprehensive response:
 
 async def writer_agent(
     query: str,
-    research_results: Dict[str, Any],
+    research_results: dict[str, Any],
     llm: Any,
     stream: Any,
     mode: str = "balanced",
@@ -138,21 +152,25 @@ async def writer_agent(
     # Prepare citation-ready sources
     all_sources = []
 
-    # Add search results
+    # Add search results (use full snippet - it's already short from search engine)
     for source in sources:
         all_sources.append({
             "title": source.get("title", "Untitled"),
             "url": source.get("url", ""),
-            "content": source.get("snippet", "")[:500]
+            "content": source.get("snippet", "")  # Full snippet, no truncation
         })
 
-    # Add scraped content (richer information)
+    # Add scraped content (richer information with summaries!)
     for scraped_item in scraped:
         if "error" not in scraped_item:
+            # Prefer summary (comprehensive 800-token context) over content
+            # Content field already contains summary from scrape_url_handler
+            content = scraped_item.get("content", "")
+
             all_sources.append({
                 "title": scraped_item.get("title", "Untitled"),
                 "url": scraped_item.get("url", ""),
-                "content": scraped_item.get("content", "")[:1500]  # More context from scraped
+                "content": content  # Already summarized by LLM in scrape_url_handler
             })
 
     # Deduplicate by URL
@@ -164,9 +182,11 @@ async def writer_agent(
             seen_urls.add(url)
             unique_sources.append(source)
 
-    # Limit sources (top 10 for writer context)
-    unique_sources = unique_sources[:10]
-
+    # Use all available sources - don't limit artificially
+    # LLM can handle context and decide which to use
+    # In speed mode: typically 3-5 sources
+    # In balanced mode: typically 8-12 sources
+    # In quality mode: typically 15-20 sources
     logger.info(f"Writer synthesizing from {len(unique_sources)} sources")
 
     # Build source context for LLM
@@ -179,13 +199,23 @@ async def writer_agent(
     system_prompt = get_writer_prompt(mode)
 
     # Build user prompt
+    sources_count = len(unique_sources)
     user_prompt = f"""Query: {query}
 
-Research sources:
+Research sources ({sources_count} sources provided - USE ALL OF THEM):
 {source_context}
 
 Write a comprehensive answer with inline citations [1], [2], etc.
-Remember: CITE EVERY FACT. Return JSON with: reasoning, answer, citations (list), confidence.
+
+IMPORTANT INSTRUCTIONS:
+- Use information from ALL {sources_count} sources - each one has valuable content
+- Synthesize information from all sources into a coherent, complete answer
+- Don't just use the first few sources - leverage ALL available research
+- Include specific details, data, and examples from different sources
+- If sources provide different perspectives, present them all with citations
+
+Remember: CITE EVERY FACT. Return JSON with: reasoning, answer, citations (list of URL strings), confidence.
+CRITICAL: citations must be a list of URL strings, e.g. ["https://example.com", "https://example2.com"]
 """
 
     try:

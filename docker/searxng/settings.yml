@@ -27,21 +27,23 @@ outgoing:
 engines:
   - name: wolframalpha
     disabled: false
-  # Disable engines that frequently timeout or require API keys
-  - name: brave
-    disabled: true
-  - name: startpage
-    disabled: true
-  - name: ahmia
-    disabled: true
-  - name: torch
-    disabled: true
-  - name: duckduckgo
-    disabled: true
-  # Disable other engines that may timeout
+  # Enable reliable engines
   - name: google
     disabled: false
     timeout: 15.0
   - name: bing
     disabled: false
     timeout: 15.0
+  - name: startpage
+    disabled: false
+    timeout: 15.0
+  - name: brave
+    disabled: false
+    timeout: 15.0
+  # Disable engines that frequently timeout or require API keys
+  - name: ahmia
+    disabled: true
+  - name: torch
+    disabled: true
+  - name: duckduckgo
+    disabled: true

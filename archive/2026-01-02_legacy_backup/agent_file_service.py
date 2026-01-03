@@ -8,7 +8,7 @@ from typing import Any
 import structlog
 
 from src.memory.file_manager import FileManager
-from src.models.agent_models import AgentMemory, AgentTodoItem
+from src.workflow.agentic.models import AgentMemory, AgentTodoItem
 
 logger = structlog.get_logger(__name__)
 

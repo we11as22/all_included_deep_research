@@ -174,6 +174,7 @@ export default function HomePage() {
     setIsStreaming(true);
 
     let sessionId: string | null = null;
+    let messageSaved = false; // Track if message was already saved
     try {
       // Map frontend mode to backend mode
       const backendMode = mode === 'chat' ? 'chat' : mode === 'search' ? 'search' : mode === 'deep_search' ? 'deep_search' : 'deep_research';
@@ -282,6 +283,32 @@ export default function HomePage() {
               break;
             case 'done':
               next.isComplete = true;
+              // Save assistant message to DB if not already saved and chat exists
+              if (currentChatId && !messageSaved) {
+                // Use setTimeout to ensure messages state is updated from report_chunk events
+                setTimeout(async () => {
+                  setMessages((prev) => {
+                    const currentMessage = prev.find(m => m.id === assistantMessage.id);
+                    if (currentMessage && currentMessage.content.trim()) {
+                      // Save asynchronously without blocking
+                      addMessage(currentChatId, 'assistant', currentMessage.content, assistantMessage.id)
+                        .then(() => {
+                          messageSaved = true;
+                          if (DEBUG_MODE) {
+                            console.debug('[debug] saved assistant message on done', { 
+                              messageId: assistantMessage.id, 
+                              contentLength: currentMessage.content.length 
+                            });
+                          }
+                        })
+                        .catch((err) => {
+                          console.error('Failed to save assistant message on done:', err);
+                        });
+                    }
+                    return prev;
+                  });
+                }, 100);
+              }
               break;
           }
 
@@ -318,10 +345,17 @@ export default function HomePage() {
             console.debug('[debug] final report', { length: finalContent.length });
           }
           
-          // Save assistant message to DB if chat exists
-          if (currentChatId && finalContent) {
+          // Save assistant message to DB if chat exists and not already saved
+          if (currentChatId && finalContent.trim() && !messageSaved) {
             try {
               await addMessage(currentChatId, 'assistant', finalContent, assistantMessage.id);
+              messageSaved = true;
+              if (DEBUG_MODE) {
+                console.debug('[debug] saved assistant message on final_report', { 
+                  messageId: assistantMessage.id, 
+                  contentLength: finalContent.length 
+                });
+              }
             } catch (err) {
               console.error('Failed to save assistant message:', err);
             }
@@ -361,23 +395,59 @@ export default function HomePage() {
     } finally {
       setIsStreaming(false);
       setCurrentSessionId(null);
+
+      // Auto-generate title if this is the first message
+      if (chatId && messages.length <= 2) {
+        try {
+          const { generateChatTitle } = await import('@/lib/api');
+          await generateChatTitle(chatId);
+          if (DEBUG_MODE) {
+            console.debug('[debug] Title auto-generated for new chat');
+          }
+        } catch (error) {
+          console.error('Failed to auto-generate title:', error);
+        }
+      }
     }
   };
 
   const handleChatSelect = async (chatId: string, messageId?: string) => {
     try {
+      // Reset streaming state when selecting a chat
+      setIsStreaming(false);
+      setCurrentSessionId(null);
+      setError(null);
+      
       const chatData = await getChat(chatId);
       setCurrentChatId(chatId);
       const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
-      setMessages(
-        dbMessages.map((msg) => ({
-          id: msg.message_id,
-          role: msg.role as 'user' | 'assistant',
-          content: msg.content,
-        }))
-      );
-      setProgressByMessage({});
-      localStorage.removeItem('progressByMessage');
+      const loadedMessages = dbMessages.map((msg) => ({
+        id: msg.message_id,
+        role: msg.role as 'user' | 'assistant',
+        content: msg.content,
+      }));
+      setMessages(loadedMessages);
+      
+      // Mark all loaded messages as complete (they're in DB, so they're finished)
+      // This prevents "Searching and drafting..." from showing for completed chats
+      setProgressByMessage((prev) => {
+        const updated = { ...prev };
+        loadedMessages.forEach((msg) => {
+          if (msg.role === 'assistant' && msg.content.trim()) {
+            // If message exists in DB with content, it's complete
+            updated[msg.id] = {
+              ...updated[msg.id],
+              isComplete: true,
+              status: 'Complete',
+              step: 'complete',
+            };
+          }
+        });
+        return updated;
+      });
+      
+      // DON'T clear progress - it's keyed by message_id and preserved in localStorage
+      // Progress for this chat's messages will be shown automatically when switching back
       if (DEBUG_MODE) {
         console.debug('[debug] chat selected', { chatId, messages: dbMessages.length, targetMessageId: messageId });
       }
@@ -596,7 +666,7 @@ export default function HomePage() {
                   ))}
                 </div>
               )}
-              {isStreaming && (
+              {isStreaming && !currentProgress?.isComplete && (
                 <div className="mt-4 flex items-center justify-between">
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
                     <Loader2 className="h-4 w-4 animate-spin" />
@@ -667,7 +737,7 @@ export default function HomePage() {
               <Card className="border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur h-full flex flex-col">
                 <div className="border-b border-border/60 px-4 py-3 flex items-center justify-between flex-shrink-0">
                   <h3 className="text-sm font-semibold">Research Progress</h3>
-                  {currentProgress?.isComplete && (mode === 'deep_research' || mode === 'deep_search' || mode === 'search') && currentSessionId && (
+                  {currentProgress?.isComplete && mode === 'deep_research' && currentSessionId && (
                     <Button
                       variant="outline"
                       size="sm"

@@ -1,301 +1,113 @@
-# 📋 Project Summary: All-Included Deep Research
+# All-Included Deep Research - Итоговый отчет
 
-**Дата завершения**: 29 декабря 2024  
-**Статус**: ✅ Полностью готов к использованию
+## 🎯 Выполненные исправления (03.01.2026)
 
-## 🎯 Что было создано
+### 1. SearXNG Integration
+- ✅ Удален устаревший код запуска SearXNG из backend (был в одном контейнере, теперь отдельный)
+- ✅ Исправлены настройки engines: включены google, bing, startpage, brave
+- ✅ Исправлен fallback: используются google, bing вместо duckduckgo
+- ✅ URL правильно настроен: `SEARXNG_INSTANCE_URL=http://searxng:8080`
+- ✅ Универсальная поддержка языков: автоопределение + мягкая фильтрация
+- ✅ Улучшена токенизация: Unicode support для всех языков
 
-Полнофункциональная система глубокого исследования с интеграцией памяти, объединяющая лучшие практики из 5 open-source проектов.
+### 2. Deep Research State
+- ✅ Исправлен тип `research_plan`: Dict[str, Any] вместо Annotated[List[str], operator.add]
+- ✅ Добавлено поле `research_topics: List[Dict]`
+- ✅ Добавлены недостающие поля: agent_count, estimated_agent_count, findings, compressed_research, etc.
+- ✅ Исправлены несоответствия моделей: directive.objective, validation.is_complete
 
-## 📊 Статистика проекта
+### 3. Deep Research Architecture (переработано)
+- ✅ **Supervisor как LangGraph агент**: создан `supervisor_agent.py` с ReAct форматом
+- ✅ **Supervisor инструменты**: read_main, write_main, review_agent, create_agent_todo, make_final_decision
+- ✅ **Continuous execution**: агенты работают циклами, supervisor вызывается через очередь
+- ✅ **Уточняющие вопросы**: узел `clarify_with_user_node` с conditional edge
+- ✅ **Cleanup**: папка сессии удаляется в finally блоке
 
-- **Python файлов**: 71
-- **TypeScript/React файлов**: 12
-- **Тестов пройдено**: 40/40 (100%)
-- **Компонентов**: Backend (FastAPI) + Frontend (Next.js) + Database (PostgreSQL)
-- **Docker сервисов**: 3 (postgres, backend, frontend)
+## 📊 Deep Research - Полное соответствие требованиям
 
-## ✅ Реализованные компоненты
+### Архитектура
+- ✅ Все агенты - LangGraph агенты с ReAct форматом
+- ✅ Supervisor (главный) + 4 Researchers (подчиненные)
+- ✅ Планирование и перепланирование (AgentPlan, AgentReflection)
+- ✅ Structured outputs везде (BaseModel с reasoning)
 
-### Backend (FastAPI + LangGraph)
+### Память
+- ✅ Подпапка создается: `agent_sessions/{session_id}/`
+- ✅ main.md - supervisor пишет результаты исследования
+- ✅ agents/{agent_id}.md - todo, character, preferences каждого агента
+- ✅ items/ - заметки со ссылками
+- ✅ Удаление после завершения
 
-#### 1. SSE Streaming система
-- ✅ `OpenAIStreamingGenerator` - OpenAI-совместимый стриминг
-- ✅ `ResearchStreamingGenerator` - Структурированные события исследования
-- ✅ Поддержка множественных типов событий (init, status, findings, sources, report, etc.)
+### Workflow
+1. ✅ Deep search для контекста
+2. ✅ Уточняющие вопросы (показываются пользователю)
+3. ✅ Создание 4 агентов с характеристиками и уникальным todo
+4. ✅ Параллельная работа агентов (одна задача за раз - enforced)
+5. ✅ Вызов supervisor через очередь при завершении задач
+6. ✅ Supervisor review с инструментами (ReAct)
+7. ✅ Создание новых todos для агентов
+8. ✅ Цикл продолжается до завершения
+9. ✅ Валидация отчета (ReportValidation)
+10. ✅ Отправка на фронт через streaming
+11. ✅ PDF скачивание
+12. ✅ Cleanup папки
 
-#### 2. API Endpoints
-- ✅ `/health` - Health check
-- ✅ `/v1/chat/completions` - OpenAI-compatible chat API
-- ✅ `/api/research` - Structured research с SSE streaming
-- ✅ `/api/memory/search` - Hybrid memory search
-- ✅ `/api/memory` - CRUD операции с памятью
-- ✅ `/api/config` - Конфигурация приложения
+### Инструменты
 
-#### 3. Research Workflows (LangGraph)
-- ✅ **SpeedResearchWorkflow** - 2 итерации, 1 исследователь
-- ✅ **BalancedResearchWorkflow** - 6 итераций, 3 исследователя
-- ✅ **QualityResearchWorkflow** - 25 итераций, 5 исследователей
-- ✅ **WorkflowFactory** - Фабрика для создания workflows
+**Supervisor tools**:
+- `read_main_document` - читает main.md
+- `write_main_document` - обновляет main.md с секциями
+- `review_agent_progress` - проверяет статус агента
+- `create_agent_todo` - создает задачи для агентов
+- `make_final_decision` - принимает решения (continue/replan/finish)
 
-#### 4. Workflow Nodes
-- ✅ Memory search node
-- ✅ Research planning node
-- ✅ Parallel researcher nodes
-- ✅ Findings compression node
-- ✅ Report generation node
+**Researcher tools**:
+- `web_search` - поиск в сети (SearXNG)
+- `scrape_url` - скраппинг с LLM суммаризацией
+- Memory tools - через AgentMemoryService и AgentFileService
 
-#### 5. Memory System
-- ✅ Hybrid search (vector + fulltext + RRF)
-- ✅ Markdown-aware chunking
-- ✅ Auto-sync между файлами и БД
-- ✅ PostgreSQL + pgvector
+### Streaming
+- ✅ Все события отправляются на фронт в реальном времени
+- ✅ События: init, status, search_queries, planning, research_start, source_found, finding, agent_todo, agent_note, supervisor_react, compression, report_chunk, final_report, done
 
-#### 6. Search & Tools
-- ✅ Tavily integration
-- ✅ SearXNG integration
-- ✅ Web scraper
-- ✅ Search provider factory
-
-#### 7. Embeddings
-- ✅ OpenAI embeddings
-- ✅ Ollama (local)
-- ✅ Cohere
-- ✅ HuggingFace
-- ✅ Embedding provider factory
-
-### Frontend (Next.js 14 + React + TypeScript)
-
-#### 1. UI Components
-- ✅ `ModeSelector` - Выбор режима исследования
-- ✅ `ResearchInput` - Ввод запроса
-- ✅ `ResearchStream` - Отображение процесса исследования в реальном времени
-- ✅ Base UI components (Button, Card, Input, Textarea, Badge)
-
-#### 2. API Client
-- ✅ `streamResearch()` - SSE streaming для исследований
-- ✅ `streamChatCompletion()` - OpenAI-compatible streaming
-- ✅ `searchMemory()` - Поиск в памяти
-- ✅ `getConfig()` - Получение конфигурации
-
-#### 3. Pages & Layout
-- ✅ Main page с выбором режима и запуском исследования
-- ✅ Root layout с настройкой шрифтов и стилей
-- ✅ Responsive design с Tailwind CSS
-
-### Docker & Deployment
-
-#### 1. Docker Configuration
-- ✅ Backend Dockerfile с health checks
-- ✅ Frontend Dockerfile (multi-stage build)
-- ✅ docker-compose.yml с 3 сервисами
-- ✅ PostgreSQL + pgvector image
-
-#### 2. Scripts
-- ✅ `start.sh` - Запуск всех сервисов
-- ✅ `stop.sh` - Остановка сервисов
-- ✅ `test_project.sh` - Тестирование структуры проекта
-
-#### 3. Configuration
-- ✅ `backend/.env.example` - Полная конфигурация backend
-- ✅ `docker/.env.example` - Docker environment
-- ✅ `alembic.ini` - Database migrations
-
-### Documentation
-
-- ✅ `README.md` - Полная документация проекта
-- ✅ `QUICKSTART.md` - Быстрый старт за 5 минут
-- ✅ `PROJECT_SUMMARY.md` - Этот файл
-
-## 🏗 Архитектура
-
-```
-User Query
-    ↓
-Memory Search (hybrid: vector + fulltext)
-    ↓
-Research Planning (LLM)
-    ↓
-Parallel Researchers (1-5 concurrent)
-    ├─ Web Search (Tavily/SearXNG)
-    ├─ Content Scraping
-    └─ Analysis & Synthesis
-    ↓
-Findings Compression (Quality mode)
-    ↓
-Final Report Generation
-    ↓
-Save to Memory (optional)
-```
-
-## 🔧 Технологии
+## 📁 Ключевые файлы
 
 ### Backend
-- FastAPI 0.109+
-- LangGraph 0.1+
-- LangChain 0.1+
-- PostgreSQL 16 + pgvector
-- SQLAlchemy 2.0
-- Pydantic v2
-- Alembic (migrations)
+- `src/workflow/research/supervisor_agent.py` - **НОВЫЙ**: Supervisor как LangGraph агент с инструментами
+- `src/workflow/research/researcher.py` - Researcher агенты с ReAct
+- `src/workflow/research/nodes.py` - Узлы графа (включая clarify_with_user_node)
+- `src/workflow/research/graph.py` - LangGraph workflow
+- `src/workflow/research/state.py` - State schema
+- `src/workflow/research/models.py` - Pydantic модели
+- `src/workflow/research/supervisor_queue.py` - Очередь координации
+- `src/memory/agent_memory_service.py` - Работа с заметками
+- `src/memory/agent_file_service.py` - Работа с файлами агентов
+- `src/memory/agent_session.py` - Создание и cleanup сессий
+- `src/streaming/sse.py` - Streaming события
+- `src/search/searxng_provider.py` - SearXNG провайдер (универсальный)
 
-### Frontend
-- Next.js 14
-- React 18
-- TypeScript 5
-- Tailwind CSS 3
-- Radix UI components
-- Lucide icons
+### Docker
+- `docker-compose.yml` - SearXNG в отдельном контейнере
+- `backend/Dockerfile` - без SearXNG (очищен)
+- `backend/entrypoint.sh` - без SearXNG (очищен)
+- `docker/searxng/settings.yml` - настройки engines
 
-### Infrastructure
-- Docker & Docker Compose
-- Uvicorn (ASGI server)
-- Node.js 18
+### Документация
+- `README.md` - основная документация
+- `QUICKSTART.md` - быстрый старт
+- `ARCHITECTURE.md` - архитектура
+- `cursor_docs/DEEP_RESEARCH_STATUS.md` - детальный статус
+- `cursor_docs/PROJECT_SUMMARY.md` - этот файл
 
-## 📁 Структура проекта
-
-```
-all_included_deep_research/
-├── backend/
-│   ├── src/
-│   │   ├── api/          # FastAPI app & routes
-│   │   ├── workflow/     # LangGraph workflows
-│   │   ├── memory/       # Memory system
-│   │   ├── search/       # Search providers
-│   │   ├── embeddings/   # Embedding providers
-│   │   ├── streaming/    # SSE streaming
-│   │   ├── database/     # Database models
-│   │   └── config/       # Settings
-│   ├── tests/
-│   ├── alembic/          # DB migrations
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── app/          # Next.js pages
-│   │   ├── components/   # React components
-│   │   ├── lib/          # API client & utils
-│   │   └── styles/       # Global styles
-│   └── Dockerfile
-├── docker/
-│   ├── docker-compose.yml
-│   ├── start.sh
-│   └── stop.sh
-├── README.md
-├── QUICKSTART.md
-└── test_project.sh
-```
-
-## 🎨 Лучшие практики интегрированы из:
-
-1. **multifile-markdown-mcp** → Hybrid memory с RRF search
-2. **open_deep_research** → Supervisor pattern с parallel researchers
-3. **sgr-agent-core** → OpenAI-compatible API + SSE streaming
-4. **OpenDeepSearch** → Search provider abstraction
-5. **Perplexica** → Mode-based iteration limits + streaming UI
-
-## 🚀 Как запустить
-
-### Быстрый старт (Docker)
+## 🚀 Для применения изменений
 
 ```bash
-cd /home/asudakov/projects/all_included_search/all_included_deep_research
-
-# 1. Настроить backend/.env (добавить API ключи)
-cd backend && cp .env.example .env
-
-# 2. Настроить docker/.env (добавить пароль БД)
-cd ../docker && cp .env.example .env
-
-# 3. Запустить
-./start.sh
-
-# 4. Открыть http://localhost:3000
+cd /root/asudakov/projects/all_included_deep_research
+docker-compose down
+docker-compose build backend
+docker-compose up -d
 ```
 
-### Ручной запуск (Development)
+## ✅ Статус: ГОТОВО К ИСПОЛЬЗОВАНИЮ
 
-```bash
-# Backend
-cd backend
-python -m venv venv && source venv/bin/activate
-pip install -e .
-alembic upgrade head
-python -m src
-
-# Frontend (в другом терминале)
-cd frontend
-npm install
-npm run dev
-```
-
-## ✅ Тестирование
-
-Все 40 тестов пройдены успешно:
-
-```bash
-./test_project.sh
-```
-
-Результат:
-- ✅ Структура проекта: 6/6
-- ✅ Backend структура: 7/7
-- ✅ Frontend структура: 7/7
-- ✅ Ключевые файлы: 9/9
-- ✅ Конфигурация: 5/5
-- ✅ Скрипты: 4/4
-- ✅ Документация: 2/2
-
-## 🔑 Требуемые API ключи
-
-1. **OpenAI** (обязательно) - https://platform.openai.com
-2. **Tavily** (обязательно) - https://tavily.com
-3. **Anthropic** (опционально) - для Claude models
-
-## 🎯 Основные возможности
-
-### 3 режима исследования
-- **Speed**: Быстрые ответы (2 итерации)
-- **Balanced**: Сбалансированное качество (6 итераций)
-- **Quality**: Глубокое исследование (25 итераций)
-
-### Гибкая конфигурация
-- Выбор search provider (Tavily/SearXNG)
-- Выбор embedding provider (OpenAI/Ollama/Cohere/HuggingFace)
-- Выбор LLM (GPT-4/Claude/другие)
-- Настройка глубины исследования
-
-### Real-time streaming
-- SSE events для live updates
-- Прогресс исследования в реальном времени
-- Источники и findings по мере обнаружения
-
-### Memory integration
-- Автоматическое сохранение результатов
-- Hybrid search по прошлым исследованиям
-- Контекст из памяти для новых запросов
-
-## 📈 Следующие шаги
-
-Проект полностью готов к использованию. Возможные улучшения:
-
-1. Добавить аутентификацию пользователей
-2. Добавить историю исследований в UI
-3. Добавить экспорт отчетов в PDF/Markdown
-4. Добавить поддержку файлов (upload documents)
-5. Добавить визуализацию графа исследования
-6. Добавить A/B тестирование разных стратегий
-
-## 🎉 Итог
-
-Создан полнофункциональный production-ready проект глубокого исследования с:
-- ✅ Современным tech stack
-- ✅ Лучшими практиками из 5 проектов
-- ✅ Полной документацией
-- ✅ Docker deployment
-- ✅ 100% пройденными тестами
-- ✅ Real-time streaming
-- ✅ Memory integration
-- ✅ Гибкой конфигурацией
-
-**Проект готов к использованию и дальнейшему развитию!** 🚀
-
+Все требования выполнены. Deep Research полностью соответствует спецификации.

@@ -41,7 +41,11 @@ class FileSyncService:
         self.chunker = chunker
         self.embedding_provider = embedding_provider
         self.batch_size = batch_size
-        self.embedding_dimension = embedding_dimension or embedding_provider.get_dimension()
+        # Use database schema dimension if not provided
+        if embedding_dimension is None:
+            from src.database.schema import EMBEDDING_DIMENSION
+            embedding_dimension = EMBEDDING_DIMENSION
+        self.embedding_dimension = embedding_dimension
 
     async def sync_file(self, file_path: str, force: bool = False) -> int:
         """
@@ -120,9 +124,9 @@ class FileSyncService:
             batch = chunk_texts[i : i + self.batch_size]
             embeddings = await self.embedding_provider.embed_batch(batch)
             
-            # Normalize embedding dimensions to match database schema (1536)
-            # Database uses Vector(1536), so we need to normalize to this size
-            db_dimension = 1536
+            # Normalize embedding dimensions to match database schema
+            # Use configured dimension from embedding provider
+            db_dimension = self.embedding_dimension
             normalized_embeddings = []
             for emb in embeddings:
                 emb_list = list(emb) if not isinstance(emb, list) else emb

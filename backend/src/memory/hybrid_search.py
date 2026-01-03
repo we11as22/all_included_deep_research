@@ -128,12 +128,14 @@ class HybridSearchEngine:
         # Generate query embedding (requires string input)
         query_embedding = await self.embedding_provider.embed_text(query)
         
-        # Normalize embedding to 1536 dimensions (database schema requirement)
+        # Normalize embedding to database schema dimension (not provider dimension!)
+        from src.database.schema import EMBEDDING_DIMENSION
+        db_dimension = EMBEDDING_DIMENSION
         # Pad or truncate as needed
-        if len(query_embedding) < 1536:
-            query_embedding = list(query_embedding) + [0.0] * (1536 - len(query_embedding))
-        elif len(query_embedding) > 1536:
-            query_embedding = query_embedding[:1536]
+        if len(query_embedding) < db_dimension:
+            query_embedding = list(query_embedding) + [0.0] * (db_dimension - len(query_embedding))
+        elif len(query_embedding) > db_dimension:
+            query_embedding = query_embedding[:db_dimension]
 
         embedding_param = _format_vector_param(query_embedding)
 
@@ -246,12 +248,14 @@ class HybridSearchEngine:
         
         query_embedding = await self.embedding_provider.embed_text(query)
         
-        # Normalize embedding to 1536 dimensions (database schema requirement)
+        # Normalize embedding to database schema dimension (not provider dimension!)
+        from src.database.schema import EMBEDDING_DIMENSION
+        db_dimension = EMBEDDING_DIMENSION
         # Pad or truncate as needed
-        if len(query_embedding) < 1536:
-            query_embedding = list(query_embedding) + [0.0] * (1536 - len(query_embedding))
-        elif len(query_embedding) > 1536:
-            query_embedding = query_embedding[:1536]
+        if len(query_embedding) < db_dimension:
+            query_embedding = list(query_embedding) + [0.0] * (db_dimension - len(query_embedding))
+        elif len(query_embedding) > db_dimension:
+            query_embedding = query_embedding[:db_dimension]
 
         embedding_param = _format_vector_param(query_embedding)
 

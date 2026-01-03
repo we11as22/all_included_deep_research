@@ -1,5 +1,6 @@
 """SQLAlchemy database models."""
 
+import os
 from datetime import datetime
 from typing import Any
 
@@ -10,6 +11,34 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 
 Base = declarative_base()
+
+
+def _get_embedding_dimension() -> int:
+    """Get embedding dimension from environment or settings.
+    
+    This is used for database schema definition. The actual dimension
+    should match the embedding provider's dimension from settings.
+    """
+    # Try environment variable first
+    env_dim = os.getenv("EMBEDDING_DIMENSION")
+    if env_dim:
+        try:
+            return int(env_dim)
+        except ValueError:
+            pass
+    
+    # Try to get from settings (lazy import to avoid circular dependencies)
+    try:
+        from src.config.settings import get_settings
+        settings = get_settings()
+        return settings.embedding_dimension
+    except Exception:
+        # Fallback to default
+        return 1536
+
+
+# Embedding dimension for database schema (must match embedding provider dimension)
+EMBEDDING_DIMENSION = _get_embedding_dimension()
 
 
 class MemoryFileModel(Base):
@@ -63,7 +92,7 @@ class MemoryChunkModel(Base):
     chunk_index = Column(Integer, nullable=False)
     content = Column(Text, nullable=False)
     content_hash = Column(String(64), nullable=False)
-    embedding = Column(Vector(1536))  # Default dimension, configurable
+    embedding = Column(Vector(EMBEDDING_DIMENSION))  # Dimension from settings/environment
     header_path = Column(ARRAY(Text), default=list)
     section_level = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -164,7 +193,7 @@ class ChatMessageModel(Base):
     message_id = Column(String(64), nullable=False, index=True)
     role = Column(String(16), nullable=False)  # user, assistant, system
     content = Column(Text, nullable=False)
-    embedding = Column(Vector(1536))  # Default dimension, will be configurable
+    embedding = Column(Vector(EMBEDDING_DIMENSION))  # Dimension from settings/environment
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     message_metadata = Column("metadata", JSONB, default=dict)
 

@@ -143,21 +143,21 @@ class Settings(BaseSettings):
 
     # LLM Settings
     llm_mode: Literal["live", "mock"] = Field(default="live", description="LLM mode: live or mock")
-    chat_model: str = Field(default="openai:gpt-4o-mini", description="Chat model for search answers")
-    chat_model_max_tokens: int = Field(default=2048, description="Chat model max tokens")
+    chat_model: str = Field(default="openai:gpt-4.1-mini", description="Chat model for search answers")
+    chat_model_max_tokens: int = Field(default=8192, description="Chat model max tokens for writer synthesis")
 
     search_summarization_model: str = Field(
-        default="openai:gpt-4o-mini", description="Model for summarizing scraped sources"
+        default="openai:gpt-4.1-mini", description="Model for summarizing scraped sources"
     )
     search_summarization_model_max_tokens: int = Field(default=1024, description="Summarization model max tokens")
 
-    research_model: str = Field(default="openai:gpt-4o", description="Research model")
+    research_model: str = Field(default="openai:gpt-4.1", description="Research model")
     research_model_max_tokens: int = Field(default=4096, description="Research model max tokens")
 
-    compression_model: str = Field(default="openai:gpt-4o-mini", description="Compression model")
+    compression_model: str = Field(default="openai:gpt-4.1-mini", description="Compression model")
     compression_model_max_tokens: int = Field(default=2048, description="Compression model max tokens")
 
-    final_report_model: str = Field(default="openai:gpt-4o", description="Final report model")
+    final_report_model: str = Field(default="openai:gpt-4.1", description="Final report model")
     final_report_model_max_tokens: int = Field(default=8192, description="Final report model max tokens")
 
     # Anthropic (for Claude models)
@@ -175,7 +175,7 @@ class Settings(BaseSettings):
 
     # Advanced Settings
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")
-    sources_limit: int = Field(default=8, description="Max sources to include in prompts")
+    sources_limit: int = Field(default=20, description="Max sources to include in prompts (increased for better coverage)")
     search_content_max_chars: int = Field(default=6000, description="Max chars per source before summarization")
     chat_history_limit: int = Field(default=6, description="Chat messages to include in prompts")
     simple_search_max_results: int = Field(default=5, description="Max results for simple search")

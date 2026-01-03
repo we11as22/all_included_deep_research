@@ -1,4 +1,27 @@
 services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: deep_research_searxng
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:-change_me_secret_key_please_change_in_production}
+      BIND_ADDRESS: "0.0.0.0:8080"
+      INSTANCE_NAME: "all-included-searxng"
+    volumes:
+      - ./docker/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      - ./docker/searxng/uwsgi.ini:/etc/searxng/uwsgi.ini:ro
+      - ./docker/searxng/limiter.toml:/etc/searxng/limiter.toml:ro
+    ports:
+      - "8081:8080"
+    networks:
+      - deep_research_network
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: deep_research_postgres
@@ -27,6 +50,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      searxng:
+        condition: service_started
     environment:
       # SQLite configuration (deprecated)
       SQLITE_DB_PATH: /app/data/research.db
@@ -40,7 +65,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-your_secure_password}
       MEMORY_DIR: /memory_files
-      SEARXNG_INSTANCE_URL: http://localhost:8080
+      SEARXNG_INSTANCE_URL: http://searxng:8080
       SEARXNG_SECRET: ${SEARXNG_SECRET:-change_me_secret_key_please_change_in_production}
       DEBUG_MODE: ${DEBUG_MODE:-false}
     env_file:
@@ -50,7 +75,6 @@ services:
       - backend_data:/app/data  # SQLite and vector store data
     ports:
       - "8000:8000"
-      - "8080:8080"
     dns:
       - 8.8.8.8
       - 8.8.4.4

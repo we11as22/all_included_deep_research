@@ -186,13 +186,18 @@ This section maintains an index of all specialized memory files with description
     async def sync_file_to_db(self, file_path: str, force: bool = False, embedding_dimension: int | None = None) -> int:
         """Sync a single file to the database."""
         async with self.session_factory() as session:
+            # Use database schema dimension if not provided
+            if embedding_dimension is None:
+                from src.database.schema import EMBEDDING_DIMENSION
+                embedding_dimension = EMBEDDING_DIMENSION
+            
             sync_service = FileSyncService(
                 session=session,
                 file_manager=self.file_manager,
                 chunker=self.chunker,
                 embedding_provider=self.embedding_provider,
                 batch_size=self.embedding_batch_size,
-                embedding_dimension=embedding_dimension or self.embedding_provider.get_dimension(),
+                embedding_dimension=embedding_dimension,
             )
             file_id = await sync_service.sync_file(file_path=file_path, force=force)
             await session.commit()

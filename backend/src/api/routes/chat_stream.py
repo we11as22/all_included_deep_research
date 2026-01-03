@@ -115,8 +115,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     memory_root, session_id
                 )
                 await agent_memory_service.read_main_file()
+                # Store in both stream.app_state (for backward compatibility) and pass directly
                 stream_generator.app_state["agent_memory_service"] = agent_memory_service
                 stream_generator.app_state["agent_file_service"] = agent_file_service
+                # Also store in a way that can be passed to graph
+                stream_generator.app_state["_agent_memory_service"] = agent_memory_service
+                stream_generator.app_state["_agent_file_service"] = agent_file_service
 
             if mode == "chat":
                 # Simple chat mode - no web search
@@ -131,27 +135,42 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 stream_generator.emit_done()
                 return
             elif mode in {"search", "deep_search"}:
+                logger.info("Starting search/deep_search workflow", mode=mode, query=query[:100])
                 chat_service = app_request.app.state.chat_service
-                if mode == "search":
-                    result = await chat_service.answer_web(query, stream=stream_generator, messages=chat_history)
-                else:
-                    result = await chat_service.answer_deep(query, stream=stream_generator, messages=chat_history)
+                try:
+                    if mode == "search":
+                        logger.debug("Calling answer_web")
+                        result = await chat_service.answer_web(query, stream=stream_generator, messages=chat_history)
+                    else:
+                        logger.debug("Calling answer_deep")
+                        result = await chat_service.answer_deep(query, stream=stream_generator, messages=chat_history)
+                    
+                    logger.info("Search workflow completed", has_answer=bool(result.answer), answer_length=len(result.answer) if result.answer else 0)
 
-                # Emit final answer
-                if result.answer:
-                    stream_generator.emit_status("Finalizing answer...", step="answer")
-                    for chunk in _chunk_text(result.answer, size=180):
-                        stream_generator.emit_report_chunk(chunk)
-                        await asyncio.sleep(0.02)
-                    stream_generator.emit_final_report(result.answer)
-                else:
-                    stream_generator.emit_error(error="No answer generated", details="Search completed but no answer was generated")
-                
-                # Store report for PDF generation
-                _store_session_report(app_request.app.state, session_id, result.answer, query, mode)
-                
-                stream_generator.emit_done()
-                return
+                    # Emit final answer
+                    if result.answer:
+                        logger.debug("Emitting final answer", answer_length=len(result.answer))
+                        stream_generator.emit_status("Finalizing answer...", step="answer")
+                        for chunk in _chunk_text(result.answer, size=180):
+                            stream_generator.emit_report_chunk(chunk)
+                            await asyncio.sleep(0.02)
+                        stream_generator.emit_final_report(result.answer)
+                        logger.debug("Final report emitted")
+                    else:
+                        logger.warning("No answer generated from search workflow")
+                        stream_generator.emit_error(error="No answer generated", details="Search completed but no answer was generated")
+                    
+                    # PDF generation only for deep_research mode
+                    # Don't store reports for search/deep_search modes
+                    
+                    stream_generator.emit_done()
+                    logger.info("Search workflow finished successfully")
+                    return
+                except Exception as e:
+                    logger.error("Search workflow failed", error=str(e), exc_info=True)
+                    stream_generator.emit_error(error=str(e), details="Search workflow encountered an error")
+                    stream_generator.emit_done()
+                    return
 
             # Use new LangGraph research system for deep_research mode
             from src.workflow.research import run_research_graph
@@ -168,40 +187,75 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
             }
 
             # Run new LangGraph research
-            final_state = await run_research_graph(
-                query=query,
-                chat_history=chat_history,
-                mode="quality",
-                llm=app_request.app.state.research_llm,
-                search_provider=app_request.app.state.chat_service.search_provider,
-                scraper=app_request.app.state.chat_service.scraper,
-                stream=stream_generator,
-                session_id=session_id,
-                mode_config=mode_config,
-                settings=settings,
-            )
+            try:
+                final_state = await run_research_graph(
+                    query=query,
+                    chat_history=chat_history,
+                    mode="quality",
+                    llm=app_request.app.state.research_llm,
+                    search_provider=app_request.app.state.chat_service.search_provider,
+                    scraper=app_request.app.state.chat_service.scraper,
+                    stream=stream_generator,
+                    session_id=session_id,
+                    mode_config=mode_config,
+                    settings=settings,
+                )
 
-            # Extract final_report - handle both dict with override and direct value
-            final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
-            if isinstance(final_report_raw, dict) and "value" in final_report_raw:
-                final_report = final_report_raw["value"]
-            elif isinstance(final_report_raw, str):
-                final_report = final_report_raw
-            else:
-                final_report = str(final_report_raw) if final_report_raw else ""
-            
-            if final_report:
-                # Emit final report chunks and final report event
-                stream_generator.emit_status("Generating final report...", step="report")
-                for chunk in _chunk_text(final_report, size=200):
-                    stream_generator.emit_report_chunk(chunk)
-                    await asyncio.sleep(0.02)
-                stream_generator.emit_final_report(final_report)
+                # Extract final_report - handle both dict with override and direct value
+                logger.info("Extracting final report from state", state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
+                final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+                logger.info("Final report raw", report_type=type(final_report_raw).__name__, has_value=bool(final_report_raw))
                 
-                # Store final report in session for PDF generation
-                _store_session_report(app_request.app.state, session_id, final_report, query, mode)
+                if isinstance(final_report_raw, dict) and "value" in final_report_raw:
+                    final_report = final_report_raw["value"]
+                elif isinstance(final_report_raw, dict) and "content" in final_report_raw:
+                    final_report = final_report_raw["content"]
+                elif isinstance(final_report_raw, str):
+                    final_report = final_report_raw
+                else:
+                    final_report = str(final_report_raw) if final_report_raw else ""
                 
-            stream_generator.emit_done()
+                logger.info("Final report extracted", report_length=len(final_report) if final_report else 0, preview=final_report[:200] if final_report else "empty")
+                
+                if final_report:
+                    # Emit final report chunks and final report event
+                    logger.info("Emitting final report", report_length=len(final_report))
+                    stream_generator.emit_status("Finalizing report...", step="report")
+                    for chunk in _chunk_text(final_report, size=200):
+                        stream_generator.emit_report_chunk(chunk)
+                        await asyncio.sleep(0.02)
+                    stream_generator.emit_final_report(final_report)
+                    logger.info("Final report emitted successfully")
+                    
+                    # Store final report in session for PDF generation
+                    _store_session_report(app_request.app.state, session_id, final_report, query, mode)
+                else:
+                    logger.warning("No final report generated from research graph", final_state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
+                    # Try to get main document as fallback
+                    if isinstance(final_state, dict):
+                        main_doc = final_state.get("main_document", "")
+                        if main_doc:
+                            logger.info("Using main document as fallback report")
+                            stream_generator.emit_final_report(main_doc)
+                            _store_session_report(app_request.app.state, session_id, main_doc, query, mode)
+                        else:
+                            stream_generator.emit_error(error="No report generated", details="Research completed but no final report was generated")
+                    else:
+                        stream_generator.emit_error(error="No report generated", details="Research completed but no final report was generated")
+                    
+                logger.info("Emitting done signal")
+                stream_generator.emit_done()
+            except Exception as e:
+                logger.error("Research graph failed", error=str(e), exc_info=True)
+                stream_generator.emit_error(error=str(e), details="Research workflow encountered an error")
+                # Try to extract any partial results
+                if "final_state" in locals():
+                    final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+                    if final_report_raw:
+                        final_report = str(final_report_raw)
+                        stream_generator.emit_final_report(final_report)
+                        _store_session_report(app_request.app.state, session_id, final_report, query, mode)
+                stream_generator.emit_done()
 
         except asyncio.CancelledError:
             logger.info("Chat task cancelled", session_id=session_id)

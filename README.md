@@ -6,9 +6,14 @@ Comprehensive deep research system with memory integration, combining the best p
 
 ### 3 Chat Modes
 
-- **Web Search**: Query rewriting + multi-query search with citations
-- **Deep Search**: Quality web search with extra iterations and broader sources
-- **Deep Research**: Full multi-agent report synthesis with planning and compression
+- **Web Search** (speed): Fast query rewriting + multi-query search with citations (2 iterations)
+- **Deep Search** (balanced): Quality web search with extra iterations and broader sources (6 iterations)
+- **Deep Research** (quality): Full multi-agent LangGraph system with supervisor coordination (up to 25 iterations)
+  - Supervisor agent (LangGraph with ReAct) coordinates 4 researcher agents
+  - Each researcher is a LangGraph agent with planning/replanning
+  - All agents write notes to markdown files in session folder
+  - Supervisor reviews progress and assigns new tasks through queue system
+  - Final report validated and streamed to frontend
 
 ### Advanced Memory System
 
@@ -18,6 +23,11 @@ Comprehensive deep research system with memory integration, combining the best p
 - **Auto-sync**: Automatic synchronization between files and database
   - Memory files location configurable via `MEMORY_DIR` (default: `/home/asudakov/projects/memory_files`)
 - **Chat Context**: Agents receive the last N chat messages (`CHAT_HISTORY_LIMIT`)
+- **Agent Sessions**: Deep Research creates temporary session folders with agent memory files
+  - `main.md` - supervisor's research document
+  - `agents/{agent_id}.md` - each agent's todos and notes
+  - `items/` - research notes with sources
+  - Automatically cleaned up after research completion
 
 ### ⚙️ Flexible Configuration
 

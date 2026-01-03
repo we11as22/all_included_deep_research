@@ -207,108 +207,181 @@ class ChatSearchService:
         tuning: SearchTuning,
         messages: list[dict[str, str]] | None = None,
     ) -> ChatSearchResult:
-        session_memory = SearchSessionMemory()
+        """
+        Run multi-query search using LLM-driven research agent (like Perplexica).
+        
+        LLM sees previous results and decides what to search next.
+        """
         try:
-            chat_history = format_chat_history(messages, self.settings.chat_history_limit)
-            self._emit_status(stream, "Rewriting query...", "rewrite")
-            # Ensure query is a string before rewriting
+            # Ensure query is a string
             if not isinstance(query, str):
                 if isinstance(query, (list, tuple)):
                     logger.error("Query was passed as list/embedding to _run_multi_query_search, using empty string", query_type=type(query).__name__)
                     query = ""
                 else:
                     query = str(query) if query else ""
-            rewritten = await self._rewrite_query(query, chat_history=chat_history)
-            self._emit_search_queries(stream, [rewritten], "rewrite")
 
+            chat_history = format_chat_history(messages, self.settings.chat_history_limit)
             memory_context: list[dict[str, Any]] = []
 
-            self._emit_status(stream, "Generating search queries...", "queries")
-            queries = await self._generate_search_queries(
-                rewritten,
-                tuning.queries,
-                memory_context=memory_context,
-                chat_history=chat_history,
+            # Classify query
+            from src.workflow.search.classifier import classify_query
+            if stream:
+                stream.emit_status("Classifying query...", step="classification")
+            
+            classification = await classify_query(
+                query, 
+                [{"role": m.get("role", "user"), "content": m.get("content", "")} for m in (messages or [])],
+                self.chat_llm
             )
 
+            # Map tuning mode to research agent mode
+            research_mode = "speed" if tuning.mode == "web" else "balanced" if tuning.mode == "deep" else "quality"
+            
+            # Use research agent (LLM-driven, like Perplexica)
+            # LLM sees results and decides what to search next
+            from src.workflow.search.researcher import research_agent
+            
+            if stream:
+                stream.emit_status(f"Starting {research_mode} research...", step="research")
+            
+            research_results = await research_agent(
+                query=query,
+                classification=classification,
+                mode=research_mode,
+                llm=self.chat_llm,  # Use same LLM for research
+                search_provider=self.search_provider,
+                scraper=self.scraper,
+                stream=stream,
+                chat_history=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in (messages or [])],
+            )
+
+            # Extract sources from research results
+            # research_agent returns sources as list of dicts from web_search action
+            sources = research_results.get("sources", [])
+            scraped_content = research_results.get("scraped_content", [])
+            
+            # Convert to SearchResult format
             results: list[SearchResult] = []
-            all_queries: list[str] = []
+            for source in sources:
+                if isinstance(source, dict):
+                    # Format: {"title": "...", "url": "...", "snippet": "..."}
+                    results.append(SearchResult(
+                        title=source.get("title", ""),
+                        url=source.get("url", ""),
+                        snippet=source.get("snippet", source.get("content", "")),
+                        score=source.get("score", 0.0)
+                    ))
+                elif hasattr(source, "title"):
+                    # Already a SearchResult object
+                    results.append(source)
+            
+            logger.info(
+                "Research agent completed",
+                sources_count=len(sources),
+                results_count=len(results),
+                scraped_count=len(scraped_content)
+            )
 
-            for iteration in range(1, tuning.iterations + 1):
-                if not queries:
-                    break
-
-                label = tuning.label if iteration == 1 else f"{tuning.label}_iter_{iteration}"
-                self._emit_search_queries(stream, queries, label)
-                all_queries.extend(queries)
-
-                async def run_query(search_query: str) -> list[SearchResult]:
-                    response = await self.search_provider.search(
-                        search_query,
-                        max_results=tuning.max_results,
-                    )
-                    # Rerank results for each query to improve relevance
-                    reranked = await self._rerank_results(search_query, response.results, top_k=tuning.max_results)
-                    return reranked
-
-                search_batches = await asyncio.gather(*[run_query(q) for q in queries])
-                for query_text, batch in zip(queries, search_batches):
-                    results.extend(batch)
-                    session_memory.add_observation(query_text, batch)
-
-                if iteration < tuning.iterations:
-                    followups = await self._generate_followup_queries(
-                        rewritten,
-                        all_queries,
-                        results=results,
-                        memory_context=memory_context,
-                        session_memory=session_memory,
-                        chat_history=chat_history,
-                    )
-                    queries = [item for item in followups if item.lower() not in {q.lower() for q in all_queries}]
-
+            # Dedupe and filter
             results = self._dedupe_results(results, per_domain_limit=2)
             results = self._filter_blocked_results(results)
-            results = await self._rerank_results(rewritten, results, top_k=tuning.rerank_top_k)
+            
+            logger.info("Before reranking", 
+                       query=query,
+                       results_count=len(results),
+                       top_titles=[r.title[:50] for r in results[:5]])
+            
+            # Final reranking with original query (CRITICAL: use original user query, not generated queries!)
+            results = await self._rerank_results(query, results, top_k=tuning.rerank_top_k)
+            
+            logger.info("After reranking", 
+                       query=query,
+                       results_count=len(results),
+                       top_titles=[r.title[:50] for r in results[:5]],
+                       top_scores=[round(r.score, 3) for r in results[:5]])
+            
             self._emit_sources(stream, results, label=tuning.label)
 
-            scraped = await self._scrape_results(results, tuning.scrape_top_n, stream=stream)
-            summarized = await self._summarize_scraped(query, scraped, stream=stream)
+            # Use scraped content from research agent, or scrape top results
+            if scraped_content:
+                # Already scraped by research agent
+                # Convert dicts to ScrapedContent objects
+                summarized = []
+                for item in scraped_content:
+                    if isinstance(item, dict):
+                        # Convert dict to ScrapedContent object
+                        summarized.append(ScrapedContent(
+                            url=item.get("url", ""),
+                            title=item.get("title", ""),
+                            content=item.get("content", item.get("summary", "")),
+                            markdown=None,
+                            html=None,
+                            images=[],
+                            links=[]
+                        ))
+                    elif isinstance(item, ScrapedContent):
+                        # Already a ScrapedContent object
+                        summarized.append(item)
+                    else:
+                        logger.warning(f"Unexpected scraped_content item type", item_type=type(item).__name__)
+            else:
+                # Fallback: scrape top results
+                scraped = await self._scrape_results(results, tuning.scrape_top_n, stream=stream)
+                logger.info("Scraping completed", scraped_count=len(scraped), total_results=len(results))
+                summarized = await self._summarize_scraped(query, scraped, stream=stream)
+                logger.info("Summarization completed", summarized_count=len(summarized))
 
             self._emit_status(stream, "Synthesizing answer from sources...", "synthesize")
+            logger.info("Starting answer synthesis", sources_count=len(results), scraped_count=len(summarized))
+            
+            # Map tuning mode to writer mode
+            writer_mode = "speed" if tuning.mode == "web" else "balanced" if tuning.mode == "deep" else "quality"
             answer = await self._synthesize_answer(
                 query=query,
-                search_query=rewritten,
+                search_query=query,  # Use original query
                 sources=results,
                 scraped=summarized,
                 memory_context=memory_context,
-                mode=tuning.mode,
+                mode=writer_mode,
                 chat_history=chat_history,
             )
+
+            if not answer or not answer.strip():
+                logger.error(
+                    "Empty answer generated",
+                    query=query,
+                    sources_count=len(results),
+                    scraped_count=len(summarized)
+                )
+                answer = "I apologize, but I was unable to generate a comprehensive answer from the available sources. Please try rephrasing your question or try again later."
 
             self._emit_finding(stream, f"{tuning.mode}_search", answer)
             self._emit_status(stream, "Answer ready", "complete")
             return ChatSearchResult(answer=answer, sources=results, memory_context=memory_context)
-        finally:
-            session_memory.clear()
+        except Exception as e:
+            logger.error("Multi-query search failed", error=str(e), exc_info=True)
+            raise
 
     def _web_tuning(self) -> SearchTuning:
+        """Web Search (Speed mode) - fast search with 2 iterations."""
         return SearchTuning(
             mode="web",
             max_results=self.settings.deep_search_max_results,
             queries=self.settings.deep_search_queries,
-            iterations=self.settings.deep_search_iterations,
+            iterations=self.settings.speed_max_iterations,  # 2 iterations for speed
             scrape_top_n=self.settings.deep_search_scrape_top_n,
             rerank_top_k=self.settings.deep_search_rerank_top_k,
             label="web",
         )
 
     def _deep_tuning(self) -> SearchTuning:
+        """Deep Search (Balanced mode) - quality search with 6 iterations."""
         return SearchTuning(
             mode="deep",
             max_results=self.settings.deep_search_quality_max_results,
             queries=self.settings.deep_search_quality_queries,
-            iterations=self.settings.deep_search_quality_iterations,
+            iterations=self.settings.balanced_max_iterations,  # 6 iterations for balanced
             scrape_top_n=self.settings.deep_search_quality_scrape_top_n,
             rerank_top_k=self.settings.deep_search_quality_rerank_top_k,
             label="deep",
@@ -326,16 +399,17 @@ class ChatSearchService:
             return query
 
         current_date = get_current_date()
+        history_block = chat_history or "Chat history: None."
         prompt = (
             f"Rewrite the user query into a precise, focused web search query that will find relevant results. "
             f"IMPORTANT: Preserve the core meaning and key terms from the original query. "
             f"Keep the query language the same as the original (do not translate unless asked). "
-            f"Use the chat history for context if needed. "
+            f"Use the chat history below for context - if the user is continuing a conversation, "
+            f"incorporate relevant context from previous messages to make the search query more specific. "
             f"Current date: {current_date} - consider this when rewriting queries about recent events. "
             f"Return JSON with fields reasoning, rewritten_query. "
             f"Example: 'расскажи про сорта пива' -> 'сорта пива типы классификация' (NOT 'какие-то' or unrelated terms)."
         )
-        history_block = chat_history or "Chat history: None."
         structured_llm = self.chat_llm.with_structured_output(QueryRewrite, method="function_calling")
         try:
             response = await structured_llm.ainvoke(
@@ -373,10 +447,14 @@ class ChatSearchService:
         history_block = chat_history or "Chat history: None."
         current_date = get_current_date()
         prompt = (
-            f"Generate concise web search queries for deeper research. "
-            f"Use memory context if relevant. "
-            f"Use the same language as the original query and avoid mixing languages. "
+            f"Generate concise, targeted web search queries based on the user's original query. "
+            f"CRITICAL: Preserve the core meaning and key terms from the original query. "
+            f"Use the same language as the original query - DO NOT translate or change language. "
+            f"Generate queries that are SEO-friendly (keywords, not full sentences). "
+            f"Each query should focus on a specific aspect of the topic. "
+            f"Use memory context and chat history if relevant to make queries more specific. "
             f"Current date: {current_date} - consider this when generating queries about recent events. "
+            f"Example: 'расскажи про саблю' -> ['сабля', 'сабля история', 'сабля виды типы'] (NOT 'история сабли в России' or unrelated terms). "
             f"Return JSON with fields reasoning, queries."
         )
         structured_llm = self.chat_llm.with_structured_output(SearchQueries, method="function_calling")
@@ -384,7 +462,7 @@ class ChatSearchService:
             response = await structured_llm.ainvoke(
                 [
                     SystemMessage(content=prompt),
-                    HumanMessage(content=f"{history_block}\n\n{query}\n\n{memory_block}"),
+                    HumanMessage(content=f"{history_block}\n\nOriginal query: {query}\n\n{memory_block}"),
                 ]
             )
             if not isinstance(response, SearchQueries):
@@ -419,10 +497,15 @@ class ChatSearchService:
         )
         current_date = get_current_date()
         prompt = (
-            f"Given the original query and existing search queries, propose follow-up queries "
+            f"Given the original user query and existing search queries, propose follow-up queries "
             f"that would fill gaps or validate key claims. "
-            f"Use the same language as the original query and avoid mixing languages. "
+            f"CRITICAL: Preserve the core meaning and key terms from the original query. "
+            f"Use the same language as the original query - DO NOT translate or change language. "
+            f"Generate queries that are SEO-friendly (keywords, not full sentences). "
+            f"Each query should focus on a specific aspect that hasn't been covered yet. "
             f"Current date: {current_date} - consider this when proposing queries about recent events. "
+            f"Example: Original 'расскажи про саблю', already searched ['сабля', 'сабля история'] -> "
+            f"['сабля виды', 'сабля характеристики', 'сабля применение'] (NOT 'история сабли в России' or unrelated). "
             f"Return JSON with fields reasoning, should_continue, gap_summary, queries."
         )
         structured_llm = self.chat_llm.with_structured_output(FollowupQueries, method="function_calling")
@@ -469,9 +552,18 @@ class ChatSearchService:
         if not results:
             return []
         try:
-            return await self.reranker.rerank(query, results, top_k=top_k)
+            reranked = await self.reranker.rerank(query, results, top_k=top_k)
+            if not reranked:
+                logger.warning(
+                    "Reranking returned no results",
+                    query=query[:100],
+                    original_count=len(results),
+                )
+                # Return original results if reranking filtered everything out
+                return results[:top_k] if top_k else results
+            return reranked
         except Exception as exc:
-            logger.warning("rerank_failed", error=str(exc))
+            logger.error("rerank_failed", error=str(exc), exc_info=True)
             return results[:top_k] if top_k else results
 
     def _dedupe_results(
@@ -527,11 +619,20 @@ class ChatSearchService:
                     self._emit_status(stream, f"Scraping {result.title}", "scrape")
                 return await self.scraper.scrape(result.url)
             except Exception as exc:
-                logger.warning("scrape_failed", url=result.url, error=str(exc))
+                error_msg = str(exc) if exc else "Unknown scraping error"
+                error_type = type(exc).__name__ if exc else "UnknownError"
+                logger.warning(
+                    "scrape_failed",
+                    url=result.url,
+                    error=error_msg,
+                    error_type=error_type
+                )
                 return None
 
         tasks = [scrape_one(result) for result in results[:top_n]]
-        scraped = [item for item in await asyncio.gather(*tasks) if item]
+        # Use return_exceptions=True to continue even if some scrapes fail
+        results_list = await asyncio.gather(*tasks, return_exceptions=True)
+        scraped = [item for item in results_list if item and not isinstance(item, Exception)]
         return scraped
 
     async def _summarize_scraped(
@@ -541,7 +642,10 @@ class ChatSearchService:
         stream: Any | None = None,
     ) -> list[ScrapedContent]:
         if not scraped:
+            logger.debug("No scraped content to summarize")
             return []
+
+        logger.info("Starting summarization", scraped_count=len(scraped))
 
         async def summarize(content: ScrapedContent) -> ScrapedContent:
             trimmed = summarize_text(content.content, self.settings.search_content_max_chars)
@@ -585,7 +689,9 @@ class ChatSearchService:
                 links=content.links,
             )
 
-        return await asyncio.gather(*[summarize(item) for item in scraped])
+        summarized_results = await asyncio.gather(*[summarize(item) for item in scraped])
+        logger.info("Summarization completed", summarized_count=len(summarized_results))
+        return summarized_results
 
     async def _synthesize_answer(
         self,
@@ -602,12 +708,30 @@ class ChatSearchService:
         history_block = chat_history or "Chat history: None."
 
         current_date = get_current_date()
+        
+        # Mode-specific length guidelines (matching writer prompts)
+        length_guide = {
+            "simple": "300-500 words",
+            "web": "400-600 words",  # Web Search (speed)
+            "speed": "400-600 words",
+            "deep": "800-1200 words",  # Deep Search (balanced)
+            "balanced": "800-1200 words",
+            "quality": "1500-3000 words",
+            "research": "1500-3000 words"
+        }.get(mode, "500-800 words")
+        
         system_prompt = (
-            f"You are a research assistant. Answer with clear, concise reasoning. "
-            f"Return JSON with fields reasoning, answer, key_points. "
-            f"Use the provided sources and cite them with [number] references. "
-            f"If information is missing, say so. "
-            f"Current date: {current_date} - always consider this when evaluating information recency and relevance."
+            f"You are an expert research assistant synthesizing information from multiple sources. "
+            f"Current date: {current_date}\n\n"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Use ALL provided sources - each one has valuable information\n"
+            f"2. Synthesize into a comprehensive, well-structured answer ({length_guide})\n"
+            f"3. CITE EVERY FACT with inline references [1], [2], etc.\n"
+            f"4. Include specific details, data, and examples from sources\n"
+            f"5. If sources provide different perspectives, present them all\n"
+            f"6. Structure with clear sections using markdown (##, ###)\n"
+            f"7. Be thorough - don't leave out important information\n\n"
+            f"Return JSON with: reasoning (why sources support answer), answer (full markdown with citations), key_points (list)"
         )
         user_prompt = (
             f"User question: {query}\n"
@@ -616,20 +740,24 @@ class ChatSearchService:
             f"Current date: {current_date}\n\n"
             f"{history_block}\n\n"
             f"{memory_block}\n\n"
-            f"Sources:\n{sources_block}\n\n"
-            "Answer with citations like [1], [2]."
+            f"Sources ({len(sources)} sources provided - USE THEM ALL):\n{sources_block}\n\n"
+            f"Write a comprehensive answer using ALL sources above. Each source adds value - synthesize them together."
         )
 
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
         try:
+            logger.debug("Calling LLM for answer synthesis", prompt_length=len(user_prompt))
             response = await structured_llm.ainvoke(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
+            logger.debug("LLM response received", response_type=type(response).__name__)
             if not isinstance(response, SynthesizedAnswer):
                 raise ValueError("SynthesizedAnswer response was not structured")
-            return response.answer.strip()
+            answer = response.answer.strip()
+            logger.info("Answer synthesis completed", answer_length=len(answer))
+            return answer
         except Exception as exc:
-            logger.error("Structured answer synthesis failed", error=str(exc))
+            logger.error("Structured answer synthesis failed", error=str(exc), exc_info=True)
             raise
 
     def _format_sources(self, sources: list[SearchResult], scraped: list[ScrapedContent]) -> str:
@@ -675,12 +803,12 @@ class ChatSearchService:
         if not stream:
             return
         findings = self._extract_key_findings(summary)
-        stream.emit_finding(
-            researcher_id="search",
-            topic=topic,
-            summary=summary,
-            key_findings=findings,
-        )
+        stream.emit_finding({
+            "researcher_id": "search",
+            "topic": topic,
+            "summary": summary,
+            "key_findings": findings,
+        })
 
     def _extract_key_findings(self, summary: str) -> list[str]:
         lines = [line.strip("- ").strip() for line in summary.splitlines() if line.strip()]

@@ -43,9 +43,27 @@ class SemanticReranker:
             query_embedding = await self.embedding_provider.embed_text(query)
 
             # Prepare documents for embedding
-            documents = [
-                f"{result.title}\n{result.snippet}" for result in results
-            ]
+            # Include title, snippet, and URL domain for better context
+            documents = []
+            for result in results:
+                # Extract domain from URL for additional context
+                domain = ""
+                if result.url:
+                    try:
+                        from urllib.parse import urlparse
+                        parsed = urlparse(result.url)
+                        domain = parsed.netloc.replace("www.", "")
+                    except:
+                        pass
+                
+                # Combine title, snippet, and domain for richer embedding context
+                doc_text = f"{result.title}"
+                if result.snippet:
+                    doc_text += f"\n{result.snippet}"
+                if domain:
+                    doc_text += f"\n{domain}"
+                
+                documents.append(doc_text)
 
             # Get document embeddings
             doc_embeddings = await self.embedding_provider.embed_batch(documents)
@@ -62,9 +80,64 @@ class SemanticReranker:
             # Sort by score descending
             result_scores.sort(key=lambda x: x[1], reverse=True)
 
+            # Filter out results with very low similarity scores
+            # Use adaptive threshold based on score distribution
+            # Start with a lower threshold (0.2 = 20% similarity) to be more inclusive
+            # This is important for multilingual queries where embeddings may have lower base similarity
+            min_similarity_threshold = 0.2
+            
+            # Calculate score statistics
+            if result_scores:
+                scores_only = [score for _, score in result_scores]
+                avg_score = sum(scores_only) / len(scores_only)
+                max_score = max(scores_only)
+                min_score = min(scores_only)
+                
+                # Adaptive threshold: use 50% of average score, but not less than 0.15
+                # This adapts to the actual score distribution for this query
+                adaptive_threshold = max(0.15, avg_score * 0.5)
+                min_similarity_threshold = min(0.3, adaptive_threshold)  # Cap at 0.3
+                
+                logger.debug(
+                    "Reranking score distribution",
+                    query=query[:100],
+                    avg_score=round(avg_score, 3),
+                    max_score=round(max_score, 3),
+                    min_score=round(min_score, 3),
+                    threshold=round(min_similarity_threshold, 3),
+                )
+            
+            filtered_scores = [
+                (result, score) for result, score in result_scores
+                if score >= min_similarity_threshold
+            ]
+            
+            # If filtering removed too many results, be more lenient
+            # Keep at least top 60% of results, or all if we have few results
+            if len(filtered_scores) < max(3, int(len(result_scores) * 0.6)):
+                # Too aggressive filtering - use even lower threshold
+                min_similarity_threshold = 0.1
+                filtered_scores = [
+                    (result, score) for result, score in result_scores
+                    if score >= min_similarity_threshold
+                ]
+            
+            # If still too few, keep all but log a warning
+            if len(filtered_scores) < 3 and len(result_scores) >= 3:
+                logger.warning(
+                    "Reranking filtered out most results, keeping all",
+                    query=query[:100],
+                    original_count=len(results),
+                    filtered_count=len(filtered_scores),
+                    min_score=min(score for _, score in result_scores) if result_scores else 0.0,
+                    max_score=max(score for _, score in result_scores) if result_scores else 0.0,
+                    threshold=min_similarity_threshold,
+                )
+                filtered_scores = result_scores
+
             # Update scores in results
             reranked = []
-            for result, score in result_scores:
+            for result, score in filtered_scores:
                 # Create a copy with updated score
                 reranked_result = result.model_copy()
                 reranked_result.score = score
@@ -74,11 +147,15 @@ class SemanticReranker:
             if top_k is not None:
                 reranked = reranked[:top_k]
 
+            avg_score = sum(score for _, score in filtered_scores[:len(reranked)]) / len(reranked) if reranked else 0.0
             logger.info(
                 "Search results reranked",
-                query=query,
+                query=query[:100],
                 original_count=len(results),
+                filtered_count=len(filtered_scores),
                 reranked_count=len(reranked),
+                avg_similarity_score=round(avg_score, 3),
+                min_threshold=min_similarity_threshold,
             )
 
             return reranked

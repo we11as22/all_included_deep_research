@@ -9,7 +9,7 @@ from uuid import uuid4
 import structlog
 
 from src.memory.file_manager import FileManager
-from src.models.agent_models import AgentNote
+from src.workflow.agentic.models import AgentNote
 from src.utils.text import summarize_text
 
 logger = structlog.get_logger(__name__)

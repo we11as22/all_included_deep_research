@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
+import structlog
+from langchain_core.messages import SystemMessage, HumanMessage
+
+logger = structlog.get_logger(__name__)
 
 _sentence_splitter = re.compile(r"(?<=[.!?])\s+")
 
@@ -61,3 +66,55 @@ def ellipsize(text: str, max_chars: int) -> str:
         return text
     trimmed = text[: max_chars - 3].rstrip()
     return trimmed + "..."
+
+
+async def summarize_text_llm(text: str, max_tokens: int, llm: Any) -> str:
+    """
+    Summarize text using LLM with structured output.
+
+    Args:
+        text: Text to summarize
+        max_tokens: Target summary length in tokens (approximate)
+        llm: LLM instance
+
+    Returns:
+        Summarized text
+    """
+    if not text or not llm:
+        return ""
+
+    # Trim input if too long (to fit in context)
+    trimmed = summarize_text(text, 8000)
+
+    # If already short enough, return as-is
+    if len(trimmed) <= max_tokens * 4:  # Rough chars-to-tokens ratio
+        return trimmed
+
+    try:
+        # Import here to avoid circular dependency
+        from src.models.schemas import SummarizedContent
+
+        prompt = (
+            f"Summarize the following content concisely (target ~{max_tokens} tokens). "
+            "Focus on key facts, data, and insights. Preserve important details and context."
+        )
+
+        structured_llm = llm.with_structured_output(SummarizedContent, method="function_calling")
+
+        response = await structured_llm.ainvoke([
+            SystemMessage(content=prompt),
+            HumanMessage(content=trimmed)
+        ])
+
+        if hasattr(response, 'summary'):
+            logger.debug("LLM summarization successful", original_length=len(text), summary_length=len(response.summary))
+            return response.summary
+
+        # Fallback if response is not structured
+        logger.warning("LLM summarization returned non-structured response")
+        return summarize_text(trimmed, max_tokens * 4)
+
+    except Exception as e:
+        logger.warning("LLM summarization failed, using fallback", error=str(e))
+        # Fallback to simple truncation
+        return summarize_text(trimmed, max_tokens * 4)

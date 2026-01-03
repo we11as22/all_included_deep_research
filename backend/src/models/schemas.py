@@ -85,3 +85,14 @@ class SynthesizedAnswer(BaseModel):
         default_factory=list,
         description="Key points in the answer"
     )
+
+
+class ChatTitle(BaseModel):
+    """Structured output for chat title generation."""
+
+    title: str = Field(
+        ...,
+        description="Concise, descriptive title for the conversation (max 60 characters)",
+        min_length=1,
+        max_length=60
+    )

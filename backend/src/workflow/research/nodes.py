@@ -1,32 +1,67 @@
-"""LangGraph nodes for deep research workflow.
+"""LangGraph nodes for deep research workflow with structured outputs.
 
 Each node is an async function that takes state and returns state updates.
+All enhanced nodes use structured outputs with reasoning fields.
 """
 
 import asyncio
+import contextvars
 import structlog
 from typing import Any, Dict
 
 from langchain_core.messages import SystemMessage, HumanMessage
 
+# Context variable for runtime dependencies (not serialized in state)
+runtime_deps_context = contextvars.ContextVar('runtime_deps', default=None)
+
+
+def _get_runtime_deps() -> Dict[str, Any]:
+    """Get runtime dependencies from context variable."""
+    deps = runtime_deps_context.get()
+    return deps or {}
+
+
+def _restore_runtime_deps(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore runtime dependencies to state from context variable."""
+    deps = _get_runtime_deps()
+    for key, value in deps.items():
+        if value is not None and key not in state:
+            state[key] = value
+    return state
+
 from src.workflow.research.state import (
     ResearchState,
-    ResearchPlan,
-    SupervisorReActOutput,
-    AgentFinding,
     CompressedFindings,
-    FinalReport,
 )
-from src.workflow.research.queue import get_supervisor_queue
+from src.workflow.research.models import (
+    QueryAnalysis,
+    ResearchPlan,
+    ResearchTopic,
+    AgentCharacteristics,
+    AgentCharacteristic,
+    AgentTodo,
+    SupervisorAssessment,
+    AgentDirective,
+    FinalReport,
+    ReportSection,
+    ReportValidation,
+    ClarificationNeeds,
+)
+from src.workflow.research.supervisor_queue import SupervisorQueue
+from src.workflow.research.researcher import run_researcher_agent_enhanced
+from src.workflow.research.supervisor_agent import run_supervisor_agent
+from src.models.agent_models import AgentTodoItem
 
 logger = structlog.get_logger(__name__)
 
 
-# ==================== Memory Search Node ==========
-
+# ==================== Memory Search Node ====================
 
 async def search_memory_node(state: ResearchState) -> Dict:
     """Search vector memory for relevant context."""
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
     query = state["query"]
     stream = state.get("stream")
 
@@ -44,11 +79,13 @@ async def search_memory_node(state: ResearchState) -> Dict:
     }
 
 
-# ==================== Deep Search Node ==========
-
+# ==================== Deep Search Node ====================
 
 async def run_deep_search_node(state: ResearchState) -> Dict:
     """Run deep search to gather initial context before planning."""
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
     query = state["query"]
     chat_history = state.get("chat_history", [])
     stream = state.get("stream")
@@ -88,7 +125,13 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
             chat_history=chat_history,
         )
 
-        logger.info("Deep search completed", answer_length=len(result))
+        logger.info("Deep search completed", answer_length=len(result) if result else 0)
+
+        # Emit deep search result to frontend via stream
+        if stream and result:
+            stream.emit_status(f"Deep search completed. Found {len(result)} characters of context.", step="deep_search")
+            # Also emit as a report chunk so user can see it
+            stream.emit_report_chunk(f"## Initial Deep Search Context\n\n{result}\n\n---\n\n*This context will be used to guide the research agents.*\n\n")
 
         return {
             "deep_search_result": {"type": "override", "value": result},
@@ -99,335 +142,604 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
         return {"deep_search_result": {"type": "override", "value": None}}
 
 
-# ==================== Planning Node ==========
+# ==================== Clarifying Questions Node ====================
 
-
-async def plan_research_node(state: ResearchState) -> Dict:
-    """Initial research planning by supervisor."""
-    query = state["query"]
-    memory_context = state.get("memory_context", [])
+async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Ask clarifying questions to user if needed before starting research.
+    
+    This helps narrow down research scope and ensure we understand the query correctly.
+    """
+    query = state.get("query", "")
+    # Get deep_search_result - handle both dict and string formats
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        # If it's a dict with "type": "override", extract the value
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
     chat_history = state.get("chat_history", [])
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
     stream = state.get("stream")
-    mode = state["mode"]
-    deep_search_result = state.get("deep_search_result")
-
-    if stream:
-        stream.emit_status("Planning research...", step="planning")
-
-    # Get settings
     settings = state.get("settings")
-    num_agents = settings.deep_research_num_agents if settings else 4
-    max_topics = num_agents  # Create exactly N agents
+    
+    # Check if clarifying questions are enabled
+    if not settings or not settings.deep_research_enable_clarifying_questions:
+        logger.info("Clarifying questions disabled, skipping")
+        return {"clarification_needed": False}
+    
+    # Check if we already asked questions (look at chat history)
+    # Only skip if there are multiple exchanges (user has already answered)
+    if len(chat_history) > 4:  # More than 2 exchanges (user + assistant pairs)
+        # User has already interacted extensively, skip clarification
+        logger.info("Chat history is extensive, skipping clarification")
+        return {"clarification_needed": False}
+    
+    if stream:
+        stream.emit_status("Analyzing if clarification is needed...", step="clarification")
+        logger.info("Clarification node: deep_search_result available", 
+                   has_result=bool(deep_search_result), 
+                   result_length=len(deep_search_result) if deep_search_result else 0,
+                   result_preview=deep_search_result[:200] if deep_search_result else "")
+    
+    # Analyze if clarification is needed
+    # Deep search result is already a synthesized answer, use it fully for context
+    from src.utils.text import summarize_text
+    deep_search_summary = summarize_text(deep_search_result, 1000) if deep_search_result and len(deep_search_result) > 1000 else deep_search_result
+    deep_search_context = f"\n\nDeep search provided this context:\n{deep_search_summary}" if deep_search_summary else ""
+    logger.info("Deep search context prepared", context_length=len(deep_search_context))
+    
+    prompt = f"""Analyze if this research query needs clarification from the user.
 
-    # Include deep search context if available
-    deep_search_context = ""
-    if deep_search_result:
-        deep_search_context = f"\n\nInitial Deep Search Result:\n{deep_search_result[:1000]}...\n\nUse this as context but identify gaps and areas that need deeper investigation."
+Query: {query}
+{deep_search_context}
 
-    system_prompt = f"""You are a research planning supervisor.
+Assess whether:
+1. The query is clear and specific enough to conduct research
+2. There are ambiguous terms that need clarification
+3. The scope is well-defined or too broad
 
-Your task: Break down the research query into EXACTLY {max_topics} focused research topics.
-
-Each topic should:
-- Be specific and well-defined
-- Cover a different aspect of the query
-- Be suitable for parallel investigation by specialist agents
-- Avoid overlap
-- Address gaps in the initial research{deep_search_context}
-
-Return JSON with: reasoning, topics (list), stop (bool)
+If clarification is needed, ask 1-2 specific questions.
+If you can proceed with reasonable assumptions, indicate so.
 """
-
-    user_prompt = f"""Query: {query}
-
-Generate EXACTLY {max_topics} research topics to cover this comprehensively.
-"""
-
+    
     try:
-        # Use structured output
-        llm = state.get("llm")  # LLM should be in state
-        if not llm:
-            raise ValueError("LLM not in state")
-
-        structured_llm = llm.with_structured_output(ResearchPlan, method="function_calling")
-
-        result = await structured_llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
+        clarification = await llm.with_structured_output(ClarificationNeeds).ainvoke([
+            {"role": "system", "content": "You are a research planning expert."},
+            {"role": "user", "content": prompt}
         ])
-
-        topics = [topic.topic for topic in result.topics[:max_topics]]
-
-        logger.info("Research plan generated", topics_count=len(topics))
-
-        # Generate agent characteristics for each topic
-        agent_characteristics = await _generate_agent_characteristics(
-            topics=topics,
-            query=query,
-            llm=state.get("llm"),
-            stream=stream
+        
+        logger.info(
+            "Clarification analysis",
+            needs_clarification=clarification.needs_clarification,
+            questions_count=len(clarification.questions),
+            can_proceed=clarification.can_proceed_without
         )
+        
+        if clarification.needs_clarification and clarification.questions:
+            # Send clarifying questions to user via stream
+            if stream:
+                questions_text = "\n\n".join([
+                    f"**Q{i+1}:** {q.question}\n\n*Why needed:* {q.why_needed}\n\n*Default assumption if not answered:* {q.default_assumption}"
+                    for i, q in enumerate(clarification.questions)
+                ])
+                
+                clarification_message = f"""## 🔍 Clarification Needed
 
-        if stream:
-            stream.emit_planning({"topics": topics, "reasoning": result.reasoning})
+Before starting the research, I need to clarify a few points:
 
-        return {
-            "research_plan": topics,
-            "agent_characteristics": {"type": "override", "value": agent_characteristics},
-        }
+{questions_text}
 
+---
+
+*Note: Research will proceed with the default assumptions listed above. 
+These questions help guide the research direction.*
+"""
+                
+                stream.emit_status(clarification_message, step="clarification")
+                
+                # Emit as report chunk so it's visible to user in the main chat
+                stream.emit_report_chunk(clarification_message)
+                
+                # Also emit as a separate message event to ensure it's visible
+                logger.info("Clarifying questions sent to user", 
+                           questions_count=len(clarification.questions),
+                           message_length=len(clarification_message))
+            
+            # Check if we can proceed without answers
+            if not clarification.can_proceed_without:
+                logger.warning("Clarification needed but cannot proceed without - proceeding anyway with assumptions")
+            
+            # For now, always proceed with assumptions
+            # To implement true interactive: would need to:
+            # 1. Pause graph execution
+            # 2. Store graph state in checkpoint
+            # 3. Wait for user response via API
+            # 4. Resume graph with user answers
+            logger.info("Clarifying questions shown, proceeding with default assumptions")
+            return {
+                "clarification_needed": False,  # Always proceed for now
+                "clarification_questions": [q.dict() for q in clarification.questions]  # Store for reference
+            }
+        
+        return {"clarification_needed": False}
+        
     except Exception as e:
-        logger.error("Planning failed, using fallback", error=str(e))
-        # Fallback: Use query as single topic
-        return {
-            "research_plan": [query],
-            "agent_characteristics": {"type": "override", "value": {}},
-        }
+        logger.error("Clarification analysis failed", error=str(e))
+        return {"clarification_needed": False}
 
 
-async def _generate_agent_characteristics(topics: list, query: str, llm: Any, stream: Any) -> Dict[str, Dict]:
-    """Generate specialist characteristics for each agent based on their topic."""
-    from pydantic import BaseModel, Field
+# ==================== Analysis Node (Enhanced) ====================
 
-    class AgentCharacteristic(BaseModel):
-        role: str = Field(description="Agent's role/title (e.g., 'Senior AI Policy Expert', 'Technical Standards Analyst')")
-        expertise: str = Field(description="Specific domain expertise")
-        personality: str = Field(description="Research approach and personality traits")
+async def analyze_query_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Analyze query to determine research approach.
 
-    class AgentCharacteristics(BaseModel):
-        agents: list[AgentCharacteristic] = Field(description="List of agent characteristics for each topic")
-
-    if stream:
-        stream.emit_status("Creating specialized research agents...", step="agent_characteristics")
-
-    try:
-        system_prompt = """You are assigning expert researcher roles for parallel investigation.
-
-For each research topic, create a unique specialist agent with:
-- A specific professional role/title that matches the topic
-- Relevant domain expertise
-- A personality/approach that enhances research quality
-
-Make agents diverse and complementary. Think like assembling a real research team."""
-
-        user_prompt = f"""Research Query: {query}
-
-Topics to assign specialists for:
-{chr(10).join(f"{i+1}. {topic}" for i, topic in enumerate(topics))}
-
-Create {len(topics)} specialist agent profiles."""
-
-        structured_llm = llm.with_structured_output(AgentCharacteristics, method="function_calling")
-        result = await structured_llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ])
-
-        # Map to dict by index
-        characteristics = {}
-        for idx, agent_char in enumerate(result.agents[:len(topics)]):
-            characteristics[f"agent_{idx}"] = {
-                "role": agent_char.role,
-                "expertise": agent_char.expertise,
-                "personality": agent_char.personality,
-            }
-
-        logger.info(f"Generated characteristics for {len(characteristics)} agents")
-        return characteristics
-
-    except Exception as e:
-        logger.warning(f"Failed to generate agent characteristics: {e}")
-        # Fallback: Generic characteristics
-        return {
-            f"agent_{i}": {
-                "role": f"Research Specialist {i+1}",
-                "expertise": topic,
-                "personality": "Thorough and analytical researcher",
-            }
-            for i, topic in enumerate(topics)
-        }
-
-
-# ==================== Spawn Agents Node ==========
-
-
-async def spawn_agents_node(state: ResearchState) -> Dict:
-    """Create agent instances for research topics."""
-    topics = state.get("research_plan", [])
-    iteration = state.get("iteration", 0)
-
-    if not topics:
-        return {"active_agents": {"type": "override", "value": {}}}
-
-    active_agents = {}
-    agent_todos = {}
-    agent_notes = {}
-
-    for idx, topic in enumerate(topics):
-        agent_id = f"agent_r{iteration}_{idx}"
-        active_agents[agent_id] = {
-            "topic": topic,
-            "status": "active",
-            "findings": None,
-        }
-
-        # Initialize agent todos
-        agent_todos[agent_id] = [
-            {
-                "title": f"Research {topic}",
-                "objective": f"Gather comprehensive information about {topic}",
-                "status": "pending",
-                "priority": "high",
-            }
-        ]
-
-        agent_notes[agent_id] = []
-
-    logger.info(f"Spawned {len(active_agents)} agents", iteration=iteration)
-
-    return {
-        "active_agents": {"type": "override", "value": active_agents},
-        "agent_todos": {"type": "override", "value": agent_todos},
-        "agent_notes": {"type": "override", "value": agent_notes},
-    }
-
-
-# ==================== Execute Agents Node ==========
-
-
-async def execute_agents_node(state: ResearchState) -> Dict:
-    """Execute all active agents in parallel with semaphore."""
-    active_agents = state.get("active_agents", {})
-    max_concurrent = state["mode_config"].get("max_concurrent", 4)
-    stream = state.get("stream")
-
-    if not active_agents:
-        return {}
-
-    semaphore = asyncio.Semaphore(max_concurrent)
-
-    async def run_agent(agent_id: str, agent_data: Dict):
-        async with semaphore:
-            # Run researcher agent (import to avoid circular dependency)
-            from src.workflow.research.researcher import run_researcher_agent
-
-            try:
-                result = await run_researcher_agent(
-                    agent_id=agent_id,
-                    topic=agent_data["topic"],
-                    state=state,
-                    llm=state.get("llm"),
-                    search_provider=state.get("search_provider"),
-                    scraper=state.get("scraper"),
-                    stream=stream,
-                    max_steps=6,
-                )
-
-                # Queue supervisor review
-                queue = get_supervisor_queue(state["session_id"])
-                await queue.enqueue(agent_id, "finish", result)
-
-                return result
-
-            except Exception as e:
-                logger.error(f"Agent {agent_id} failed", error=str(e), exc_info=True)
-                return None
-
-    # Run all agents in parallel
-    tasks = [run_agent(aid, adata) for aid, adata in active_agents.items()]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Collect successful findings
-    findings = []
-    for result in results:
-        if result and not isinstance(result, Exception):
-            findings.append(result)
-
-    logger.info(f"Agent execution completed", findings=len(findings))
-
-    return {
-        "agent_findings": findings,
-        "iteration": state["iteration"] + 1,
-    }
-
-
-# ==================== Supervisor ReAct Node ==========
-
-
-async def supervisor_react_node(state: ResearchState) -> Dict:
-    """Supervisor analyzes progress and decides next action."""
-    findings = state.get("agent_findings", [])
-    iteration = state.get("iteration", 0)
-    max_iterations = state.get("max_iterations", 25)
+    Uses structured output to assess query complexity and plan.
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    query = state.get("query", "")
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
     stream = state.get("stream")
 
     if stream:
-        stream.emit_status("Supervisor reviewing progress...", step="supervisor")
+        stream.emit_status("Analyzing query complexity...", step="analysis")
 
-    # Build summary for supervisor
-    findings_summary = "\n\n".join([
-        f"Agent {f.get('agent_id')}: {f.get('topic')}\n{f.get('summary', '')[:200]}"
-        for f in findings if f
-    ])
+    prompt = f"""Analyze this research query to determine the best approach:
 
-    system_prompt = f"""You are the research supervisor.
+Query: {query}
 
-Iteration: {iteration}/{max_iterations}
-
-Evaluate: Are the findings comprehensive? Should we continue? Are there gaps?
-
-Return JSON with: reasoning, should_continue, replanning_needed, directives, new_topics, gaps_identified
-"""
-
-    user_prompt = f"""Current findings:
-{findings_summary}
-
-Should research continue?
+Assess:
+1. What are the main topics/subtopics?
+2. How complex is this query?
+3. Do we need deep search context first?
+4. How many specialized research agents would be optimal?
 """
 
     try:
-        llm = state.get("llm")
-        structured_llm = llm.with_structured_output(SupervisorReActOutput, method="function_calling")
-
-        result = await structured_llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
+        analysis = await llm.with_structured_output(QueryAnalysis).ainvoke([
+            {"role": "system", "content": "You are an expert research planner."},
+            {"role": "user", "content": prompt}
         ])
 
         logger.info(
-            "Supervisor decision",
-            should_continue=result.should_continue,
-            replan=result.replanning_needed,
-            gaps=len(result.gaps_identified)
+            "Query analyzed",
+            complexity=analysis.complexity,
+            agent_count=analysis.estimated_agent_count,
+            topics=analysis.topics
         )
 
-        if stream:
-            stream.emit_supervisor_react({
-                "reasoning": result.reasoning,
-                "should_continue": result.should_continue,
-                "gaps": result.gaps_identified,
-            })
-
         return {
-            "should_continue": {"type": "override", "value": result.should_continue},
-            "replanning_needed": {"type": "override", "value": result.replanning_needed},
-            "gaps_identified": {"type": "override", "value": result.gaps_identified},
-            "supervisor_directives": result.directives,
+            "query_analysis": analysis.dict(),
+            "requires_deep_search": analysis.requires_deep_search,
+            "estimated_agent_count": analysis.estimated_agent_count
         }
 
     except Exception as e:
-        logger.error("Supervisor ReAct failed", error=str(e))
-        # Fallback: Stop if near max iterations
+        logger.error("Query analysis failed", error=str(e))
+        # Fallback
         return {
-            "should_continue": {"type": "override", "value": iteration < max_iterations - 1},
-            "replanning_needed": {"type": "override", "value": False},
+            "query_analysis": {
+                "reasoning": "Fallback analysis due to error",
+                "topics": [query],
+                "complexity": "moderate",
+                "requires_deep_search": True,
+                "estimated_agent_count": 4
+            },
+            "requires_deep_search": True,
+            "estimated_agent_count": 4
         }
 
 
-# ==================== Compress Findings Node ==========
+# ==================== Planning Node (Enhanced) ====================
 
+async def plan_research_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create detailed research plan with structured output.
+
+    Generates research topics, priorities, and coordination strategy.
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    query = state.get("query", "")
+    query_analysis = state.get("query_analysis", {})
+    # Get deep_search_result - handle both dict and string formats
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if isinstance(deep_search_result_raw, dict):
+        # If it's a dict with "type": "override", extract the value
+        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+    else:
+        deep_search_result = deep_search_result_raw or ""
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
+    stream = state.get("stream")
+
+    if stream:
+        stream.emit_status("Creating research plan...", step="planning")
+
+    context_info = f"\n\nDeep search context:\n{deep_search_result}" if deep_search_result else ""
+
+    prompt = f"""Create a comprehensive research plan for this query:
+
+Query: {query}
+
+Query analysis: {query_analysis.get('reasoning', '')}
+Identified topics: {', '.join(query_analysis.get('topics', []))}
+Complexity: {query_analysis.get('complexity', 'moderate')}{context_info}
+
+Create a detailed research plan with specific topics for different agents to investigate.
+"""
+
+    try:
+        plan = await llm.with_structured_output(ResearchPlan).ainvoke([
+            {"role": "system", "content": "You are a research strategy expert."},
+            {"role": "user", "content": prompt}
+        ])
+
+        logger.info("Research plan created", topics=len(plan.topics))
+
+        return {
+            "research_plan": {
+                "reasoning": plan.reasoning,
+                "research_depth": plan.research_depth,
+                "coordination_strategy": plan.coordination_strategy
+            },
+            "research_topics": [topic.dict() for topic in plan.topics]
+        }
+
+    except Exception as e:
+        logger.error("Research planning failed", error=str(e))
+        # Fallback with all required fields
+        fallback_topic = ResearchTopic(
+            topic=query,
+            description=f"Research: {query}",
+            priority="high",
+            estimated_sources=5  # Default estimate for fallback
+        )
+        return {
+            "research_plan": {
+                "reasoning": "Fallback plan due to planning error",
+                "research_depth": "standard",
+                "coordination_strategy": "Parallel research"
+            },
+            "research_topics": [fallback_topic.dict()]
+        }
+
+
+# ==================== Agent Characteristics Creation (Enhanced) ====================
+
+async def create_agent_characteristics_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create specialized agent characteristics with initial todos.
+
+    Each agent gets:
+    - Unique role and expertise
+    - Personality
+    - Initial structured todos
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    query = state.get("query", "")
+    research_plan = state.get("research_plan", {})
+    research_topics = state.get("research_topics", [])
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
+    stream = state.get("stream")
+    settings = state.get("settings")
+
+    # Get agent count from settings or state
+    agent_count = state.get("estimated_agent_count", getattr(settings, "max_concurrent_agents", 4) if settings else 4)
+    agent_count = min(agent_count, len(research_topics) + 1)  # At least one per topic
+
+    if stream:
+        stream.emit_status(f"Creating {agent_count} specialized research agents...", step="agent_characteristics")
+
+    prompt = f"""Create a team of {agent_count} specialized research agents for this project:
+
+Query: {query}
+
+Research topics:
+{chr(10).join([f"- {t.get('topic')}: {t.get('description')}" for t in research_topics])}
+
+CRITICAL: Each agent must research DIFFERENT aspects to build a complete picture!
+
+For each agent, create:
+1. A unique role (e.g., "Senior Aviation Historian", "Economic Policy Analyst", "Technical Specifications Expert", "Case Study Researcher")
+2. Specific expertise area - ensure DIFFERENT angles:
+   - Historical development and evolution
+   - Technical specifications and technical details
+   - Expert opinions, analysis, and critical perspectives
+   - Real-world applications, case studies, and practical examples
+   - Industry trends, current state, and future prospects
+   - Comparative analysis with alternatives/competitors
+   - Economic, social, or cultural impact
+   - Challenges, limitations, and controversies
+3. Personality traits (thorough, analytical, critical, etc.)
+4. Initial todo list with 2-3 specific research tasks - each agent should cover DIFFERENT aspects
+
+DIVERSITY REQUIREMENT:
+- Ensure agents cover DIFFERENT angles - avoid overlap!
+- Each agent should contribute unique insights to build comprehensive understanding
+- From diverse agent findings, the supervisor will assemble a COMPLETE picture
+- Examples: one agent focuses on history, another on technical specs, another on expert views, another on applications, etc.
+"""
+
+    try:
+        characteristics = await llm.with_structured_output(AgentCharacteristics).ainvoke([
+            {"role": "system", "content": "You are an expert at designing research teams."},
+            {"role": "user", "content": prompt}
+        ])
+
+        logger.info("Agent characteristics created", agent_count=len(characteristics.agents))
+
+        # Get memory services from stream
+        agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+        agent_file_service = stream.app_state.get("agent_file_service") if stream else None
+
+        # Create agent files with initial todos
+        agent_chars = {}
+        for i, agent_char in enumerate(characteristics.agents):
+            agent_id = f"agent_{i+1}"
+
+            # Convert todos to AgentTodoItem
+            agent_todos = [
+                AgentTodoItem(
+                    reasoning=todo.reasoning,
+                    title=todo.title,
+                    objective=todo.objective,
+                    expected_output=todo.expected_output,
+                    sources_needed=todo.sources_needed,
+                    status="pending",
+                    note=""
+                )
+                for todo in agent_char.initial_todos
+            ]
+
+            # Create agent file if services available
+            if agent_file_service:
+                try:
+                    await agent_file_service.write_agent_file(
+                        agent_id=agent_id,
+                        todos=agent_todos,
+                        character=f"""**Role**: {agent_char.role}
+**Expertise**: {agent_char.expertise}
+**Personality**: {agent_char.personality}
+""",
+                        preferences=f"Focus on: {agent_char.expertise}"
+                    )
+                    logger.info(f"Agent file created", agent_id=agent_id, todos=len(agent_todos))
+                except Exception as e:
+                    logger.error(f"Failed to create agent file", agent_id=agent_id, error=str(e))
+
+            agent_chars[agent_id] = {
+                "role": agent_char.role,
+                "expertise": agent_char.expertise,
+                "personality": agent_char.personality,
+                "initial_todos": [todo.dict() for todo in agent_char.initial_todos]
+            }
+
+        return {
+            "agent_characteristics": agent_chars,
+            "agent_count": len(agent_chars),
+            "coordination_notes": characteristics.coordination_notes
+        }
+
+    except Exception as e:
+        logger.error("Agent characteristics creation failed", error=str(e))
+        # Fallback: create simple agents
+        fallback_chars = {}
+        for i in range(agent_count):
+            agent_id = f"agent_{i+1}"
+            fallback_chars[agent_id] = {
+                "role": f"Research Agent {i+1}",
+                "expertise": "general research",
+                "personality": "thorough and analytical",
+                "initial_todos": []
+            }
+        return {
+            "agent_characteristics": fallback_chars,
+            "agent_count": agent_count,
+            "coordination_notes": "Parallel research with supervisor coordination"
+        }
+
+
+# ==================== Execute Agents Node (Enhanced with Queue) ====================
+
+async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Execute research agents in parallel with supervisor queue coordination.
+    
+    Agents work in parallel, each on ONE task at a time.
+    When an agent completes a task, it queues for supervisor review.
+    Agents continue working on next tasks until all todos are done.
+    
+    This implements the requirement: "МНОГО АГЕНТОВ ПОЧТИ ОДНОВРЕМЕННО 
+    ВЫПОЛНЯЮТ ЗАДАЧУ И ВЫЗЫВАЮТ ГЛАВНОГО!"
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    agent_characteristics = state.get("agent_characteristics", {})
+    agent_count = state.get("agent_count", 4)
+    llm = state.get("llm")
+    search_provider = state.get("search_provider")
+    scraper = state.get("scraper")
+    stream = state.get("stream")
+    settings = state.get("settings")
+    max_iterations = state.get("max_iterations", 25)
+    current_iteration = state.get("iteration", 0)
+
+    if stream:
+        stream.emit_status(f"Executing {agent_count} research agents in parallel...", step="agents")
+
+    # Create supervisor queue
+    supervisor_queue = SupervisorQueue()
+
+    # Store in state for agents to access
+    state["supervisor_queue"] = supervisor_queue
+    
+    # All collected findings from all agent iterations
+    all_findings = []
+    
+    # Run agents in continuous mode until all todos complete or max iterations
+    agents_active = True
+    iteration_count = 0
+    
+    while agents_active and iteration_count < max_iterations:
+        iteration_count += 1
+        logger.info(f"Agent execution cycle {iteration_count}")
+        
+        # Launch all agents in parallel for this iteration
+        agent_tasks = []
+        for agent_id in agent_characteristics.keys():
+            task = asyncio.create_task(
+                run_researcher_agent_enhanced(
+                    agent_id=agent_id,
+                    state=state,
+                    llm=llm,
+                    search_provider=search_provider,
+                    scraper=scraper,
+                    stream=stream,
+                    supervisor_queue=supervisor_queue,
+                    max_steps=8
+                )
+            )
+            agent_tasks.append((agent_id, task))
+
+        logger.info(f"Launched {len(agent_tasks)} agents for cycle {iteration_count}")
+
+        # Collect results from this cycle - wait for all agents in parallel
+        cycle_findings = []
+        no_tasks_count = 0
+        
+        # Gather all agent tasks in parallel (not sequentially)
+        agent_results = await asyncio.gather(
+            *[task for _, task in agent_tasks],
+            return_exceptions=True
+        )
+        
+        # Process results
+        for (agent_id, _), result in zip(agent_tasks, agent_results):
+            if isinstance(result, Exception):
+                logger.error(f"Agent {agent_id} failed", error=str(result), exc_info=result)
+            elif result:
+                if result.get("topic") == "no_tasks":
+                    no_tasks_count += 1
+                    logger.info(f"Agent {agent_id} has no tasks")
+                else:
+                    cycle_findings.append(result)
+                    all_findings.append(result)
+                    logger.info(f"Agent {agent_id} completed task", sources=len(result.get("sources", [])))
+
+        # If all agents report no tasks, stop
+        if no_tasks_count == len(agent_tasks):
+            logger.info("All agents report no tasks, stopping agent execution")
+            agents_active = False
+            break
+        
+        # After each cycle, process supervisor queue if there are completions
+        if supervisor_queue.size() > 0:
+            logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue")
+            
+            # Call supervisor agent to review and assign new tasks
+            from src.workflow.research.supervisor_agent import run_supervisor_agent
+            
+            try:
+                decision = await run_supervisor_agent(
+                    state=state,
+                    llm=llm,
+                    stream=stream,
+                    max_iterations=10
+                )
+                
+                # Update state with supervisor decision
+                state["should_continue"] = decision.get("should_continue", False)
+                state["replanning_needed"] = decision.get("replanning_needed", False)
+                
+                # Clear the queue after processing
+                while not supervisor_queue.queue.empty():
+                    try:
+                        supervisor_queue.queue.get_nowait()
+                        supervisor_queue.queue.task_done()
+                    except:
+                        break
+                        
+                logger.info("Supervisor queue processed", decision=decision.get("should_continue"))
+                
+            except Exception as e:
+                logger.error("Supervisor processing failed", error=str(e))
+
+    # Add findings to agent_findings (using reducer)
+    return {
+        "agent_findings": all_findings,
+        "findings": all_findings,  # Keep for supervisor review
+        "findings_count": len(all_findings),
+        "iteration": current_iteration + iteration_count
+    }
+
+
+# ==================== Supervisor Review (Enhanced) ====================
+
+async def supervisor_review_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Supervisor reviews all findings using LangGraph agent with ReAct format.
+    
+    The supervisor is now a full agent with tools:
+    - read_main_document
+    - write_main_document  
+    - review_agent_progress
+    - create_agent_todo
+    - make_final_decision
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
+    stream = state.get("stream")
+
+    # Use new supervisor agent with ReAct format
+    try:
+        decision = await run_supervisor_agent(
+            state=state,
+            llm=llm,
+            stream=stream,
+            max_iterations=10
+        )
+        
+        logger.info("Supervisor agent completed", decision=decision)
+        return decision
+        
+    except Exception as e:
+        logger.error("Supervisor agent failed", error=str(e), exc_info=True)
+        # Fallback: stop research
+        return {
+            "should_continue": False,
+            "replanning_needed": False,
+            "gaps_identified": [],
+            "iteration": state.get("iteration", 0) + 1,
+            "completion_criteria_met": True
+        }
+
+
+# ==================== Compress Findings Node ====================
 
 async def compress_findings_node(state: ResearchState) -> Dict:
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
     """Compress all findings before final report."""
     findings = state.get("agent_findings", [])
     stream = state.get("stream")
@@ -472,50 +784,158 @@ Return JSON with: reasoning, compressed_summary, key_themes, important_sources
         return {"compressed_research": {"type": "override", "value": findings_text}}
 
 
-# ==================== Generate Report Node ==========
+# ==================== Final Report Generation (Enhanced) ====================
 
+async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Generate final research report with validation.
 
-async def generate_report_node(state: ResearchState) -> Dict:
-    """Generate final markdown report."""
-    compressed = state.get("compressed_research", "")
-    query = state["query"]
+    Uses structured output for well-organized report.
+    """
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    query = state.get("query", "")
+    # Use findings from execute_agents, fallback to agent_findings
+    findings = state.get("findings", state.get("agent_findings", []))
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
     stream = state.get("stream")
 
     if stream:
         stream.emit_status("Generating final report...", step="report")
 
-    system_prompt = """Generate a comprehensive research report in markdown.
+    # Get memory service to read main document
+    agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+    main_document = ""
+    if agent_memory_service:
+        try:
+            main_document = await agent_memory_service.read_main_file()
+            logger.info("Read main document", length=len(main_document))
+        except Exception as e:
+            logger.warning("Could not read main document", error=str(e))
 
-Include:
-- Clear structure with headings
-- Inline citations [1], [2]
-- Sources section at end
+    # Compile all findings
+    findings_text = "\n\n".join([
+        f"### {f.get('topic')}\n{f.get('summary', '')}\n\nKey findings:\n" +
+        "\n".join([f"- {kf}" for kf in f.get('key_findings', [])[:5]])
+        for f in findings
+    ])
 
-Return JSON with: reasoning, report (markdown), key_findings, sources_count
+    prompt = f"""Generate a comprehensive final research report.
+
+Query: {query}
+
+Main research document:
+{main_document}
+
+Additional findings:
+{findings_text}
+
+Create a well-structured report with:
+1. Executive summary
+2. Detailed sections with analysis
+3. Evidence-based conclusions
+4. Citations to sources
 """
 
     try:
-        llm = state.get("llm")
-        structured_llm = llm.with_structured_output(FinalReport, method="function_calling")
-
-        result = await structured_llm.ainvoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=f"Query: {query}\n\nResearch:\n{compressed}")
+        report = await llm.with_structured_output(FinalReport).ainvoke([
+            {"role": "system", "content": "You are an expert research report writer."},
+            {"role": "user", "content": prompt}
         ])
 
-        logger.info("Final report generated", length=len(result.report))
+        # Validate report
+        # Use summarize_text for intelligent truncation, not hard cut
+        from src.utils.text import summarize_text
+        exec_summary_preview = summarize_text(report.executive_summary, 500)
+        conclusion_preview = summarize_text(report.conclusion, 300)
+        
+        validation_prompt = f"""Validate this research report for quality.
 
+Query: {query}
+
+Report title: {report.title}
+Executive summary: {exec_summary_preview}
+Sections: {len(report.sections)}
+Conclusion: {conclusion_preview}
+
+Check for completeness, accuracy, and quality.
+"""
+
+        validation = await llm.with_structured_output(ReportValidation).ainvoke([
+            {"role": "system", "content": "You are a research quality auditor."},
+            {"role": "user", "content": validation_prompt}
+        ])
+
+        logger.info(
+            "Report generated and validated",
+            is_complete=validation.is_complete,
+            quality_score=validation.quality_score,
+            sections=len(report.sections)
+        )
+
+        # Format as markdown
+        report_markdown = f"""# {report.title}
+
+## Executive Summary
+
+{report.executive_summary}
+
+"""
+        for section in report.sections:
+            report_markdown += f"""## {section.title}
+
+{section.content}
+
+"""
+
+        report_markdown += f"""## Conclusion
+
+{report.conclusion}
+
+---
+
+*Confidence Level: {report.confidence_level}*
+*Research Quality Score: {validation.quality_score}/10*
+"""
+
+        # Stream report in chunks
         if stream:
-            stream.emit_final_report(result.report)
+            logger.info("Streaming final report", report_length=len(report_markdown))
+            chunk_size = 500
+            for i in range(0, len(report_markdown), chunk_size):
+                chunk = report_markdown[i:i+chunk_size]
+                stream.emit_report_chunk(chunk)
+                await asyncio.sleep(0.02)  # Small delay for smooth streaming
+            logger.info("Final report chunks streamed", total_chunks=(len(report_markdown) + chunk_size - 1) // chunk_size)
 
+        logger.info("Returning final report from node", report_length=len(report_markdown))
         return {
-            "final_report": {"type": "override", "value": result.report},
-            "confidence": {"type": "override", "value": "high"},
+            "final_report": report_markdown,
+            "confidence": report.confidence_level
         }
 
     except Exception as e:
         logger.error("Report generation failed", error=str(e))
+        # Fallback
+        fallback_report = f"""# Research Report: {query}
+
+{main_document if main_document else findings_text}
+"""
         return {
-            "final_report": {"type": "override", "value": compressed or "Research failed"},
-            "confidence": {"type": "override", "value": "low"},
+            "final_report": fallback_report,
+            "confidence": "low"
         }
+
+
+# ==================== Aliases for Backward Compatibility ====================
+
+# Old names point to enhanced versions
+plan_research_node = plan_research_enhanced_node
+spawn_agents_node = create_agent_characteristics_enhanced_node
+execute_agents_node = execute_agents_enhanced_node
+supervisor_react_node = supervisor_review_enhanced_node
+generate_report_node = generate_final_report_enhanced_node

@@ -10,7 +10,7 @@ ENV TOKENIZERS_PARALLELISM=false
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including searxng build dependencies
+# Install system dependencies
 RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
@@ -45,15 +45,12 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
     python3-babel \
     python3-venv \
     python-is-python3 \
-    uwsgi \
-    uwsgi-plugin-python3 \
     git \
     build-essential \
     libxslt-dev \
     zlib1g-dev \
     libffi-dev \
     libssl-dev \
-    sudo \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 
 # Copy requirements and source code for package installation
@@ -76,54 +73,12 @@ COPY backend/alembic ./alembic
 # Create memory directory
 RUN mkdir -p /memory_files
 
-# Setup searxng user and directories (similar to Perplexica)
-RUN useradd --shell /bin/bash --system \
-    --home-dir "/usr/local/searxng" \
-    --comment 'Privacy-respecting metasearch engine' \
-    searxng
-
-RUN mkdir "/usr/local/searxng"
-RUN mkdir -p /etc/searxng
-RUN mkdir -p /var/cache/searxng
-RUN chown -R "searxng:searxng" "/usr/local/searxng"
-RUN chown -R "searxng:searxng" "/var/cache/searxng"
-
-# Copy searxng configuration files
-COPY docker/searxng/settings.yml /etc/searxng/settings.yml
-COPY docker/searxng/limiter.toml /etc/searxng/limiter.toml
-COPY docker/searxng/uwsgi.ini /etc/searxng/uwsgi.ini
-RUN chown -R searxng:searxng /etc/searxng
-
-# Switch to searxng user to clone and setup searxng
-USER searxng
-
-# Clone searxng repository
-RUN git clone "https://github.com/searxng/searxng" \
-                   "/usr/local/searxng/searxng-src"
-
-# Create Python virtual environment for searxng
-RUN python3 -m venv "/usr/local/searxng/searx-pyenv"
-RUN "/usr/local/searxng/searx-pyenv/bin/pip" install --upgrade pip setuptools wheel pyyaml msgspec
-RUN cd "/usr/local/searxng/searxng-src" && \
-    "/usr/local/searxng/searx-pyenv/bin/pip" install --use-pep517 --no-build-isolation -e .
-# Install uwsgi in virtual environment for compatibility
-RUN "/usr/local/searxng/searx-pyenv/bin/pip" install uwsgi
-
-# Switch back to root
-USER root
-
 # Copy entrypoint script
 COPY backend/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh && sed -i 's/\r$//' /entrypoint.sh || true
 
-# Allow searxng user to use sudo (needed for flask run)
-RUN echo "searxng ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-
 # Expose ports
-EXPOSE 8000 8080
-
-# Set environment variable for searxng
-ENV SEARXNG_API_URL=http://localhost:8080
+EXPOSE 8000
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \

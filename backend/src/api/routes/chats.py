@@ -123,24 +123,121 @@ async def get_chat(chat_id: str, app_request: Request):
         }
 
 
-@router.delete("/{chat_id}")
-async def delete_chat(chat_id: str, app_request: Request):
-    """Delete a chat and all its messages."""
+@router.patch("/{chat_id}/title")
+async def update_chat_title(chat_id: str, title: str, app_request: Request):
+    """Update chat title."""
     session_factory = app_request.app.state.session_factory
-    
+
     async with session_factory() as session:
         result = await session.execute(
             select(ChatModel).where(ChatModel.id == chat_id)
         )
         chat = result.scalar_one_or_none()
-        
+
         if not chat:
             raise HTTPException(status_code=404, detail="Chat not found")
-        
+
+        chat.title = title
+        chat.updated_at = datetime.utcnow()
+        await session.commit()
+
+        logger.info("Chat title updated", chat_id=chat_id, title=title)
+        return {"id": chat.id, "title": chat.title}
+
+
+@router.post("/{chat_id}/generate-title")
+async def generate_chat_title(chat_id: str, app_request: Request):
+    """Auto-generate chat title using LLM based on first messages."""
+    session_factory = app_request.app.state.session_factory
+
+    async with session_factory() as session:
+        # Get chat with messages
+        result = await session.execute(
+            select(ChatModel).where(ChatModel.id == chat_id)
+        )
+        chat = result.scalar_one_or_none()
+
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        # Get first few messages
+        messages_result = await session.execute(
+            select(ChatMessageModel)
+            .where(ChatMessageModel.chat_id == chat_id)
+            .order_by(ChatMessageModel.created_at)
+            .limit(4)
+        )
+        messages = messages_result.scalars().all()
+
+        if not messages:
+            return {"id": chat.id, "title": "New Chat"}
+
+        # Build conversation context
+        conversation = "\n".join([
+            f"{msg.role}: {msg.content[:200]}" for msg in messages
+        ])
+
+        # Generate title using LLM
+        try:
+            from langchain_core.messages import SystemMessage, HumanMessage
+
+            llm = app_request.app.state.chat_llm
+
+            # Use structured output for title generation
+            from src.models.schemas import ChatTitle
+            
+            structured_llm = llm.with_structured_output(ChatTitle, method="function_calling")
+            title_response = await structured_llm.ainvoke([
+                SystemMessage(content="Generate a concise, descriptive title (max 60 characters) for this conversation."),
+                HumanMessage(content=conversation)
+            ])
+
+            if isinstance(title_response, ChatTitle):
+                generated_title = title_response.title.strip().strip('"').strip("'")[:60]
+            else:
+                # Fallback
+                generated_title = title_response.content.strip().strip('"').strip("'")[:60] if hasattr(title_response, "content") else "New Chat"
+
+            # Update chat title
+            chat.title = generated_title
+            chat.updated_at = datetime.utcnow()
+            await session.commit()
+
+            logger.info("Chat title generated", chat_id=chat_id, title=generated_title)
+            return {"id": chat.id, "title": chat.title}
+
+        except Exception as e:
+            logger.error("Failed to generate title", error=str(e))
+            # Fallback: use first user message
+            user_msg = next((m for m in messages if m.role == "user"), None)
+            if user_msg:
+                fallback_title = user_msg.content[:60]
+                chat.title = fallback_title
+                chat.updated_at = datetime.utcnow()
+                await session.commit()
+                return {"id": chat.id, "title": fallback_title}
+
+            return {"id": chat.id, "title": "New Chat"}
+
+
+@router.delete("/{chat_id}")
+async def delete_chat(chat_id: str, app_request: Request):
+    """Delete a chat and all its messages."""
+    session_factory = app_request.app.state.session_factory
+
+    async with session_factory() as session:
+        result = await session.execute(
+            select(ChatModel).where(ChatModel.id == chat_id)
+        )
+        chat = result.scalar_one_or_none()
+
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
         # Delete chat from database (cascades to messages)
         await session.delete(chat)
         await session.commit()
-        
+
         logger.info("Chat deleted", chat_id=chat_id)
         return {"status": "deleted", "chat_id": chat_id}
 
@@ -184,11 +281,15 @@ async def add_message(
                 embedding_provider = app_request.app.state.embedding_provider
                 embedding_vector = await embedding_provider.embed_text(content)
 
-                # Normalize embedding to 1536 dimensions (database schema requirement)
-                if len(embedding_vector) < 1536:
-                    embedding_vector = list(embedding_vector) + [0.0] * (1536 - len(embedding_vector))
-                elif len(embedding_vector) > 1536:
-                    embedding_vector = embedding_vector[:1536]
+                # Normalize embedding to database schema dimension (not provider dimension!)
+                # Database schema uses EMBEDDING_DIMENSION from settings/environment
+                from src.database.schema import EMBEDDING_DIMENSION
+                db_dimension = EMBEDDING_DIMENSION
+                
+                if len(embedding_vector) < db_dimension:
+                    embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                elif len(embedding_vector) > db_dimension:
+                    embedding_vector = embedding_vector[:db_dimension]
 
                 embedding = embedding_vector
             except Exception as e:

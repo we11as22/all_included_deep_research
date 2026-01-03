@@ -39,13 +39,25 @@ class SearXNGSearchProvider(SearchProvider):
         logger.info("SearXNGSearchProvider initialized", instance_url=self.instance_url)
 
     def _build_params(self, query: str, engines_override: list[str] | None) -> dict[str, str | int]:
+        """
+        Build search parameters for SearXNG.
+        
+        Language handling:
+        - If language is empty string, SearXNG will auto-detect
+        - We provide hints for Russian (Cyrillic detection)
+        - Otherwise use configured language
+        """
         language = self._select_language(query)
         params: dict[str, str | int] = {
             "q": query,
             "format": "json",
-            "language": language,
             "safesearch": self.safesearch,
         }
+        
+        # Only add language parameter if it's not empty (let SearXNG auto-detect if empty)
+        if language:
+            params["language"] = language
+        
         if self.categories:
             params["categories"] = ",".join(self.categories)
         engines = engines_override if engines_override is not None else self.engines
@@ -54,11 +66,33 @@ class SearXNGSearchProvider(SearchProvider):
         return params
 
     def _select_language(self, query: str) -> str:
+        """
+        Select language for SearXNG query.
+        
+        Universal language support:
+        - SearXNG can auto-detect language from query content
+        - We provide hints for known languages (e.g., Russian from Cyrillic)
+        - If language is empty string, SearXNG will auto-detect
+        - Otherwise use configured language
+        
+        Returns:
+            Language code (e.g., "en", "ru", "de") or empty string for auto-detect
+        """
         if not query:
-            return self.language
-        if self._contains_cyrillic(query) and self.language in {"en", ""}:
-            return "ru"
-        return self.language
+            # If no query, use configured language or auto-detect
+            return self.language if self.language else ""
+        
+        # Auto-detect Russian from Cyrillic characters
+        if self._contains_cyrillic(query):
+            # If default is English or empty, use Russian
+            if self.language in {"en", ""}:
+                return "ru"
+            # Otherwise keep configured language
+        
+        # Use configured language, or empty string to let SearXNG auto-detect
+        # Empty string means SearXNG will auto-detect based on query content
+        # This works for all languages (Chinese, Japanese, Arabic, etc.)
+        return self.language if self.language else ""
 
     @staticmethod
     def _contains_cyrillic(text: str) -> bool:
@@ -170,26 +204,19 @@ class SearXNGSearchProvider(SearchProvider):
                 if total_results == 0 and len(results) > 0:
                     total_results = len(results)
 
+                # No filtering - just return results as-is
+                # Semantic reranking (embeddings) will handle proper ranking by query similarity
                 filtered_results = self._filter_results_by_query(query, results, max_results)
 
                 logger.info(
                     "SearXNG search completed",
-                    query=query,
+                    query=query[:100],
                     results_count=len(filtered_results),
                     total_results=total_results,
                     raw_results_processed=len(raw_results),
                     number_of_results_from_api=data.get("number_of_results", 0),
                     label=label,
                 )
-
-                if len(filtered_results) == 0 and len(raw_results) > 0:
-                    logger.warning(
-                        "SearXNG returned raw results but none were valid",
-                        query=query,
-                        raw_results_count=len(raw_results),
-                        sample_result=raw_results[0] if raw_results else None,
-                        label=label,
-                    )
 
                 return SearchResponse(
                     query=query,
@@ -228,43 +255,29 @@ class SearXNGSearchProvider(SearchProvider):
         return False
 
     def _tokenize(self, text: str) -> list[str]:
-        return [token for token in re.findall(r"\w+", text.lower()) if len(token) >= 3]
+        """Tokenize text supporting all Unicode languages."""
+        # Use Unicode word boundaries to support all languages (Latin, Cyrillic, CJK, etc.)
+        # \w+ matches word characters in any language when used with re.UNICODE
+        tokens = re.findall(r'\b\w+\b', text.lower(), re.UNICODE)
+        # Filter out very short tokens (less than 2 chars)
+        return [token for token in tokens if len(token) >= 2]
+
 
     def _filter_results_by_query(
         self, query: str, results: list[SearchResult], max_results: int
     ) -> list[SearchResult]:
+        """
+        Return results as-is from SearXNG.
+        
+        No filtering - we rely on semantic reranking (embeddings) in chat service
+        to properly rank results by query similarity. SearXNG already does
+        language-aware filtering and initial ranking.
+        """
         if not results:
             return results
-        query_tokens = set(self._tokenize(query))
-        if not query_tokens:
-            return results
-
-        def overlap_count(item: SearchResult) -> int:
-            haystack = f"{item.title} {item.snippet}"
-            tokens = set(self._tokenize(haystack))
-            return len(query_tokens & tokens)
-
-        min_overlap = 2 if len(query_tokens) >= 4 else 1
-        filtered = [item for item in results if overlap_count(item) >= min_overlap]
-
-        if filtered:
-            if len(filtered) != len(results):
-                logger.info(
-                    "Filtered low-relevance SearXNG results",
-                    query=query,
-                    before=len(results),
-                    after=len(filtered),
-                    min_overlap=min_overlap,
-                )
-            return filtered
-
-        logger.info(
-            "No SearXNG results matched query tokens; returning empty",
-            query=query,
-            before=len(results),
-            min_overlap=min_overlap,
-        )
-        return []
+        
+        # Just return top results as-is - semantic reranking will handle ranking
+        return results[:max_results]
 
 
     def _prefer_fallback(
@@ -306,8 +319,8 @@ class SearXNGSearchProvider(SearchProvider):
                     session,
                     query,
                     max_results=max_results,
-                    engines_override=["duckduckgo"],
-                    label="duckduckgo",
+                    engines_override=["google", "bing"],
+                    label="fallback",
                 )
 
                 if self._prefer_fallback(primary.results, fallback.results):

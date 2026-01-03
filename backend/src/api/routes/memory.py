@@ -83,7 +83,9 @@ async def create_memory_file(memory_request: MemoryCreateRequest, app_request: R
         )
 
         # Sync to database
-        embedding_dimension = getattr(app_request.app.state, "embedding_dimension", 1536)
+        # Use database schema dimension (not provider dimension!)
+        from src.database.schema import EMBEDDING_DIMENSION
+        embedding_dimension = EMBEDDING_DIMENSION
         file_id = await memory_manager.sync_file_to_db(memory_request.file_path, embedding_dimension=embedding_dimension)
         file_record = await memory_manager.get_file_by_path(memory_request.file_path)
 

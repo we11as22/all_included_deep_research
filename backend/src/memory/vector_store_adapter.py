@@ -77,7 +77,7 @@ class FAISSAdapter(VectorStoreAdapter):
     Suitable for small to medium datasets (<100K embeddings).
     """
 
-    def __init__(self, dimension: int = 1536):
+    def __init__(self, dimension: int = 1536):  # Default, but should be passed from settings
         """Initialize FAISS index."""
         try:
             import faiss
@@ -361,7 +361,7 @@ class MockVectorStoreAdapter(VectorStoreAdapter):
 
 def create_vector_store(
     store_type: str,
-    dimension: int = 1536,
+    dimension: int = 1536,  # Default, but should be passed from settings
     persist_directory: str = "./vector_store",
     collection_name: str = "embeddings",
 ) -> VectorStoreAdapter:

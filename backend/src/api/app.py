@@ -26,7 +26,6 @@ from src.api.routes import (
     config_router,
     health_router,
     memory_router,
-    research_router,
 )
 
 logger = structlog.get_logger(__name__)
@@ -146,6 +145,16 @@ async def lifespan(app: FastAPI):
     app.state.compression_llm = compression_llm
     app.state.final_report_llm = final_report_llm
 
+    # Initialize chat LLM for general chat operations
+    logger.info("Initializing chat LLM...")
+    chat_llm = create_chat_model(
+        settings.chat_model,
+        settings,
+        max_tokens=settings.chat_model_max_tokens,
+        temperature=0.7,
+    )
+    app.state.chat_llm = chat_llm
+
     # Initialize chat search service
     logger.info("Initializing chat search service...")
     chat_service = ChatSearchService(
@@ -205,7 +214,6 @@ def create_app() -> FastAPI:
     app.include_router(chat_router)
     app.include_router(chat_stream_router)
     app.include_router(chats_router)
-    app.include_router(research_router)
     app.include_router(memory_router)
     app.include_router(config_router)
 

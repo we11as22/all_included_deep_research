@@ -4,7 +4,7 @@ Defines the state structure for the multi-agent research system.
 """
 
 import operator
-from typing import Annotated, Any, Dict, List, TypedDict
+from typing import Annotated, Any, TypedDict
 
 from pydantic import BaseModel, Field
 
@@ -23,31 +23,35 @@ class ResearchState(TypedDict):
     chat_history: list  # List of message dicts
     mode: str  # speed, balanced, quality
 
+    # ========== Analysis ==========
+    query_analysis: dict[str, Any]  # QueryAnalysis structured output
+
     # ========== Planning ==========
-    research_plan: Annotated[List[str], operator.add]  # Topics to research
-    completed_topics: Annotated[List[str], operator.add]  # Finished topics
+    research_plan: dict[str, Any]  # Research plan metadata (reasoning, depth, strategy)
+    research_topics: list[dict]  # List of research topics to investigate
+    completed_topics: Annotated[list[str], operator.add]  # Finished topics
 
     # ========== Agent Execution ==========
-    active_agents: Dict[str, Dict]  # agent_id -> {topic, status, findings}
-    agent_findings: Annotated[List[Dict], operator.add]  # All agent findings
-    agent_todos: Dict[str, List[Dict]]  # agent_id -> todo list
-    agent_notes: Dict[str, List[Dict]]  # agent_id -> notes list
+    active_agents: dict[str, dict]  # agent_id -> {topic, status, findings}
+    agent_findings: Annotated[list[dict], operator.add]  # All agent findings
+    agent_todos: dict[str, list[dict]]  # agent_id -> todo list
+    agent_notes: dict[str, list[dict]]  # agent_id -> notes list
 
     # ========== Supervisor State ==========
-    supervisor_directives: Annotated[List[Dict], operator.add]  # Directive queue
+    supervisor_directives: Annotated[list[dict], operator.add]  # Directive queue
     replanning_needed: bool
-    gaps_identified: List[str]
+    gaps_identified: list[str]
 
     # ========== Deep Search ==========
     deep_search_result: str  # Initial deep search answer
 
     # ========== Memory ==========
-    memory_context: List[Dict]  # Memory search results
+    memory_context: list[dict]  # Memory search results
     main_file_content: str  # Main research file content
-    shared_notes: Annotated[List[Dict], operator.add]  # Cross-agent shared notes
+    shared_notes: Annotated[list[dict], operator.add]  # Cross-agent shared notes
 
     # ========== Agent Characteristics ==========
-    agent_characteristics: Dict[str, Dict]  # agent_id -> {role, expertise, personality}
+    agent_characteristics: dict[str, dict]  # agent_id -> {role, expertise, personality}
 
     # ========== Output ==========
     final_report: str
@@ -56,10 +60,24 @@ class ResearchState(TypedDict):
     # ========== Settings ==========
     settings: Any  # Settings object
 
+    # ========== Dependencies (not persisted in state, added at runtime) ==========
+    llm: Any  # LLM instance
+    search_provider: Any  # Search provider
+    scraper: Any  # Web scraper
+    supervisor_queue: Any  # Supervisor queue for agent coordination
+
     # ========== Control Flow ==========
     iteration: int
     max_iterations: int
     should_continue: bool
+    estimated_agent_count: int  # Estimated number of agents from analysis
+    agent_count: int  # Actual number of agents created
+    requires_deep_search: bool  # Whether deep search is needed
+    clarification_needed: bool  # Whether user clarification is needed
+    findings: list[dict]  # Findings from execute_agents (temporary, before adding to agent_findings)
+    findings_count: int  # Count of findings
+    compressed_research: str  # Compressed findings before final report
+    coordination_notes: str  # Notes on how agents should coordinate
 
     # ========== Streaming ==========
     stream: Any  # Streaming generator
@@ -68,7 +86,7 @@ class ResearchState(TypedDict):
     session_id: str
 
     # ========== Mode Config ==========
-    mode_config: Dict[str, Any]  # max_concurrent, max_sources, etc.
+    mode_config: dict[str, Any]  # max_concurrent, max_sources, etc.
 
 
 # ==================== Pydantic Models for Structured Outputs ==========
@@ -87,7 +105,7 @@ class ResearchPlan(BaseModel):
     """Initial research plan from supervisor."""
 
     reasoning: str = Field(description="Overall research strategy")
-    topics: List[ResearchTopic] = Field(description="List of research topics")
+    topics: list[ResearchTopic] = Field(description="List of research topics")
     stop: bool = Field(default=False, description="Whether planning is complete")
 
 
@@ -97,15 +115,15 @@ class SupervisorReActOutput(BaseModel):
     reasoning: str = Field(description="Analysis of current research state")
     should_continue: bool = Field(description="Whether research should continue")
     replanning_needed: bool = Field(description="Whether new topics are needed")
-    directives: List[Dict] = Field(
+    directives: list[dict] = Field(
         default_factory=list,
         description="Todo updates for agents: [{agent_id, action, content}]"
     )
-    new_topics: List[str] = Field(
+    new_topics: list[str] = Field(
         default_factory=list,
         description="New research topics to explore"
     )
-    gaps_identified: List[str] = Field(
+    gaps_identified: list[str] = Field(
         default_factory=list,
         description="Identified research gaps"
     )
@@ -117,8 +135,8 @@ class AgentFinding(BaseModel):
     agent_id: str
     topic: str
     summary: str
-    key_findings: List[str]
-    sources: List[Dict[str, str]]  # [{title, url}]
+    key_findings: list[str]
+    sources: list[dict[str, str]]  # [{title, url}]
     confidence: str = "medium"
 
 
@@ -127,17 +145,11 @@ class CompressedFindings(BaseModel):
 
     reasoning: str = Field(description="Why these are the key findings")
     compressed_summary: str = Field(description="Synthesized summary (800-1200 words)")
-    key_themes: List[str] = Field(description="Common themes across findings")
-    important_sources: List[str] = Field(description="Most important source URLs")
+    key_themes: list[str] = Field(description="Common themes across findings")
+    important_sources: list[str] = Field(description="Most important source URLs")
 
 
-class FinalReport(BaseModel):
-    """Final research report."""
-
-    reasoning: str = Field(description="Report structure rationale")
-    report: str = Field(description="Complete markdown report with citations")
-    key_findings: List[str] = Field(description="Summary of key findings")
-    sources_count: int = Field(description="Number of unique sources")
+# FinalReport is now defined in models.py - removed duplicate
 
 
 # ==================== Helper Functions ==========
@@ -149,7 +161,7 @@ def create_initial_state(
     mode: str,
     stream: Any,
     session_id: str,
-    mode_config: Dict[str, Any],
+    mode_config: dict[str, Any],
     settings: Any = None,
 ) -> ResearchState:
     """Create initial state for research graph."""
@@ -160,8 +172,12 @@ def create_initial_state(
         "chat_history": chat_history,
         "mode": mode,
 
+        # Analysis
+        "query_analysis": {},
+
         # Planning
-        "research_plan": [],
+        "research_plan": {},
+        "research_topics": [],
         "completed_topics": [],
 
         # Deep Search
@@ -204,4 +220,14 @@ def create_initial_state(
 
         # Settings
         "settings": settings,
+
+        # Additional fields
+        "estimated_agent_count": 4,
+        "agent_count": 0,
+        "requires_deep_search": True,
+        "clarification_needed": False,
+        "findings": [],
+        "findings_count": 0,
+        "compressed_research": "",
+        "coordination_notes": "",
     }

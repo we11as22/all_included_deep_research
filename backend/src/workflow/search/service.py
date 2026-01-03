@@ -130,21 +130,42 @@ If you don't know something or it requires recent information, say so clearly.""
 
         messages.append(HumanMessage(content=query))
 
-        # Get response
-        response = await self.classifier_llm.ainvoke(messages)
-        answer = response.content if hasattr(response, "content") else str(response)
+        # Use structured output for chat response
+        from src.models.schemas import SynthesizedAnswer
+        
+        structured_llm = self.classifier_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
+        response = await structured_llm.ainvoke(messages)
+        
+        if isinstance(response, SynthesizedAnswer):
+            answer = response.answer.strip()
+        else:
+            # Fallback
+            answer = response.content.strip() if hasattr(response, "content") else str(response)
 
         return answer
 
     async def _answer_web_search(
         self,
         query: str,
-        classification: QueryClassification,
+        classification: QueryClassification | None,
         stream: Any,
         chat_history: list[dict],
     ) -> str:
         """Quick web search (speed mode - 2 iterations)."""
         logger.info("Answering with web search (speed mode)")
+
+        # Create classification if not provided
+        if classification is None:
+            if stream:
+                stream.emit_status("Classifying query...", step="classification")
+            classification = await classify_query(
+                query, chat_history, self.classifier_llm
+            )
+            logger.info(
+                "Query classified",
+                type=classification.query_type,
+                mode=classification.suggested_mode,
+            )
 
         # Research stage
         research_results = await research_agent(
@@ -173,12 +194,25 @@ If you don't know something or it requires recent information, say so clearly.""
     async def _answer_deep_search(
         self,
         query: str,
-        classification: QueryClassification,
+        classification: QueryClassification | None,
         stream: Any,
         chat_history: list[dict],
     ) -> str:
         """Deep search with iterations (balanced mode - 6 iterations)."""
         logger.info("Answering with deep search (balanced mode)")
+
+        # Create classification if not provided
+        if classification is None:
+            if stream:
+                stream.emit_status("Classifying query...", step="classification")
+            classification = await classify_query(
+                query, chat_history, self.classifier_llm
+            )
+            logger.info(
+                "Query classified",
+                type=classification.query_type,
+                mode=classification.suggested_mode,
+            )
 
         # Research stage
         research_results = await research_agent(

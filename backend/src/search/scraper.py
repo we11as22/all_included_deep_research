@@ -125,7 +125,14 @@ class WebScraper:
                 return self._parse_html(html, url, extract_markdown)
 
         except Exception as e:
-            logger.error("Playwright scraping failed", error=str(e), url=url)
+            error_msg = str(e) if e else "Unknown Playwright error"
+            error_type = type(e).__name__ if e else "UnknownError"
+            logger.error(
+                "Playwright scraping failed",
+                error=error_msg,
+                error_type=error_type,
+                url=url
+            )
             # Fallback to HTTP scraping
             logger.info("Falling back to HTTP scraping", url=url)
             return await self._scrape_with_http(url, extract_markdown)
@@ -201,10 +208,25 @@ class WebScraper:
             return self._parse_html(html, url, extract_markdown)
 
         except aiohttp.ClientError as e:
-            logger.error("Web scraping failed - connection error", error=str(e), url=url)
+            error_msg = str(e) if e else "Unknown connection error"
+            error_type = type(e).__name__
+            logger.error(
+                "Web scraping failed - connection error",
+                error=error_msg,
+                error_type=error_type,
+                url=url
+            )
             raise
         except Exception as e:
-            logger.error("Web scraping failed", error=str(e), url=url)
+            error_msg = str(e) if e else "Unknown error"
+            error_type = type(e).__name__
+            logger.error(
+                "Web scraping failed",
+                error=error_msg,
+                error_type=error_type,
+                url=url,
+                exc_info=True  # Include full traceback
+            )
             raise
 
     def _parse_html(self, html: str, url: str, extract_markdown: bool = True) -> ScrapedContent:
@@ -423,7 +445,15 @@ class WebScraper:
                     links=[],
                 )
         except Exception as e:
-            logger.error("PDF scraping failed", url=url, error=str(e))
+            error_msg = str(e) if e else "Unknown PDF scraping error"
+            error_type = type(e).__name__ if e else "UnknownError"
+            logger.error(
+                "PDF scraping failed",
+                url=url,
+                error=error_msg,
+                error_type=error_type,
+                exc_info=True
+            )
             raise
 
 

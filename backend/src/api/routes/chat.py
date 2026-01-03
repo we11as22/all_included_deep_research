@@ -68,7 +68,8 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
                     else:
                         result = await chat_service.answer_deep(query, messages=chat_history)
 
-                    answer = _append_sources(result.answer, result.sources)
+                    # Sources already included in answer by ChatService with inline citations
+                    answer = result.answer
                     for chunk in _chunk_text(answer, size=120):
                         stream_generator.add_chunk_from_str(chunk)
                         await asyncio.sleep(0.02)
