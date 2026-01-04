@@ -7,7 +7,7 @@ from datetime import datetime
 import structlog
 from fastapi import APIRouter, HTTPException, Request, Query
 from pydantic import BaseModel
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 
 from src.database.schema import ChatModel, ChatMessageModel
 from src.utils.text import summarize_text
@@ -244,9 +244,9 @@ async def delete_chat(chat_id: str, app_request: Request):
         messages_count = messages_result.scalar() or 0
 
         # Delete chat from database (cascades to messages via ondelete="CASCADE" in ForeignKey)
-        # SQLAlchemy's session.delete() is synchronous, but we need to await commit
+        # Use execute(delete(...)) for async SQLAlchemy to avoid warnings
         # The cascade="all, delete-orphan" in relationship ensures messages are deleted
-        session.delete(chat)
+        await session.execute(delete(ChatModel).where(ChatModel.id == chat_id))
         await session.commit()
 
         logger.info("Chat deleted successfully", chat_id=chat_id, messages_count=messages_count)
@@ -291,6 +291,9 @@ async def add_message(
         )
         existing_message = existing_message_result.scalar_one_or_none()
         
+        # Initialize embedding variable for logging
+        embedding = None
+        
         if existing_message:
             # Update existing message (in case of retry or duplicate)
             logger.info("Message with message_id already exists, updating", message_id=msg_id, chat_id=chat_id)
@@ -308,12 +311,15 @@ async def add_message(
                     elif len(embedding_vector) > db_dimension:
                         embedding_vector = embedding_vector[:db_dimension]
                     existing_message.embedding = embedding_vector
+                    embedding = embedding_vector  # Set for logging
                 except Exception as e:
                     logger.warning("Failed to update embedding for existing message", error=str(e), chat_id=chat_id)
+            else:
+                # Use existing embedding if content is empty
+                embedding = existing_message.embedding
             message = existing_message
         else:
             # Generate embedding for new message content
-            embedding = None
             if content.strip():
                 try:
                     embedding_provider = app_request.app.state.embedding_provider

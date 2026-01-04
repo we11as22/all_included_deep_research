@@ -49,8 +49,10 @@ class MemoryManager:
         """Ensure base folder structure and index files exist."""
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
-        for subdir in ["projects", "concepts", "conversations", "preferences", "items", "agents"]:
-            (self.memory_dir / subdir).mkdir(exist_ok=True)
+        # Only create agent_sessions directory for agent memory
+        # Old legacy folders (projects, concepts, conversations, preferences, items, agents) are not used
+        # Agent sessions are created separately via create_agent_session_services()
+        (self.memory_dir / "agent_sessions").mkdir(exist_ok=True)
 
         main_file = self.memory_dir / "main.md"
         if not main_file.exists():

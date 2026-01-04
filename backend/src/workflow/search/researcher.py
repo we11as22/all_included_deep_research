@@ -250,14 +250,30 @@ async def research_agent(
     reasoning_history = []
     agent_history = []
 
-    # Add initial context
-    history_context = format_chat_history(chat_history, limit=6)
+    # Add initial context - show actual messages from chat
     original_query = query  # Preserve original user query
     standalone_query = classification.standalone_query if classification else query
     
+    # Format chat history to show actual messages
+    if chat_history and len(chat_history) > 0:
+        history_lines = []
+        history_lines.append("**Previous messages in this chat:**")
+        for msg in chat_history[-4:]:  # Last 4 messages
+            role = msg.get("role", "user")
+            content = msg.get("content", "").strip()
+            if content:
+                role_label = "User" if role == "user" else "Assistant"
+                # Truncate long messages for context
+                if len(content) > 500:
+                    content = content[:500] + "..."
+                history_lines.append(f"- {role_label}: {content}")
+        history_context = "\n".join(history_lines)
+    else:
+        history_context = "**Previous messages in this chat:** None (this is the first message)."
+    
     agent_history.append({
         "role": "user",
-        "content": f"Chat history:\n{history_context}\n\nUser query: {standalone_query}"
+        "content": f"{history_context}\n\n**Current user query:** {standalone_query}"
     })
 
     logger.info(

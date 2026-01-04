@@ -142,12 +142,28 @@ class ChatSearchService:
             f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs."
         )
         
-        history_block = chat_history or "Chat history: None."
+        # Format chat history to show actual messages from the chat
+        if messages and len(messages) > 0:
+            history_lines = []
+            history_lines.append("**Previous messages in this chat:**")
+            for msg in messages[-4:]:  # Last 4 messages
+                role = msg.get("role", "user")
+                content = msg.get("content", "").strip()
+                if content:
+                    role_label = "User" if role == "user" else "Assistant"
+                    # Truncate long messages for context
+                    if len(content) > 500:
+                        content = content[:500] + "..."
+                    history_lines.append(f"- {role_label}: {content}")
+            history_block = "\n".join(history_lines)
+        else:
+            history_block = "**Previous messages in this chat:** None (this is the first message)."
+        
         user_prompt = (
             f"User question: {query}\n"
             f"Current date: {current_date}\n\n"
             f"{history_block}\n\n"
-            "Please provide a helpful and accurate response."
+            "Please provide a helpful and accurate response based on the conversation context above."
         )
         
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")

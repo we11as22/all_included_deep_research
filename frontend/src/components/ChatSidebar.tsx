@@ -18,13 +18,15 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
   const [chats, setChats] = useState<Chat[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const loadChats = async () => {
+  const loadChats = async (): Promise<Chat[]> => {
     try {
       setLoading(true);
       const chatList = await listChats();
       setChats(chatList);
+      return chatList;
     } catch (error) {
       console.error('Failed to load chats:', error);
+      return [];
     } finally {
       setLoading(false);
     }
@@ -43,12 +45,14 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
 
   // Listen for chat-not-found events to reload chat list
   useEffect(() => {
-    const handleChatNotFound = () => {
+    const handleChatNotFound = (event?: CustomEvent) => {
+      console.log('Chat not found event received', event?.detail);
+      // Reload chat list to remove deleted chat
       loadChats();
     };
-    window.addEventListener('chat-not-found', handleChatNotFound);
+    window.addEventListener('chat-not-found', handleChatNotFound as EventListener);
     return () => {
-      window.removeEventListener('chat-not-found', handleChatNotFound);
+      window.removeEventListener('chat-not-found', handleChatNotFound as EventListener);
     };
   }, []);
 
@@ -61,18 +65,40 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
       return;
     }
     
+    const wasCurrentChat = currentChatId === chatId;
+    
+    // Optimistically remove chat from UI immediately
+    setChats(prevChats => prevChats.filter(c => c.id !== chatId));
+    
+    // If deleting current chat, switch to new chat immediately
+    if (wasCurrentChat) {
+      onNewChat();
+    }
+    
+    setLoading(true);
+    
     try {
+      // Delete chat on server - wait for completion
       await deleteChat(chatId);
+      
+      // Wait for database transaction to fully commit
+      // PostgreSQL may need a moment for the transaction to be visible to other connections
+      await new Promise(resolve => setTimeout(resolve, 300));
+      
       // Reload chat list to ensure sync with server
       await loadChats();
-      if (currentChatId === chatId) {
-        onNewChat();
-      }
+      
     } catch (error) {
       console.error('Failed to delete chat:', error);
-      // Reload chat list anyway to sync with server state
+      
+      // Reload chat list to restore correct state (chat might still exist)
       await loadChats();
-      alert(`Failed to delete chat: ${error instanceof Error ? error.message : 'Unknown error'}`);
+      
+      // Show error message
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      alert(`Failed to delete chat: ${errorMessage}`);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -94,9 +120,21 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
 
     try {
       setLoading(true);
+      // Save chats list before clearing UI
+      const chatsToDelete = [...chats];
+      const chatsCount = chatsToDelete.length;
+      
+      // Immediately clear the chat list in UI to prevent showing stale data
+      setChats([]);
+      
+      // Also clear current chat selection if it's one of the deleted chats
+      if (currentChatId && chatsToDelete.some(c => c.id === currentChatId)) {
+        onNewChat();
+      }
+      
       // Delete all chats - use allSettled to continue even if some fail
       const results = await Promise.allSettled(
-        chats.map(chat => deleteChat(chat.id))
+        chatsToDelete.map(chat => deleteChat(chat.id))
       );
       
       // Count successful deletions
@@ -107,12 +145,18 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
         console.warn(`Failed to delete ${failed} chat(s)`, results.filter(r => r.status === 'rejected'));
       }
       
-      // Reload chat list to get current state from server
-      await loadChats();
+      // Wait for database transactions to fully commit
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      // Reload chat list to get current state from server (should be empty)
+      const finalChats = await loadChats();
       
       // If all chats were deleted, switch to new chat
-      if (successful === chats.length) {
+      if (successful === chatsCount && finalChats.length === 0) {
         onNewChat();
+      } else if (finalChats.length > 0) {
+        // Some chats remain - show warning
+        console.warn(`Some chats could not be deleted. ${finalChats.length} chat(s) remain.`);
       }
     } catch (error) {
       console.error('Failed to clear all chats:', error);

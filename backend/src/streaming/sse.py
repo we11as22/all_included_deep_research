@@ -64,25 +64,63 @@ class StreamingGenerator:
         self.queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._finished = False
         self.app_state = app_state or {}
+        # Store all sent events for reconnection (keep last 1000 events)
+        self._event_history: list[str] = []
+        self._max_history = 1000
 
     def add(self, data: str) -> None:
         """Add data to stream."""
         if not self._finished:
-            self.queue.put_nowait(data)
+            try:
+                self.queue.put_nowait(data)
+                # Store in history for reconnection
+                self._event_history.append(data)
+                # Keep only last N events to avoid memory issues
+                if len(self._event_history) > self._max_history:
+                    self._event_history = self._event_history[-self._max_history:]
+            except asyncio.QueueFull:
+                # Queue is full - this shouldn't happen with unbounded queue, but handle it
+                logger.warning("Stream queue is full, dropping event")
 
     def finish(self) -> None:
         """Signal stream completion."""
         if not self._finished:
             self._finished = True
-            self.queue.put_nowait(None)
+            try:
+                self.queue.put_nowait(None)
+            except asyncio.QueueFull:
+                # Shouldn't happen, but handle it
+                pass
 
-    async def stream(self):
-        """Async generator for streaming data."""
-        while True:
-            data = await self.queue.get()
-            if data is None:
-                break
-            yield data
+    async def stream(self, replay_history: bool = False):
+        """
+        Async generator for streaming data.
+        
+        Args:
+            replay_history: If True, replay all stored events first (for reconnection)
+        """
+        try:
+            # If reconnecting, replay all stored events first
+            if replay_history and self._event_history:
+                logger.info("Replaying event history for reconnection", events_count=len(self._event_history))
+                for event in self._event_history:
+                    yield event
+            
+            # Then stream new events
+            while True:
+                data = await self.queue.get()
+                if data is None:
+                    break
+                yield data
+        except Exception as e:
+            logger.error("Stream generator error", error=str(e), exc_info=True)
+            # Try to send error event before closing (only if ResearchStreamingGenerator)
+            try:
+                if hasattr(self, '_create_event'):
+                    error_event = self._create_event(StreamEventType.ERROR, {"error": f"Stream error: {str(e)}", "details": "Stream generator encountered an error"})
+                    yield error_event
+            except:
+                pass
 
 
 class OpenAIStreamingGenerator(StreamingGenerator):

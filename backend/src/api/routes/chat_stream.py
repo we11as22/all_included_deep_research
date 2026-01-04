@@ -75,7 +75,42 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     raw_mode = request.model or "search"
     normalized = raw_mode.lower().replace("-", "_")
     settings = app_request.app.state.settings
-    chat_history = _collect_chat_history(request.messages, settings.chat_history_limit)
+    
+    # Load chat history from database if chat_id is provided
+    chat_history = []
+    if request.chat_id:
+        try:
+            from src.database.schema import ChatMessageModel
+            from sqlalchemy import select
+            
+            session_factory = app_request.app.state.session_factory
+            async with session_factory() as session:
+                result = await session.execute(
+                    select(ChatMessageModel)
+                    .where(ChatMessageModel.chat_id == request.chat_id)
+                    .order_by(ChatMessageModel.created_at.asc())
+                )
+                db_messages = result.scalars().all()
+                
+                # Convert DB messages to chat history format
+                for msg in db_messages:
+                    chat_history.append({
+                        "role": msg.role,
+                        "content": msg.content
+                    })
+                
+                logger.info("Loaded chat history from database", chat_id=request.chat_id, messages_count=len(chat_history))
+        except Exception as e:
+            logger.warning("Failed to load chat history from database", chat_id=request.chat_id, error=str(e))
+            # Fallback to request messages
+            chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
+    else:
+        # Use messages from request
+        chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
+    
+    # Limit chat history length
+    if settings.chat_history_limit and len(chat_history) > settings.chat_history_limit:
+        chat_history = chat_history[-settings.chat_history_limit:]
 
     if normalized in {"chat", "simple", "conversation"}:
         mode = "chat"
@@ -219,18 +254,76 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 # Check if graph stopped waiting for user (clarification needed but no answer yet)
                 if isinstance(final_state, dict):
                     clarification_needed = final_state.get("clarification_needed", False)
-                    if clarification_needed and not is_continuation:
+                    clarification_waiting = final_state.get("clarification_waiting", False)
+                    should_stop = final_state.get("should_stop", False)
+                    
+                    # If graph is still waiting for clarification and this is not a continuation
+                    if (clarification_needed or clarification_waiting or should_stop) and not is_continuation:
                         # Graph stopped waiting for user - don't emit final report yet
-                        logger.info("Graph stopped waiting for user clarification - not emitting final report")
-                        # Emit status that we're waiting
-                        stream_generator.emit_status("Waiting for your clarification answers...", step="clarification")
-                        stream_generator.emit_done()
+                        logger.info("Graph stopped waiting for user clarification - not emitting final report", 
+                                   clarification_needed=clarification_needed, 
+                                   clarification_waiting=clarification_waiting,
+                                   should_stop=should_stop)
+                        # Emit status that we're waiting (but don't close stream - user needs to answer)
+                        try:
+                            stream_generator.emit_status("Waiting for your clarification answers...", step="clarification")
+                            # Small delay to ensure events are sent
+                            await asyncio.sleep(0.1)
+                            stream_generator.emit_done()
+                            logger.info("Clarification waiting - stream closed, waiting for user response")
+                        except Exception as e:
+                            logger.error("Failed to emit clarification waiting status", error=str(e), exc_info=True)
+                            try:
+                                stream_generator.emit_done()
+                            except:
+                                pass
                         return
+                    
+                    # If graph is still waiting even after continuation, it means research is still in progress
+                    # Don't try to extract final_report yet
+                    if (clarification_needed or clarification_waiting or should_stop) and is_continuation:
+                        logger.info("Graph still waiting after continuation - research may still be in progress, checking for partial results")
+                        # Research might still be running - check if we have any partial results
+                        # But don't emit error, just log and continue
+                        final_report_raw = final_state.get("final_report", "")
+                        if not final_report_raw or (isinstance(final_report_raw, str) and not final_report_raw.strip()):
+                            logger.info("No final report yet - research is still in progress, stream will continue")
+                            # Don't emit done yet - research is still running
+                            # The graph will continue and emit results via stream
+                            return
 
                 # Extract final_report - handle both dict with override and direct value
                 logger.info("Extracting final report from state", state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
-                final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+                
+                # Check if research is still in progress (no final_report yet)
+                # This can happen when graph continues after clarification but research hasn't finished
+                final_report_raw = None
+                try:
+                    final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+                except Exception as e:
+                    logger.warning("Failed to extract final_report from state", error=str(e))
+                    final_report_raw = ""
+                
                 logger.info("Final report raw", report_type=type(final_report_raw).__name__, has_value=bool(final_report_raw))
+                
+                # If no final_report and this is a continuation, research might still be in progress
+                if not final_report_raw and is_continuation:
+                    logger.info("No final_report yet after continuation - research may still be in progress")
+                    # Check if research is actually still running by looking at state
+                    # If there are findings or agent work in progress, research is still running
+                    if isinstance(final_state, dict):
+                        findings = final_state.get("findings", final_state.get("agent_findings", []))
+                        iteration = final_state.get("iteration", 0)
+                        should_continue = final_state.get("should_continue", False)
+                        
+                        if findings or iteration > 0 or should_continue:
+                            logger.info("Research is still in progress - not emitting final report yet", 
+                                       findings_count=len(findings) if findings else 0,
+                                       iteration=iteration,
+                                       should_continue=should_continue)
+                            # Research is still running - don't emit done, let it continue
+                            # The graph will emit results via stream as they become available
+                            return
                 
                 if isinstance(final_report_raw, dict) and "value" in final_report_raw:
                     final_report = final_report_raw["value"]
@@ -307,14 +400,54 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 stream_generator.emit_done()
             except Exception as e:
                 logger.error("Research graph failed", error=str(e), exc_info=True)
-                stream_generator.emit_error(error=str(e), details="Research workflow encountered an error")
-                # Try to extract any partial results
-                if "final_state" in locals():
-                    final_report_raw = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
+                
+                # CRITICAL: Even on error, try to send partial results to frontend
+                # Extract any available results from state or draft_report
+                fallback_report = None
+                
+                # Try to get draft_report as fallback
+                agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                if agent_memory_service:
+                    try:
+                        draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+                        if len(draft_report) > 500:
+                            fallback_report = draft_report
+                            logger.info("Using draft_report.md as fallback after error", length=len(draft_report))
+                    except Exception as e2:
+                        logger.warning("Could not read draft_report after error", error=str(e2))
+                
+                # Try to extract partial results from final_state if available
+                if not fallback_report and "final_state" in locals():
+                    final_state_dict = final_state if isinstance(final_state, dict) else {}
+                    final_report_raw = final_state_dict.get("final_report", "")
                     if final_report_raw:
-                        final_report = str(final_report_raw)
-                        stream_generator.emit_final_report(final_report)
-                        _store_session_report(app_request.app.state, session_id, final_report, query, mode)
+                        fallback_report = str(final_report_raw)
+                        logger.info("Using final_report from state as fallback after error")
+                    else:
+                        # Try findings
+                        findings = final_state_dict.get("findings", final_state_dict.get("agent_findings", []))
+                        if findings:
+                            findings_text = "\n\n".join([
+                                f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
+                                for f in findings
+                            ])
+                            fallback_report = f"# Research Report: {query}\n\n## Findings (Partial Results)\n\n{findings_text}\n\n---\n\n**Note:** Research encountered an error: {str(e)}"
+                            logger.info("Using findings as fallback after error", findings_count=len(findings))
+                
+                # Emit error and fallback report if available
+                if fallback_report:
+                    logger.info("Emitting fallback report after error", report_length=len(fallback_report))
+                    stream_generator.emit_error(error=f"Research encountered an error: {str(e)}", details="Partial results available below")
+                    stream_generator.emit_status("Sending partial results...", step="error")
+                    for chunk in _chunk_text(fallback_report, size=200):
+                        stream_generator.emit_report_chunk(chunk)
+                        await asyncio.sleep(0.02)
+                    stream_generator.emit_final_report(fallback_report)
+                    _store_session_report(app_request.app.state, session_id, fallback_report, query, mode)
+                else:
+                    # No fallback available - just emit error
+                    stream_generator.emit_error(error=str(e), details="Research workflow encountered an error and no partial results are available")
+                
                 stream_generator.emit_done()
 
         except asyncio.CancelledError:
@@ -362,6 +495,15 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
         finally:
             # Remove task from active tasks
             app_request.app.state.active_tasks.pop(session_id, None)
+            # Keep stream generator for a while after task completion to allow reconnection
+            # Remove it after 5 minutes (for deep_research, user might reconnect)
+            if hasattr(app_request.app.state, "active_streams"):
+                # Schedule removal after 5 minutes
+                async def remove_stream_after_delay():
+                    await asyncio.sleep(300)  # 5 minutes
+                    app_request.app.state.active_streams.pop(session_id, None)
+                    logger.debug("Stream generator removed after delay", session_id=session_id)
+                asyncio.create_task(remove_stream_after_delay())
             # DON'T cleanup session dir here - only cleanup on cancellation or error
             # This allows successful sessions to keep their files for debugging
             logger.debug("Task finished, session files preserved", session_id=session_id, preserved=session_agent_dir is not None)
@@ -369,6 +511,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     # Start background task and store it
     task = asyncio.create_task(run_task())
     app_request.app.state.active_tasks[session_id] = task
+    
+    # CRITICAL: Store stream generator for reconnection (especially for deep_research)
+    # This allows clients to reconnect and get results even after disconnect
+    if not hasattr(app_request.app.state, "active_streams"):
+        app_request.app.state.active_streams = {}
+    app_request.app.state.active_streams[session_id] = stream_generator
 
     async def watch_disconnect() -> None:
         """
@@ -427,9 +575,44 @@ async def cancel_chat(session_id: str, app_request: Request):
     
     task.cancel()
     active_tasks.pop(session_id, None)
+    
+    # Also remove stream generator
+    if hasattr(app_request.app.state, "active_streams"):
+        app_request.app.state.active_streams.pop(session_id, None)
+    
     logger.info("Chat session cancelled", session_id=session_id)
     
     return {"status": "cancelled", "session_id": session_id}
+
+
+@router.get("/stream/{session_id}/reconnect")
+async def reconnect_stream(session_id: str, app_request: Request):
+    """
+    Reconnect to an active or completed stream session.
+    
+    This allows clients to reconnect and receive all events, even after disconnect.
+    Especially useful for long-running deep_research tasks.
+    """
+    if not hasattr(app_request.app.state, "active_streams"):
+        raise HTTPException(status_code=404, detail="No active streams found")
+    
+    stream_generator = app_request.app.state.active_streams.get(session_id)
+    
+    if not stream_generator:
+        raise HTTPException(status_code=404, detail=f"Stream session {session_id} not found or expired")
+    
+    logger.info("Client reconnecting to stream", session_id=session_id)
+    
+    # Return the stream with history replay - client will receive all buffered events
+    return StreamingResponse(
+        stream_generator.stream(replay_history=True),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-ID": session_id,
+        },
+    )
 
 
 @router.get("/stream/{session_id}/pdf")

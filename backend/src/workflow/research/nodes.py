@@ -87,12 +87,52 @@ async def search_memory_node(state: ResearchState) -> Dict:
 # ==================== Deep Search Node ====================
 
 async def run_deep_search_node(state: ResearchState) -> Dict:
-    """Run deep search to gather initial context before planning."""
+    """
+    Run deep search to gather initial context before planning.
+    
+    CRITICAL: If deep_search_result already exists and user has answered clarification,
+    skip deep search and return existing result. This prevents re-running deep search
+    after user answers clarification questions.
+    """
+    query = state["query"]
+    chat_history = state.get("chat_history", [])
+    
+    # Check if deep search was already done by looking at chat_history
+    # If there's a message with "Initial Deep Search Context" and user has answered clarification, skip
+    deep_search_done = False
+    has_user_answer = False
+    found_clarification = False
+    
+    for i, msg in enumerate(chat_history):
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "").lower()
+            # Check if this message contains deep search result
+            if "initial deep search context" in content or "deep search completed" in content:
+                deep_search_done = True
+            # Check if this message contains clarification questions
+            if "clarification" in content or "🔍" in content or "clarify" in content:
+                found_clarification = True
+                # Check if next message is from user (user answered)
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    has_user_answer = True
+                    logger.info("User answered clarification questions")
+                    break
+    
+    # If deep search was done and user answered clarification, skip deep search
+    if deep_search_done and found_clarification and has_user_answer:
+        logger.info("Skipping deep search - already completed and user answered clarification, proceeding to research")
+        # Return empty result to indicate skip (clarify node will use existing context from chat_history)
+        return {"deep_search_result": {"type": "override", "value": ""}}
+    
+    # Also check if deep_search_result already exists in state (from checkpoint)
+    deep_search_result_raw = state.get("deep_search_result", "")
+    if deep_search_result_raw and found_clarification and has_user_answer:
+        logger.info("Skipping deep search - result exists in state and user answered clarification")
+        return {"deep_search_result": deep_search_result_raw}
+    
     # Restore runtime dependencies if not in state
     state = _restore_runtime_deps(state)
     
-    query = state["query"]
-    chat_history = state.get("chat_history", [])
     stream = state.get("stream")
 
     # CRITICAL: Always try to restore stream from context if missing
@@ -149,11 +189,36 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
 
         logger.info("Deep search completed", answer_length=len(result) if result else 0)
 
-        # Emit deep search result to frontend via stream
+        # Emit deep search result to frontend via stream - FULL RESULT, NO TRUNCATION
         if stream and result:
-            stream.emit_status(f"Deep search completed. Found {len(result)} characters of context.", step="deep_search")
-            # Also emit as a report chunk so user can see it
-            stream.emit_report_chunk(f"## Initial Deep Search Context\n\n{result}\n\n---\n\n*This context will be used to guide the research agents.*\n\n")
+            try:
+                stream.emit_status(f"Deep search completed. Found {len(result)} characters of context.", step="deep_search")
+                # Send FULL result - no truncation! User needs to see complete deep search answer
+                # Send in smaller chunks to ensure smooth streaming and avoid blocking
+                full_message = f"## Initial Deep Search Context\n\n{result}\n\n---\n\n*This context will be used to guide the research agents.*\n\n"
+                
+                # Always send in chunks for smooth streaming (chunk size 10000 chars)
+                chunk_size = 10000
+                chunks = [full_message[i:i+chunk_size] for i in range(0, len(full_message), chunk_size)]
+                logger.info("Sending deep search result in chunks", total_length=len(full_message), chunks_count=len(chunks))
+                
+                for i, chunk in enumerate(chunks):
+                    stream.emit_report_chunk(chunk)
+                    # Small delay between chunks to ensure smooth streaming
+                    if i < len(chunks) - 1:  # Don't sleep after last chunk
+                        await asyncio.sleep(0.03)  # Small delay between chunks
+                
+                logger.info("Deep search FULL result emitted to stream", result_length=len(result), chunks_sent=len(chunks))
+                # Small delay to ensure all chunks are sent before continuing
+                await asyncio.sleep(0.15)
+            except Exception as e:
+                logger.error("Failed to emit deep search result to stream", error=str(e), exc_info=True)
+                # Try to emit at least a status message
+                try:
+                    stream.emit_status(f"Deep search completed ({len(result)} chars). Proceeding with research...", step="deep_search")
+                    await asyncio.sleep(0.1)
+                except Exception as e2:
+                    logger.error("Failed to emit status after deep search", error=str(e2))
 
         return {
             "deep_search_result": {"type": "override", "value": result},
@@ -330,10 +395,20 @@ Research will proceed after you provide your answers.*
                 
                 # CRITICAL: Emit as report chunk FIRST so it appears in the assistant message
                 # This ensures questions are visible to user before research continues
-                stream.emit_report_chunk(clarification_message)
+                try:
+                    stream.emit_report_chunk(clarification_message)
+                    logger.info("Clarification questions emitted as report chunk", message_length=len(clarification_message))
+                except Exception as e:
+                    logger.error("Failed to emit clarification questions as report chunk", error=str(e), exc_info=True)
                 
                 # Also emit as status for progress tracking
-                stream.emit_status("Waiting for your clarification answers...", step="clarification")
+                try:
+                    stream.emit_status("Waiting for your clarification answers...", step="clarification")
+                except Exception as e:
+                    logger.error("Failed to emit clarification status", error=str(e))
+                
+                # Small delay to ensure all events are sent before graph stops
+                await asyncio.sleep(0.2)
                 
                 # Also emit as a separate message event to ensure it's visible
                 logger.info("MANDATORY: Clarifying questions sent to user after deep search", 
@@ -843,6 +918,107 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     cycle_findings.append(result)
                     all_findings.append(result)
                     logger.info(f"Agent {agent_id} completed task", sources=len(result.get("sources", [])))
+        
+        # CRITICAL: Automatically update draft_report with new findings after each agent cycle
+        # This ensures draft_report is always up-to-date with latest findings, even if supervisor doesn't call write_draft_report
+        if cycle_findings and len(cycle_findings) > 0:
+            agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+            if agent_memory_service:
+                try:
+                    # Read current draft_report
+                    try:
+                        draft_content = await agent_memory_service.file_manager.read_file("draft_report.md")
+                    except FileNotFoundError:
+                        draft_content = ""
+                    
+                    # Get new findings from this cycle
+                    from datetime import datetime
+                    query = state.get("query", "")
+                    
+                    # Build findings sections for new cycle findings
+                    findings_sections = []
+                    for f in cycle_findings:
+                        full_summary = f.get('summary', 'No summary')
+                        all_key_findings = f.get('key_findings', [])
+                        sources = f.get('sources', [])
+                        
+                        findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+**Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+### Summary
+
+{full_summary}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
+
+### Sources ({len(sources)})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:10]]) if sources else "No sources"}
+""")
+                    
+                    findings_text = "\n\n".join(findings_sections)
+                    
+                    # Append to existing draft or create new
+                    if len(draft_content) > 500:
+                        # Append new findings section
+                        update = f"""
+
+---
+
+## New Findings - Cycle {iteration_count} - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{findings_text}
+"""
+                        updated_draft = draft_content + update
+                    else:
+                        # Create new draft with all findings so far
+                        all_findings_text = "\n\n".join([
+                            f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+
+### Summary
+
+{f.get('summary', 'No summary')}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in f.get('key_findings', [])]) if f.get('key_findings') else "No key findings"}
+
+### Sources ({len(f.get('sources', []))})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in f.get('sources', [])[:10]]) if f.get('sources') else "No sources"}
+""" for f in all_findings
+                        ])
+                        
+                        updated_draft = f"""# Research Report Draft
+
+**Query:** {query}
+**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(all_findings)}
+
+## Overview
+
+This is the working draft of the research report. Findings are automatically updated as agents complete their tasks.
+
+## Detailed Findings
+
+{all_findings_text}
+
+---
+"""
+                    
+                    await agent_memory_service.file_manager.write_file("draft_report.md", updated_draft)
+                    logger.info("Draft report automatically updated with cycle findings", 
+                              cycle_findings=len(cycle_findings), total_findings=len(all_findings), draft_length=len(updated_draft))
+                except Exception as e:
+                    logger.warning("Failed to automatically update draft_report with cycle findings", error=str(e))
 
         # If all agents report no tasks, stop
         if no_tasks_count == len(agent_tasks):
@@ -936,6 +1112,123 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 
             except Exception as e:
                 logger.error("Supervisor processing failed", error=str(e))
+        
+        # CRITICAL: Automatically update draft_report with new findings after each agent cycle
+        # This ensures draft_report is always up-to-date, even if supervisor doesn't call write_draft_report
+        if all_findings and len(all_findings) > 0:
+            agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+            if agent_memory_service:
+                try:
+                    # Read current draft_report
+                    try:
+                        draft_content = await agent_memory_service.file_manager.read_file("draft_report.md")
+                    except FileNotFoundError:
+                        draft_content = ""
+                    
+                    # Get new findings from this cycle (findings that aren't already in draft)
+                    # Extract topics already in draft to avoid duplicates
+                    existing_topics = set()
+                    if draft_content:
+                        import re
+                        topic_matches = re.findall(r'##\s+([^\n]+)', draft_content)
+                        existing_topics = {t.strip().lower() for t in topic_matches}
+                    
+                    # Filter out findings already in draft
+                    new_findings = []
+                    for f in all_findings:
+                        topic = f.get('topic', '').lower()
+                        if topic not in existing_topics:
+                            new_findings.append(f)
+                    
+                    # Only update if there are new findings
+                    if new_findings:
+                        from datetime import datetime
+                        query = state.get("query", "")
+                        
+                        # Build findings sections for new findings only
+                        findings_sections = []
+                        for f in new_findings:
+                            full_summary = f.get('summary', 'No summary')
+                            all_key_findings = f.get('key_findings', [])
+                            sources = f.get('sources', [])
+                            
+                            findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+**Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+### Summary
+
+{full_summary}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
+
+### Sources ({len(sources)})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:10]]) if sources else "No sources"}
+""")
+                        
+                        findings_text = "\n\n".join(findings_sections)
+                        
+                        # Append to existing draft or create new
+                        if len(draft_content) > 500:
+                            # Append new findings section
+                            update = f"""
+
+---
+
+## New Findings - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{findings_text}
+"""
+                            updated_draft = draft_content + update
+                        else:
+                            # Create new draft with all findings
+                            all_findings_text = "\n\n".join([
+                                f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Confidence:** {f.get('confidence', 'unknown')}
+
+### Summary
+
+{f.get('summary', 'No summary')}
+
+### Key Findings
+
+{chr(10).join([f"- {kf}" for kf in f.get('key_findings', [])]) if f.get('key_findings') else "No key findings"}
+
+### Sources ({len(f.get('sources', []))})
+
+{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in f.get('sources', [])[:10]]) if f.get('sources') else "No sources"}
+""" for f in all_findings
+                            ])
+                            
+                            updated_draft = f"""# Research Report Draft
+
+**Query:** {query}
+**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Total Findings:** {len(all_findings)}
+
+## Overview
+
+This is the working draft of the research report. Findings are automatically updated as agents complete their tasks.
+
+## Detailed Findings
+
+{all_findings_text}
+
+---
+"""
+                        
+                        await agent_memory_service.file_manager.write_file("draft_report.md", updated_draft)
+                        logger.info("Draft report automatically updated with new findings", 
+                                  new_findings=len(new_findings), total_findings=len(all_findings), draft_length=len(updated_draft))
+                except Exception as e:
+                    logger.warning("Failed to automatically update draft_report", error=str(e))
 
     # Add findings to agent_findings (using reducer)
     # Update iteration in state
@@ -1112,7 +1405,51 @@ async def supervisor_review_enhanced_node(state: Dict[str, Any]) -> Dict[str, An
 
     except Exception as e:
         logger.error("Supervisor agent failed", error=str(e), exc_info=True)
-        # Fallback: stop research
+        
+        # CRITICAL: Even if supervisor fails, ensure draft_report is updated with findings
+        # This ensures frontend always gets results even if supervisor crashes
+        agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+        if agent_memory_service:
+            try:
+                findings = state.get("findings", state.get("agent_findings", []))
+                if findings:
+                    # Read current draft_report
+                    try:
+                        draft_content = await agent_memory_service.file_manager.read_file("draft_report.md")
+                    except FileNotFoundError:
+                        draft_content = ""
+                    
+                    # If draft_report is empty or short, create/update it with findings
+                    if len(draft_content) < 500:
+                        from datetime import datetime
+                        query = state.get("query", "")
+                        
+                        findings_sections = []
+                        for f in findings:
+                            findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
+
+**Agent:** {f.get('agent_id', 'unknown')}
+**Summary:** {f.get('summary', 'No summary')}
+**Key Findings:** {', '.join(f.get('key_findings', [])[:5])}
+""")
+                        
+                        findings_text = "\n\n".join(findings_sections)
+                        draft_content = f"""# Research Report Draft
+
+**Query:** {query}
+**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Note:** Supervisor encountered an error, but findings are available below.
+
+## Findings
+
+{findings_text}
+"""
+                        await agent_memory_service.file_manager.write_file("draft_report.md", draft_content)
+                        logger.info("Updated draft_report with findings after supervisor error", findings_count=len(findings))
+            except Exception as e2:
+                logger.warning("Failed to update draft_report after supervisor error", error=str(e2))
+        
+        # Fallback: stop research but return findings
         return {
             "should_continue": False,
             "replanning_needed": False,
@@ -1373,9 +1710,26 @@ Research completed with {len(findings)} findings from multiple agents covering v
         # For large draft reports, use full content but note it
         logger.info("Draft report is large - using full content in prompt", length=len(primary_source))
 
+    # Detect user language from query
+    def _detect_user_language(text: str) -> str:
+        """Detect user language from query text."""
+        if not text:
+            return "English"
+        # Check for Cyrillic (Russian, Ukrainian, etc.)
+        if any('\u0400' <= char <= '\u04FF' for char in text):
+            return "Russian"
+        return "English"
+    
+    user_language = _detect_user_language(query)
+    
     prompt = f"""Generate a COMPREHENSIVE, DETAILED final research report. This should be a FULL, SUBSTANTIAL research document, not a brief summary.
 
 Query: {query}
+
+**CRITICAL: LANGUAGE REQUIREMENT**
+- **MANDATORY**: You MUST write the entire report in {user_language}
+- Match the user's query language exactly - if the user asked in {user_language}, write the report in {user_language}
+- This applies to ALL sections: executive summary, all report sections, and conclusion
 
 **CRITICAL**: Use the Draft Research Report as the PRIMARY source - it contains the supervisor's comprehensive synthesis of all agent findings.
 **IMPORTANT**: Generate a FULL, DETAILED report with extensive analysis, multiple sections, and comprehensive coverage. The report should be SUBSTANTIAL and COMPLETE.

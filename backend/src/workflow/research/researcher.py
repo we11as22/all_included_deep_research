@@ -848,7 +848,8 @@ Create an updated research plan incorporating this new direction.
             urls=[s.get("url") for s in sources[:5] if s.get("url")],
             tags=["task_complete"]
         )
-        await agent_memory_service.save_agent_note(final_note, agent_id)
+        # CRITICAL: Pass agent_file_service so note is added to agent's personal file
+        await agent_memory_service.save_agent_note(final_note, agent_id, agent_file_service=agent_file_service)
 
         stream.emit_agent_note(agent_id, {
             "title": final_note.title,

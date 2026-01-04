@@ -2,6 +2,7 @@
 
 import asyncio
 from contextlib import asynccontextmanager
+from typing import Any
 from urllib.parse import unquote, parse_qs, urlencode
 
 import structlog
@@ -167,6 +168,8 @@ async def lifespan(app: FastAPI):
     
     # Initialize active tasks storage for cancellation
     app.state.active_tasks: dict[str, asyncio.Task] = {}
+    # Initialize active streams storage for reconnection
+    app.state.active_streams: dict[str, Any] = {}
 
     logger.info(
         "All-Included Deep Research API started successfully",

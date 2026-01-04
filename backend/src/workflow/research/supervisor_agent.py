@@ -53,6 +53,18 @@ class CreateAgentTodoArgs(BaseModel):
     guidance: str = Field(description="Specific guidance for the agent")
 
 
+class UpdateAgentTodoArgs(BaseModel):
+    """Arguments for updating existing todo for an agent."""
+    agent_id: str = Field(description="Target agent ID")
+    todo_title: str = Field(description="Title of the existing todo to update")
+    status: str = Field(default=None, description="New status (pending, in_progress, done)")
+    objective: str = Field(default=None, description="Updated objective")
+    expected_output: str = Field(default=None, description="Updated expected result")
+    guidance: str = Field(default=None, description="Updated guidance")
+    priority: str = Field(default=None, description="Updated priority: high/medium/low")
+    reasoning: str = Field(default=None, description="Updated reasoning")
+
+
 class ReviewAgentProgressArgs(BaseModel):
     """Arguments for reviewing specific agent's progress."""
     agent_id: str = Field(description="Agent ID to review")
@@ -409,6 +421,65 @@ async def create_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         return {"error": str(e)}
 
 
+async def update_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict:
+    """Update existing todo for an agent."""
+    agent_file_service = context.get("agent_file_service")
+    
+    if not agent_file_service:
+        return {"error": "File service not available"}
+    
+    try:
+        agent_id = args.get("agent_id")
+        todo_title = args.get("todo_title")
+        
+        # Read current agent file
+        agent_file = await agent_file_service.read_agent_file(agent_id)
+        current_todos = agent_file.get("todos", [])
+        
+        # Find and update todo
+        updated = False
+        for todo in current_todos:
+            if todo.title == todo_title:
+                # Update fields if provided
+                if "status" in args and args["status"]:
+                    todo.status = args["status"]
+                if "objective" in args and args["objective"]:
+                    todo.objective = args["objective"]
+                if "expected_output" in args and args["expected_output"]:
+                    todo.expected_output = args["expected_output"]
+                if "guidance" in args and args["guidance"]:
+                    todo.note = args["guidance"]
+                if "priority" in args and args["priority"]:
+                    todo.priority = args["priority"]
+                if "reasoning" in args and args["reasoning"]:
+                    todo.reasoning = args["reasoning"]
+                updated = True
+                break
+        
+        if not updated:
+            return {"error": f"Todo '{todo_title}' not found for agent {agent_id}"}
+        
+        # Write updated todos
+        await agent_file_service.write_agent_file(
+            agent_id=agent_id,
+            todos=current_todos,
+            character=agent_file.get("character", ""),
+            preferences=agent_file.get("preferences", "")
+        )
+        
+        logger.info("Updated agent todo", agent_id=agent_id, todo_title=todo_title)
+        
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "todo_title": todo_title,
+            "total_todos": len(current_todos)
+        }
+    except Exception as e:
+        logger.error("Failed to update agent todo", error=str(e))
+        return {"error": str(e)}
+
+
 async def review_agent_progress_handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict:
     """Review specific agent's progress."""
     agent_file_service = context.get("agent_file_service")
@@ -664,6 +735,53 @@ class SupervisorToolsRegistry:
             },
             "handler": create_agent_todo_handler
         },
+        "update_agent_todo": {
+            "name": "update_agent_todo",
+            "description": "Update an existing todo task for a specific research agent. "
+                          "Use this to modify task details, change priority, update guidance, or change status. "
+                          "This is OPTIMAL for refining tasks when agents need more specific instructions or when research direction changes.",
+            "args_schema": {
+                "type": "object",
+                "properties": {
+                    "agent_id": {
+                        "type": "string",
+                        "description": "Agent identifier (e.g., 'agent_1', 'agent_2')"
+                    },
+                    "todo_title": {
+                        "type": "string",
+                        "description": "Title of the existing todo to update"
+                    },
+                    "status": {
+                        "type": "string",
+                        "description": "New status (pending, in_progress, done)",
+                        "enum": ["pending", "in_progress", "done"]
+                    },
+                    "objective": {
+                        "type": "string",
+                        "description": "Updated objective"
+                    },
+                    "expected_output": {
+                        "type": "string",
+                        "description": "Updated expected result format"
+                    },
+                    "guidance": {
+                        "type": "string",
+                        "description": "Updated guidance on how to approach this task"
+                    },
+                    "priority": {
+                        "type": "string",
+                        "description": "Updated priority: high/medium/low",
+                        "enum": ["high", "medium", "low"]
+                    },
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Updated reasoning for why this task is needed"
+                    }
+                },
+                "required": ["agent_id", "todo_title"]
+            },
+            "handler": update_agent_todo_handler
+        },
         "review_agent_progress": {
             "name": "review_agent_progress",
             "description": "Review specific agent's current progress, todos, and notes. "
@@ -810,6 +928,20 @@ async def run_supervisor_agent(
     research_plan = state.get("research_plan", {})
     iteration = state.get("iteration", 0)
     
+    # Detect user language from query
+    def _detect_user_language(text: str) -> str:
+        """Detect user language from query text."""
+        if not text:
+            return "English"
+        # Check for Cyrillic (Russian, Ukrainian, etc.)
+        if any('\u0400' <= char <= '\u04FF' for char in text):
+            return "Russian"
+        # Check for common non-English patterns
+        # For now, default to English if not clearly Russian
+        return "English"
+    
+    user_language = _detect_user_language(query)
+    
     # Get deep_search_result for context (from initial deep search before multi-agent system)
     deep_search_result_raw = state.get("deep_search_result", "")
     if isinstance(deep_search_result_raw, dict):
@@ -901,8 +1033,38 @@ async def run_supervisor_agent(
                summary_length=len(findings_summary),
                findings_preview=findings_summary[:500] if findings_summary else "No findings")
     
+    # Get clarification context if available
+    clarification_context = state.get("clarification_context", "")
+    if not clarification_context:
+        clarification_context = ""
+    
+    # Format chat history to show actual messages from chat
+    # For deep_research, use only 2 messages as they can be very long
+    chat_history = state.get("chat_history", [])
+    chat_history_text = ""
+    if chat_history and len(chat_history) > 0:
+        history_lines = []
+        history_lines.append("**Previous messages in this chat:**")
+        for msg in chat_history[-2:]:  # Last 2 messages (deep_research messages are large)
+            role = msg.get("role", "user")
+            content = msg.get("content", "").strip()
+            if content:
+                role_label = "User" if role == "user" else "Assistant"
+                # Truncate long messages for context
+                if len(content) > 500:
+                    content = content[:500] + "..."
+                history_lines.append(f"- {role_label}: {content}")
+        chat_history_text = "\n".join(history_lines) + "\n\n"
+    else:
+        chat_history_text = "**Previous messages in this chat:** None (this is the first message).\n\n"
+    
     # Create supervisor prompt
     system_prompt = f"""You are the research supervisor coordinating a team of researcher agents.
+
+**CRITICAL: LANGUAGE REQUIREMENT**
+- **MANDATORY**: You MUST write all content (notes, draft_report.md, todos, directives) in {user_language}
+- Match the user's query language exactly - if the user asked in {user_language}, respond in {user_language}
+- This applies to ALL text you generate: draft_report.md, supervisor notes, agent todos, and directives
 
 Your role:
 1. Review agent findings and update main research document
@@ -911,13 +1073,13 @@ Your role:
 4. **CRITICAL**: Assign DIFFERENT tasks to different agents to cover ALL aspects of the topic
 5. Decide when research is complete - only when truly comprehensive
 
-**ORIGINAL USER QUERY:** {query}
+{chat_history_text}**ORIGINAL USER QUERY:** {query}
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
 
 **INITIAL DEEP SEARCH CONTEXT:**
 {deep_search_result[:2000] if deep_search_result else "No initial deep search context available."}
-{clarification_context}
+{clarification_context if clarification_context else ""}
 
 **CRITICAL CONTEXT USAGE:**
 - **ALWAYS refer to the ORIGINAL USER QUERY above** - this is what the user actually asked for
@@ -956,6 +1118,7 @@ Available tools:
 - write_draft_report: Write/append to draft research report (draft_report.md) - this is where you assemble the final report
 - review_agent_progress: Check specific agent's progress and todos
 - create_agent_todo: Assign new task to an agent (use this to force deeper research AND diversify coverage!)
+- update_agent_todo: Update existing agent todo (OPTIMAL for refining tasks, changing priority, updating guidance, or modifying objectives)
 - make_final_decision: Decide to continue/replan/finish
 
 CRITICAL WORKFLOW:
@@ -972,11 +1135,13 @@ CRITICAL WORKFLOW:
    - If findings are basic, create todos forcing deeper research with specific instructions
    - If agents overlap, redirect them to DIFFERENT angles to build complete picture
    - Ensure comprehensive coverage: history, technical, expert views, applications, trends, comparisons, impact, challenges
+   - **OPTIMAL**: Use update_agent_todo to refine existing tasks when agents need more specific instructions or when research direction changes
 7. **MANDATORY: You MUST call at least ONE tool on EVERY iteration** - never return empty tool_calls!
    - If you need to review findings: call read_draft_report, read_main_document, or review_agent_progress
    - **After reviewing agent findings, you MUST call write_draft_report** to synthesize their findings
    - If you need to update documents: call write_draft_report, write_main_document, or write_supervisor_note
-   - If you need to assign tasks: call create_agent_todo
+   - If you need to assign NEW tasks: call create_agent_todo
+   - If you need to REFINE/UPDATE existing tasks: call update_agent_todo (OPTIMAL for modifying objectives, guidance, priority, or status)
    - If you're ready to finish: call make_final_decision (this is the ONLY way to finish!)
    - **CRITICAL**: Before calling make_final_decision with "finish", ensure you've written comprehensive findings to draft_report.md!
 8. **Make final decision** - CRITICAL: You MUST call make_final_decision tool on EVERY review cycle!

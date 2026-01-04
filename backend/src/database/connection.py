@@ -46,6 +46,8 @@ class DatabaseManager:
                 echo=self.settings.debug,
                 pool_size=self.settings.database_pool_size,
                 max_overflow=10,
+                pool_pre_ping=True,  # Verify connections before using (prevents stale connections)
+                pool_recycle=3600,  # Recycle connections after 1 hour (prevents password auth errors)
             )
 
             self.session_factory = sessionmaker(
@@ -85,6 +87,8 @@ def create_database_engine(settings: Settings) -> AsyncEngine:
         echo=settings.debug,
         pool_size=settings.database_pool_size,
         max_overflow=10,
+        pool_pre_ping=True,  # Verify connections before using (prevents stale connections)
+        pool_recycle=3600,  # Recycle connections after 1 hour (prevents password auth errors)
     )
 
 

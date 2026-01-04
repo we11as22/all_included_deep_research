@@ -182,7 +182,10 @@ export default function HomePage() {
       
       for await (const event of streamChatProgress(
         [...messagePayload, { role: 'user' as const, content: userMessage.content }],
-        backendMode as any
+        backendMode as any,
+        chatId,  // Pass chat_id to load messages from database
+        currentSessionId || null,  // Pass session ID for reconnection
+        3  // Max reconnect attempts
       )) {
         if (DEBUG_MODE) {
           console.debug('[debug] stream event', { type: event.type, data: event.data, sessionId: event.sessionId });
@@ -502,8 +505,14 @@ export default function HomePage() {
     
     try {
       const chatData = await getChat(chatId);
+      
+      // Validate chat data
+      if (!chatData || !chatData.chat) {
+        throw new Error('Invalid chat data received');
+      }
+      
       setCurrentChatId(chatId);
-      const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
+      const dbMessages: DBChatMessage[] = (chatData.messages || []) as DBChatMessage[];
       
       // CRITICAL: Load ALL messages from DB, including assistant messages
       // Sort by created_at to maintain order
@@ -562,14 +571,29 @@ export default function HomePage() {
       }
     } catch (error: any) {
       console.error('Failed to load chat:', error);
-      // If chat not found (404), reload chat list to sync with server
-      if (error?.response?.status === 404 || error?.message?.includes('404') || error?.message?.includes('not found')) {
-        console.warn('Chat not found, reloading chat list');
-        // Trigger chat list reload in parent component if available
-        window.dispatchEvent(new CustomEvent('chat-not-found', { detail: { chatId } }));
-      }
-      // Don't set currentChatId if chat doesn't exist
+      
+      // Clear current chat selection on error
       setCurrentChatId(null);
+      setMessages([]);
+      
+      // Check if it's a 404 or not found error
+      const isNotFound = 
+        error?.response?.status === 404 || 
+        error?.message?.includes('404') || 
+        error?.message?.includes('not found') ||
+        error?.message?.includes('Get chat failed');
+      
+      if (isNotFound) {
+        console.warn('Chat not found, reloading chat list');
+        // Trigger chat list reload to remove deleted chat from sidebar
+        window.dispatchEvent(new CustomEvent('chat-not-found', { detail: { chatId } }));
+        setError('Chat not found. It may have been deleted.');
+      } else {
+        // Other errors (network, server, etc.)
+        const errorMessage = error?.message || 'Failed to load chat';
+        setError(`Error loading chat: ${errorMessage}`);
+        console.error('Chat load error details:', error);
+      }
     }
   };
 
