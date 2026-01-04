@@ -495,16 +495,15 @@ export default function HomePage() {
   };
 
   const handleChatSelect = async (chatId: string, messageId?: string) => {
+    // Reset streaming state when selecting a chat
+    setIsStreaming(false);
+    setCurrentSessionId(null);
+    setError(null);
+    
     try {
-      // Reset streaming state when selecting a chat
-      setIsStreaming(false);
-      setCurrentSessionId(null);
-      setError(null);
-      
-      try {
-        const chatData = await getChat(chatId);
-        setCurrentChatId(chatId);
-        const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
+      const chatData = await getChat(chatId);
+      setCurrentChatId(chatId);
+      const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
       
       // CRITICAL: Load ALL messages from DB, including assistant messages
       // Sort by created_at to maintain order
@@ -561,8 +560,16 @@ export default function HomePage() {
           }
         }, 100);
       }
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to load chat:', error);
+      // If chat not found (404), reload chat list to sync with server
+      if (error?.response?.status === 404 || error?.message?.includes('404') || error?.message?.includes('not found')) {
+        console.warn('Chat not found, reloading chat list');
+        // Trigger chat list reload in parent component if available
+        window.dispatchEvent(new CustomEvent('chat-not-found', { detail: { chatId } }));
+      }
+      // Don't set currentChatId if chat doesn't exist
+      setCurrentChatId(null);
     }
   };
 

@@ -82,9 +82,9 @@ class SemanticReranker:
 
             # Filter out results with very low similarity scores
             # Use adaptive threshold based on score distribution
-            # Start with a lower threshold (0.2 = 20% similarity) to be more inclusive
-            # This is important for multilingual queries where embeddings may have lower base similarity
-            min_similarity_threshold = 0.2
+            # For multilingual queries and Bing's irrelevant results, be more aggressive
+            # Start with a higher threshold (0.3 = 30% similarity) to filter out irrelevant results
+            min_similarity_threshold = 0.3
             
             # Calculate score statistics
             if result_scores:
@@ -93,10 +93,10 @@ class SemanticReranker:
                 max_score = max(scores_only)
                 min_score = min(scores_only)
                 
-                # Adaptive threshold: use 50% of average score, but not less than 0.15
-                # This adapts to the actual score distribution for this query
-                adaptive_threshold = max(0.15, avg_score * 0.5)
-                min_similarity_threshold = min(0.3, adaptive_threshold)  # Cap at 0.3
+                # Adaptive threshold: use 60% of average score, but not less than 0.2
+                # This adapts to the actual score distribution and filters more aggressively
+                adaptive_threshold = max(0.2, avg_score * 0.6)
+                min_similarity_threshold = min(0.4, adaptive_threshold)  # Cap at 0.4 for better filtering
                 
                 logger.debug(
                     "Reranking score distribution",
@@ -113,10 +113,10 @@ class SemanticReranker:
             ]
             
             # If filtering removed too many results, be more lenient
-            # Keep at least top 60% of results, or all if we have few results
-            if len(filtered_scores) < max(3, int(len(result_scores) * 0.6)):
-                # Too aggressive filtering - use even lower threshold
-                min_similarity_threshold = 0.1
+            # Keep at least top 50% of results, or all if we have few results
+            if len(filtered_scores) < max(3, int(len(result_scores) * 0.5)):
+                # Too aggressive filtering - use lower threshold but still filter
+                min_similarity_threshold = 0.15
                 filtered_scores = [
                     (result, score) for result, score in result_scores
                     if score >= min_similarity_threshold

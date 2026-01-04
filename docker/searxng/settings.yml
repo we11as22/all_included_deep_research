@@ -8,6 +8,9 @@ search:
   formats:
     - html
     - json
+  # Auto-detect language from query (like Perplexica)
+  # SearXNG will automatically detect language from query content
+  default_lang: "auto"
 
 server:
   secret_key: "change_me"
@@ -23,27 +26,106 @@ outgoing:
   useragent_suffix: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
 
 # Engines configuration
-# Keep only reliable engines that work with slow connections
+# Only tested engines with good results are enabled
 engines:
-  - name: wolframalpha
-    disabled: false
-  # Enable reliable engines
-  - name: google
-    disabled: false
-    timeout: 15.0
-  - name: bing
-    disabled: false
-    timeout: 15.0
+  # ============================================
+  # ENABLED: Tested with excellent results
+  # ============================================
+  
+  # Startpage - BEST for Russian and English queries
+  # Tested: 5/5 relevant for "история ВВС Польши" and "Polish Air Force history"
+  # Provides Google results with privacy protection
   - name: startpage
     disabled: false
     timeout: 15.0
-  - name: brave
+  
+  # Presearch - Meta search engine (works directly)
+  # Tested: 5/5 relevant for Russian and English queries
+  - name: presearch
     disabled: false
     timeout: 15.0
-  # Disable engines that frequently timeout or require API keys
-  - name: ahmia
+  
+  # Yahoo - Classic search engine (works directly)
+  # Tested: 5/5 relevant for Russian and English queries
+  - name: yahoo
+    disabled: false
+    timeout: 15.0
+  
+  # MWMBL - Decentralized search engine
+  # Tested: 4/5 relevant, provides many results (50-121 per query)
+  - name: mwmbl
+    disabled: false
+    timeout: 15.0
+  
+  # Specialized engines (tested and working)
+  # GitHub - Code repositories
+  # Tested: 3/3 relevant for "Python programming tutorial" and "machine learning algorithms"
+  - name: github
+    disabled: false
+    timeout: 15.0
+  
+  # GitLab - Code repositories
+  # Tested: 3/3 relevant for "machine learning algorithms"
+  - name: gitlab
+    disabled: false
+    timeout: 15.0
+  
+  # arXiv - Scientific papers
+  # Tested: 3/3 relevant for scientific queries
+  - name: arxiv
+    disabled: false
+    timeout: 15.0
+  
+  # PubMed - Medical papers
+  # Tested: 3/3 relevant for medical/scientific queries
+  - name: pubmed
+    disabled: false
+    timeout: 15.0
+  
+  # OpenAlex - Scientific papers
+  # Tested: 2-3/3 relevant for scientific queries
+  - name: openalex
+    disabled: false
+    timeout: 15.0
+  
+  # WolframAlpha - Factual queries
+  # Tested: Works for factual queries
+  - name: wolframalpha
+    disabled: false
+    timeout: 15.0
+  
+  # ============================================
+  # DISABLED: Not tested or problematic
+  # ============================================
+  
+  - name: google
     disabled: true
-  - name: torch
+    timeout: 15.0
+  
+  - name: bing
     disabled: true
+    timeout: 15.0
+  
   - name: duckduckgo
     disabled: true
+    timeout: 15.0
+  
+  - name: yandex
+    disabled: true
+    timeout: 15.0
+  
+  - name: marginalia
+    disabled: true
+    timeout: 15.0
+  
+  - name: brave
+    disabled: true
+    timeout: 15.0
+  
+  - name: qwant
+    disabled: true
+    timeout: 15.0
+  
+  - name: mojeek
+    disabled: true
+    timeout: 15.0

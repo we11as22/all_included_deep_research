@@ -283,19 +283,32 @@ class ChatSearchService:
                 scraped_count=len(scraped_content)
             )
 
-            # Like Perplexica: simple deduplication only, no reranking, no filtering
-            # Perplexica doesn't rerank or filter - it trusts SearXNG's ranking completely
-            # Only dedupe by URL (merge content for duplicates)
-            results = self._dedupe_results_simple(results)  # Simple dedupe like Perplexica
-            # NO filtering - Perplexica doesn't filter results
+            # Deduplication and reranking for better relevance
+            # Tavily already provides high-quality, relevant results with scores,
+            # so reranking is not needed for Tavily. For SearXNG (especially Bing),
+            # semantic reranking helps filter irrelevant results.
+            results = self._dedupe_results_simple(results)
             
             logger.info("Results after deduplication", 
                        query=query,
                        results_count=len(results),
                        top_titles=[r.title[:50] for r in results[:5]])
             
-            # NO reranking - like Perplexica, trust SearXNG's ranking
-            # Reranking can actually make results worse if embeddings are not good
+            # Apply semantic reranking only for SearXNG (not for Tavily)
+            # Tavily already provides optimized, relevant results with scores
+            # SearXNG (especially Bing) may return irrelevant results for non-English queries
+            if (tuning.rerank_top_k and tuning.rerank_top_k > 0 and 
+                self.settings.search_provider == "searxng"):
+                results = await self._rerank_results(query, results, top_k=tuning.rerank_top_k)
+                logger.info("Results after reranking",
+                           query=query,
+                           results_count=len(results),
+                           top_titles=[r.title[:50] for r in results[:5]])
+            elif self.settings.search_provider == "tavily":
+                logger.info("Skipping reranking for Tavily (already optimized)",
+                           query=query,
+                           results_count=len(results),
+                           avg_score=sum(r.score for r in results) / len(results) if results else 0.0)
             
             self._emit_sources(stream, results, label=tuning.label)
 

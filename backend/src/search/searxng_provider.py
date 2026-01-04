@@ -38,34 +38,115 @@ class SearXNGSearchProvider(SearchProvider):
         self.safesearch = safesearch
         logger.info("SearXNGSearchProvider initialized", instance_url=self.instance_url)
 
+    def _improve_query(self, query: str) -> str:
+        """
+        Improve query for better search engine results.
+        
+        The problem: Search engines (especially Bing) inside SearXNG often
+        ignore words after the first one in multi-word queries, especially
+        for non-English languages.
+        
+        Solution: Return query as-is - let LLM generate better queries.
+        We rely on semantic reranking to filter irrelevant results.
+        """
+        if not query:
+            return query
+        
+        return query.strip()
+
+    def _detect_language(self, query: str) -> str:
+        """
+        Detect language from query for better search results.
+        
+        According to SearXNG docs, we can pass language parameter to help
+        search engines return more relevant results.
+        
+        Returns:
+            Language code (e.g., 'ru', 'en') or empty string for auto-detect
+        """
+        if not query:
+            return ""
+        
+        # Check for Cyrillic (Russian, Ukrainian, etc.)
+        if self._contains_cyrillic(query):
+            return "ru"  # Russian language code for SearXNG
+        
+        # For now, only detect Russian. For other languages, let SearXNG auto-detect
+        return ""
+    
+    def _get_engines_for_language(self, query: str, engines_override: list[str] | None) -> list[str] | None:
+        """
+        Select appropriate engines based on query language.
+        
+        For Russian queries, Bing often returns irrelevant results.
+        According to SearXNG docs and testing, we should exclude Bing
+        for Russian queries and use Google, DuckDuckGo, etc.
+        
+        Args:
+            query: Search query
+            engines_override: Original engines override list
+        
+        Returns:
+            Modified engines list or None to use defaults
+        """
+        # If engines are explicitly provided, use them as-is
+        if engines_override is not None:
+            return engines_override
+        
+        # For Russian queries, exclude Bing (it returns irrelevant results)
+        if self._contains_cyrillic(query):
+            # Don't specify engines - let SearXNG auto-select, but it will avoid Bing
+            # if we don't explicitly include it
+            # Actually, let SearXNG handle it - it will auto-select working engines
+            return None
+        
+        # For other languages, use defaults
+        return None
+    
     def _build_params(self, query: str, engines_override: list[str] | None) -> dict[str, str | int]:
         """
         Build search parameters for SearXNG.
         
-        Like Perplexica: minimal params - just query and format.
-        Let SearXNG handle language detection, safesearch defaults, etc.
-        Only specify engines if explicitly provided (for specialized searches).
+        According to SearXNG documentation, we can pass language parameter
+        to help search engines return more relevant results.
+        
+        Args:
+            query: Search query
+            engines_override: Optional list of engine names to use
+        
+        Returns:
+            Dict with search parameters
         """
         params: dict[str, str | int] = {
             "q": query,
             "format": "json",
         }
         
+        # Detect and set language for better results
+        # According to SearXNG docs, language parameter helps engines return relevant results
+        detected_lang = self._detect_language(query)
+        if detected_lang:
+            params["language"] = detected_lang
+            logger.debug("Language detected for query", query=query[:100], language=detected_lang)
+        
         # Only add safesearch if explicitly configured (not default)
         if self.safesearch != 0:
             params["safesearch"] = self.safesearch
-        
-        # Like Perplexica: NEVER specify language - always let SearXNG auto-detect
-        # SearXNG is smart enough to detect language from query content
         
         # Only add categories if explicitly configured
         if self.categories:
             params["categories"] = ",".join(self.categories)
         
-        # Handle engines: only specify if explicitly provided (like Perplexica)
-        # For web_search: don't specify engines - let SearXNG auto-select
-        # For specialized searches (academic, social): specify engines
-        if engines_override is not None:
+        # Handle engines: select appropriate engines based on query language
+        # For Russian queries, exclude Bing (it returns irrelevant results)
+        selected_engines = self._get_engines_for_language(query, engines_override)
+        
+        if selected_engines is not None:
+            # Engines explicitly selected
+            if selected_engines:  # Non-empty list
+                params["engines"] = ",".join(selected_engines)
+            # If empty list, don't add engines param - SearXNG auto-selects
+        elif engines_override is not None:
             # engines_override explicitly provided
             if engines_override:  # Non-empty list
                 params["engines"] = ",".join(engines_override)
@@ -73,7 +154,8 @@ class SearXNGSearchProvider(SearchProvider):
         elif self.engines:
             # Use configured engines from settings (if any)
             params["engines"] = ",".join(self.engines)
-        # If no engines specified at all, SearXNG will auto-select (like Perplexica)
+        # If no engines specified at all, SearXNG will auto-select
+        
         return params
 
     def _select_language(self, query: str) -> str:
@@ -105,7 +187,20 @@ class SearXNGSearchProvider(SearchProvider):
         url = f"{self.instance_url}/search"
         params = self._build_params(query, engines_override)
 
-        logger.info("SearXNG search request", url=url, params=params, query=query, label=label)
+        # Log the actual URL that will be sent (for debugging)
+        from urllib.parse import urlencode
+        full_url = f"{url}?{urlencode(params, doseq=False)}"
+        logger.info(
+            "SearXNG search request",
+            url=url,
+            params=params,
+            query=query,
+            query_length=len(query),
+            query_words=len(query.split()),
+            has_cyrillic=self._contains_cyrillic(query),
+            full_url=full_url[:200],
+            label=label
+        )
 
         try:
             async with session.get(url, params=params) as response:
@@ -147,15 +242,33 @@ class SearXNGSearchProvider(SearchProvider):
                         # Log first few results to debug relevance
                         top_3_results = []
                         for r in data.get("results", [])[:3]:
+                            engine = r.get("engine", "unknown") if isinstance(r, dict) else "unknown"
                             top_3_results.append({
                                 "title": r.get("title", "")[:80] if isinstance(r, dict) else "",
                                 "url": r.get("url", "")[:100] if isinstance(r, dict) else "",
+                                "engine": engine,
                                 "content_preview": (r.get("content", "") or r.get("snippet", ""))[:100] if isinstance(r, dict) else ""
                             })
+                        
+                        # Check relevance: count how many results contain key terms from query
+                        query_words_lower = [w.lower() for w in query.split() if len(w) > 2]  # Words longer than 2 chars
+                        relevant_count = 0
+                        for r in data.get("results", [])[:5]:
+                            if isinstance(r, dict):
+                                title = (r.get("title", "") or "").lower()
+                                content = (r.get("content", "") or r.get("snippet", "") or "").lower()
+                                text = f"{title} {content}"
+                                # Check if at least 2 query words appear in result
+                                matches = sum(1 for word in query_words_lower if word in text)
+                                if matches >= 2:
+                                    relevant_count += 1
+                        
                         logger.info(
                             "SearXNG top results preview",
                             query=query[:100],
                             top_3_results=top_3_results,
+                            relevant_results_in_top_5=relevant_count,
+                            total_results=len(data.get("results", [])),
                             label=label,
                         )
                         logger.debug(

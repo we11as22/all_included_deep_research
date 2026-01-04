@@ -135,6 +135,9 @@ async def web_search_handler(args: dict[str, Any], context: dict[str, Any]) -> d
     if not search_provider:
         return {"error": "Search provider not available"}
 
+    # Log queries for debugging relevance
+    logger.info(f"web_search_handler received queries", queries=queries, queries_count=len(queries))
+
     # Emit all queries at once
     if stream:
         for query in queries[:3]:
@@ -331,21 +334,16 @@ def register_actions():
     ActionRegistry.register(
         name="web_search",
         description="Search the web for information. Provide up to 3 search queries. "
-        "CRITICAL: Write queries EXACTLY as you would type them in a browser search box - natural, complete questions or phrases. "
-        "Use the SAME LANGUAGE as the original user query. "
-        "**IMPORTANT**: If the user query contains a word that might be a typo (e.g., 'гинеса' -> 'Гиннесса'), intelligently correct it. "
-        "Examples: "
-        "- User asks 'расскажи про историю гинеса' -> queries: ['история Книги рекордов Гиннесса', 'Guinness World Records история', 'когда создана Книга рекордов Гиннесса'] "
-        "- User asks 'расскажи про саблю' -> queries: ['что такое сабля', 'история сабли', 'виды сабель'] "
-        "- User asks 'ВВС Германии техника' -> queries: ['ВВС Германии современная техника', 'Luftwaffe самолеты', 'военная авиация Германии'] "
-        "Write natural queries that a person would use in a search engine. Returns list of search results with title, URL, and snippet.",
+        "Write natural search queries as you would type in a browser. "
+        "Keep queries targeted and specific to what you need. "
+        "Returns list of search results with title, URL, and snippet.",
         args_schema={
             "type": "object",
             "properties": {
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of 1-3 natural search queries (as you would type in a browser, preserve original query's meaning and language)",
+                    "description": "List of 1-3 natural search queries (as you would type in a browser)",
                     "minItems": 1,
                     "maxItems": 3,
                 },

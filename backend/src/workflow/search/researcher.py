@@ -45,7 +45,7 @@ class ResearchPlan(BaseModel):
 # ==================== Mode-Specific Prompts ====================
 
 
-def get_researcher_prompt(mode: str, iteration: int, max_iterations: int) -> str:
+def get_researcher_prompt(mode: str, iteration: int, max_iterations: int, original_query: str = "") -> str:
     """Get mode-specific researcher prompt."""
 
     current_date = get_current_date()
@@ -56,28 +56,11 @@ Current date: {current_date}
 
 Your knowledge cutoff is early 2024. For ANY information after that date, you MUST use web search.
 
-CRITICAL INSTRUCTIONS FOR SEARCH QUERIES:
-When calling web_search tool with queries parameter:
-1. ALWAYS preserve the core meaning and key terms from the original user query
-2. Use the SAME LANGUAGE as the original query - DO NOT translate or change language
-3. Generate SEO-friendly keywords, NOT full sentences
-4. Each query should focus on a specific aspect of the topic
-5. **CRITICAL**: If the user query contains a word that might be a typo or misspelling, try to correct it intelligently:
-   - "гинеса" -> "Гиннесса" (Guinness)
-   - "сабля" -> "сабля" (correct)
-   - Use common sense to identify and correct obvious typos
-6. Example: User asks "расскажи про историю гинеса" -> queries should be ["Гиннесса история", "Книга рекордов Гиннесса", "Guinness World Records история"]
-7. DO NOT add unrelated terms like "в России" unless the user specifically asked about Russia
-8. Keep queries concise and targeted (2-5 words typically)
-9. If user query mentions a specific entity (like "Гиннесса", "сабля"), queries MUST include that entity name as the main term
-
-BAD examples (DO NOT DO THIS):
-- User: "расскажи про историю гинеса" -> ["история", "история России", "история браузера"] ❌ (missing key term!)
-- User: "расскажи про саблю" -> ["оружие", "холодное оружие"] ❌ (missing key term!)
-
-GOOD examples (DO THIS):
-- User: "расскажи про историю гинеса" -> ["Гиннесса история", "Книга рекордов Гиннесса", "Guinness World Records"] ✅
-- User: "расскажи про саблю" -> ["сабля", "сабля история", "сабля виды"] ✅
+When calling web_search tool:
+- Write natural search queries as you would type in a browser
+- Keep queries targeted and specific to what you need
+- You can provide up to 3 queries at a time
+- Use the same language as the user's query
 """
 
     if mode == "speed":
@@ -269,9 +252,12 @@ async def research_agent(
 
     # Add initial context
     history_context = format_chat_history(chat_history, limit=6)
+    original_query = query  # Preserve original user query
+    standalone_query = classification.standalone_query if classification else query
+    
     agent_history.append({
         "role": "user",
-        "content": f"Chat history:\n{history_context}\n\nResearch query: {classification.standalone_query}"
+        "content": f"Chat history:\n{history_context}\n\nUser query: {standalone_query}"
     })
 
     logger.info(
@@ -284,8 +270,8 @@ async def research_agent(
     # Research loop
     for iteration in range(max_iterations):
         try:
-            # Get researcher prompt for current iteration
-            system_prompt = get_researcher_prompt(mode, iteration, max_iterations)
+            # Get researcher prompt for current iteration - pass original query to ensure key terms are preserved
+            system_prompt = get_researcher_prompt(mode, iteration, max_iterations, original_query=query)
 
             # Build messages for LLM
             from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage

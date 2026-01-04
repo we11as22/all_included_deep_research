@@ -1,56 +1,67 @@
 # All-Included Deep Research
 
-Comprehensive deep research system with memory integration, combining the best practices from multiple open-source projects.
+Полноценная система глубокого исследования с интеграцией памяти, объединяющая лучшие практики из множества open-source проектов.
 
-## ✨ Features
+## 📚 Документация
 
-### 3 Chat Modes
+- **[QUICKSTART.md](QUICKSTART.md)** - Быстрый старт за 5 минут
+- **[AGENT_LOGIC.md](AGENT_LOGIC.md)** - Детальное описание агентной логики всех режимов работы
 
-- **Web Search** (speed): Fast query rewriting + multi-query search with citations (2 iterations)
-- **Deep Search** (balanced): Quality web search with extra iterations and broader sources (6 iterations)
-- **Deep Research** (quality): Full multi-agent LangGraph system with supervisor coordination (up to 25 iterations)
-  - Supervisor agent (LangGraph with ReAct) coordinates 4 researcher agents
-  - Each researcher is a LangGraph agent with planning/replanning
-  - All agents write notes to markdown files in session folder
-  - Supervisor reviews progress and assigns new tasks through queue system
-  - Final report validated and streamed to frontend
+## ✨ Возможности
 
-### Advanced Memory System
+### 4 Режима работы
 
-- **Dual Storage**: Human-readable Markdown files + PostgreSQL with pgvector
-- **Hybrid Search**: RRF (Reciprocal Rank Fusion) combining vector and fulltext search
-- **Smart Chunking**: Markdown-aware chunking with header context preservation
-- **Auto-sync**: Automatic synchronization between files and database
-  - Memory files location configurable via `MEMORY_DIR` (default: `/home/asudakov/projects/memory_files`)
-- **Chat Context**: Agents receive the last N chat messages (`CHAT_HISTORY_LIMIT`)
-- **Agent Sessions**: Deep Research creates temporary session folders with agent memory files
-  - `main.md` - supervisor's research document
-  - `agents/{agent_id}.md` - each agent's todos and notes
-  - `items/` - research notes with sources
-  - Automatically cleaned up after research completion
+- **Chat** - Простой диалог с LLM без веб-поиска
+- **Web Search** (search) - Быстрый веб-поиск с расширением запросов (2 итерации)
+- **Deep Search** (deep_search) - Качественный веб-поиск с глубокими итерациями (6 итераций)
+- **Deep Research** (deep_research) - Полноценная мультиагентная система с координацией через супервайзера
+  - Супервайзер (LangGraph с ReAct) координирует 1-5 исследовательских агентов
+  - Каждый исследователь - LangGraph агент с планированием и перепланированием
+  - Все агенты пишут заметки в markdown файлы в сессионной папке
+  - Супервайзер просматривает прогресс и назначает новые задачи через систему очередей
+  - Финальный отчет валидируется и стримится на фронтенд
+  - Подробнее: [AGENT_LOGIC.md](AGENT_LOGIC.md)
 
-### ⚙️ Flexible Configuration
+### Продвинутая система памяти
 
-- **Search Providers**: Tavily or SearXNG (self-hosted)
-- **Embedding Providers**: OpenAI, Ollama (local), Cohere, or HuggingFace
-- **LLM Models**: OpenAI GPT-4, Anthropic Claude, OpenRouter, and any OpenAI-compatible API
-- **Fully Configurable**: All settings via `.env` files
+- **Двойное хранилище**: Человекочитаемые Markdown файлы + PostgreSQL с pgvector
+- **Гибридный поиск**: RRF (Reciprocal Rank Fusion) объединяет векторный и полнотекстовый поиск
+- **Умное разбиение**: Markdown-aware chunking с сохранением контекста заголовков
+- **Автосинхронизация**: Автоматическая синхронизация между файлами и базой данных
+  - Расположение файлов памяти настраивается через `MEMORY_DIR` (по умолчанию: `./memory_files`)
+- **Контекст чата**: Агенты получают последние N сообщений чата (`CHAT_HISTORY_LIMIT`)
+- **Агентные сессии**: Deep Research создает временные папки сессий с файлами памяти агентов
+  - `main.md` - главный документ исследования (ключевые инсайты)
+  - `draft_report.md` - черновик финального отчета
+  - `supervisor.md` - личные заметки супервайзера
+  - `agents/{agent_id}.md` - файлы агентов (todos и заметки)
+  - `items/` - заметки агентов с источниками
+  - Автоматически сохраняются после успешного завершения исследования
 
-### 🛠 Modern Tech Stack
+### ⚙️ Гибкая конфигурация
+
+- **Провайдеры поиска**: Tavily или SearXNG (self-hosted)
+- **Провайдеры эмбеддингов**: OpenAI, Ollama (локально), Cohere, или HuggingFace
+- **LLM модели**: OpenAI GPT-4, Anthropic Claude, OpenRouter, и любой OpenAI-совместимый API
+- **Полностью настраиваемо**: Все настройки через `.env` файлы
+
+### 🛠 Современный стек технологий
 
 - **Backend**: FastAPI + LangGraph workflows + Pydantic v2
 - **Frontend**: Next.js 14 + React + TypeScript + Tailwind CSS
-- **Database**: PostgreSQL 16 + pgvector extension
-- **Real-time**: SSE streaming for live research updates
-- **Deployment**: Docker Compose for easy setup
+- **База данных**: PostgreSQL 16 + pgvector extension (или SQLite для разработки)
+- **Real-time**: SSE streaming для обновлений исследования в реальном времени
+- **Развертывание**: Docker Compose для простой настройки
 
-## 🚀 Quick Start
+## 🚀 Быстрый старт
 
-### Prerequisites
+См. подробную инструкцию: **[QUICKSTART.md](QUICKSTART.md)**
 
-- **Docker & Docker Compose** (recommended) OR
-- Python 3.11+ and Node.js 18+ for manual setup
-- API keys: OpenAI (required) and Tavily (recommended)
+### Требования
+
+- **Docker & Docker Compose** (рекомендуется) ИЛИ
+- Python 3.11+ и Node.js 18+ для ручной настройки
+- API ключи: OpenAI (обязательно) и Tavily (рекомендуется)
 
 ### Option 1: Docker Compose (Recommended) ⭐
 
@@ -146,7 +157,16 @@ npm run dev
 - Backend API: http://localhost:8000
 - API Documentation: http://localhost:8000/docs
 
-## Project Structure
+## 📖 Подробная документация
+
+- **[QUICKSTART.md](QUICKSTART.md)** - Пошаговая инструкция по запуску
+- **[AGENT_LOGIC.md](AGENT_LOGIC.md)** - Детальное описание логики работы всех режимов:
+  - Chat Mode - простой диалог
+  - Web Search Mode - быстрый веб-поиск
+  - Deep Search Mode - качественный веб-поиск
+  - Deep Research Mode - мультиагентная система
+
+## Структура проекта
 
 ```
 all_included_deep_research/
@@ -172,39 +192,39 @@ all_included_deep_research/
 └── docker-compose.yml   # Full stack Compose
 ```
 
-## Architecture Highlights
+## Архитектурные особенности
 
 ### LangGraph Workflows
 
-The system uses LangGraph to orchestrate complex research workflows:
+Система использует LangGraph для оркестрации сложных исследовательских процессов:
 
 ```
-User Query → Memory Search → Research Brief → Supervisor
-                                                  ↓
-                                     Parallel Researchers (1-5)
-                                                  ↓
-                                     Compress Findings
-                                                  ↓
-                                     Final Report → Save to Memory
+User Query → Deep Search (optional) → Clarifying Questions (optional) →
+Analyze Query → Plan Research → Create Agent Characteristics →
+Execute Agents (parallel) → Supervisor Reviews → 
+[Continue/Replan/Finish] →
+Compress Findings → Generate Final Report → Return
 ```
 
-### Memory Integration
+Подробнее о логике работы: **[AGENT_LOGIC.md](AGENT_LOGIC.md)**
 
-- Research context is retrieved from memory before starting
-- Findings are automatically saved to memory after completion
-- Hybrid search (semantic + keyword) for optimal retrieval
+### Интеграция памяти
+
+- Контекст исследования извлекается из памяти перед началом
+- Находки автоматически сохраняются в память после завершения
+- Гибридный поиск (семантический + ключевые слова) для оптимального извлечения
 
 ### Real-time Streaming
 
-- OpenAI-compatible `/v1/chat/completions` endpoint
-- SSE streaming with research/source/reasoning blocks
-- SessionManager pattern for UI state management
+- OpenAI-совместимый endpoint `/v1/chat/completions`
+- SSE streaming с блоками исследования/источников/рассуждений
+- SessionManager паттерн для управления состоянием UI
 
-## ⚙️ Configuration
+## ⚙️ Конфигурация
 
-### Required Settings
+### Обязательные настройки
 
-Edit `backend/.env`:
+Отредактируйте `backend/.env`:
 
 ```bash
 # Database (required)
@@ -299,24 +319,24 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 NEXT_PUBLIC_DEFAULT_MODE=search
 ```
 
-## API Documentation
+## API Документация
 
-Once the backend is running, visit:
+После запуска backend, посетите:
 - Swagger UI: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
 
-### Key Endpoints
+### Основные Endpoints
 
-- `POST /v1/chat/completions` - OpenAI-compatible chat endpoint (model: `search`/`web_search`, `deep_search`, `deep_research`)
-- `POST /api/chat/stream` - Chat with progress events (SSE)
-- `POST /api/research` - Start a research session
-- `GET /api/memory` - List memory files
-- `POST /api/memory` - Create memory file
-- `GET /api/config` - Get configuration
+- `POST /v1/chat/completions` - OpenAI-совместимый chat endpoint (model: `chat`, `search`/`web_search`, `deep_search`, `deep_research`)
+- `POST /api/chat/stream` - Chat с событиями прогресса (SSE)
+- `POST /api/research` - Запустить исследовательскую сессию
+- `GET /api/memory` - Список файлов памяти
+- `POST /api/memory` - Создать файл памяти
+- `GET /api/config` - Получить конфигурацию
 
-## Development
+## Разработка
 
-### Running Tests
+### Запуск тестов
 
 Backend:
 ```bash
@@ -330,7 +350,7 @@ cd frontend
 npm test
 ```
 
-### Code Quality
+### Качество кода
 
 Backend:
 ```bash
@@ -347,51 +367,43 @@ npm run lint
 npm run type-check
 ```
 
-## 🎓 Best Practices Integrated
+## 🎓 Интегрированные лучшие практики
 
-This project combines the best features from leading open-source projects:
+Этот проект объединяет лучшие возможности из ведущих open-source проектов:
 
-| Project | Feature Adopted |
-|---------|----------------|
-| **multifile-markdown-mcp** | Hybrid memory system with RRF (Reciprocal Rank Fusion) search |
-| **open_deep_research** | Supervisor pattern with parallel researchers |
-| **sgr-agent-core** | OpenAI-compatible API with SSE streaming |
-| **OpenDeepSearch** | Search provider abstraction and reranking |
-| **Perplexica** | Mode-based iteration limits and streaming UI blocks |
+| Проект | Интегрированная возможность |
+|--------|----------------------------|
+| **multifile-markdown-mcp** | Гибридная система памяти с RRF (Reciprocal Rank Fusion) поиском |
+| **open_deep_research** | Паттерн супервайзера с параллельными исследователями |
+| **sgr-agent-core** | OpenAI-совместимый API с SSE streaming |
+| **OpenDeepSearch** | Абстракция провайдеров поиска и реранжинг |
+| **Perplexica** | Лимиты итераций по режимам и streaming UI блоки |
 
-## 📊 How It Works
+## 📊 Как это работает
 
-### Research Workflow
+Подробное описание логики работы всех режимов: **[AGENT_LOGIC.md](AGENT_LOGIC.md)**
+
+### Исследовательский процесс
 
 ```
-User Query → Memory Search → Research Planning
-                                    ↓
-                    Parallel Researchers (1-5 concurrent)
-                                    ↓
-                    Source Discovery & Analysis
-                                    ↓
-                    Findings Compression & Synthesis
-                                    ↓
-                    Final Report Generation
-                                    ↓
-                    Save to Memory (optional)
+User Query → Deep Search (optional) → Clarifying Questions (optional) →
+Analyze Query → Plan Research → Create Agent Characteristics →
+Execute Agents (parallel) → Supervisor Reviews → 
+[Continue/Replan/Finish] →
+Compress Findings → Generate Final Report → Return
 ```
 
-### Memory System
+### Система памяти
 
-1. **Markdown Files**: Human-readable research notes (location configurable via `MEMORY_DIR`)
-2. **Vector Database**: PostgreSQL + pgvector for semantic search
-3. **Hybrid Search**: Combines vector similarity + fulltext search with RRF
-4. **Auto-sync**: Changes to files automatically update the database
+1. **Markdown файлы**: Человекочитаемые исследовательские заметки (расположение настраивается через `MEMORY_DIR`)
+2. **Векторная база данных**: PostgreSQL + pgvector для семантического поиска
+3. **Гибридный поиск**: Объединяет векторное сходство + полнотекстовый поиск с RRF
+4. **Автосинхронизация**: Изменения в файлах автоматически обновляют базу данных
 
-## License
+## Лицензия
 
 MIT
 
-## Contributing
+## Поддержка
 
-Contributions are welcome! Please read our contributing guidelines first.
-
-## Support
-
-For issues and questions, please use the GitHub issue tracker.
+Для вопросов и проблем используйте GitHub issue tracker.

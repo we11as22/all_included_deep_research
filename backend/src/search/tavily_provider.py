@@ -25,36 +25,51 @@ class TavilySearchProvider(SearchProvider):
     async def search(self, query: str, max_results: int = 10) -> SearchResponse:
         """
         Search using Tavily API.
+        
+        Tavily already provides high-quality, relevant results with scores,
+        so no reranking is needed. The API is optimized for LLM use cases.
 
         Args:
-            query: Search query
+            query: Search query (supports all languages including Russian)
             max_results: Maximum results
 
         Returns:
-            SearchResponse with results
+            SearchResponse with results (already ranked by relevance)
         """
         try:
-            # Tavily search (synchronous API)
+            # Tavily search with optimized parameters
+            # According to Tavily docs: auto_parameters optimizes search automatically
+            # search_depth="advanced" provides better quality results
             response = self.client.search(
                 query=query,
                 max_results=max_results,
-                search_depth="advanced",  # Use advanced search for better quality
+                search_depth="advanced",  # "basic", "advanced", "fast", or "ultra-fast"
+                topic="general",  # "general", "news", or "finance"
                 include_answer=False,  # We'll generate our own answers
                 include_raw_content=False,  # Don't need raw HTML in search results
+                auto_parameters=True,  # Automatically optimize search parameters for better results
+                include_favicon=False,  # Not needed for our use case
             )
 
+            # Tavily already provides relevance scores (0.0-1.0)
+            # Results are already sorted by relevance, no reranking needed
             results = [
                 SearchResult(
                     title=result.get("title", ""),
                     url=result.get("url", ""),
                     snippet=result.get("content", ""),
-                    score=result.get("score", 0.0),
+                    score=result.get("score", 0.0),  # Tavily's relevance score
                     published_date=result.get("published_date"),
                 )
                 for result in response.get("results", [])
             ]
 
-            logger.info("Tavily search completed", query=query, results_count=len(results))
+            logger.info(
+                "Tavily search completed",
+                query=query[:100],
+                results_count=len(results),
+                avg_score=sum(r.score for r in results) / len(results) if results else 0.0,
+            )
 
             return SearchResponse(
                 query=query,
@@ -63,7 +78,7 @@ class TavilySearchProvider(SearchProvider):
             )
 
         except Exception as e:
-            logger.error("Tavily search failed", error=str(e), query=query)
+            logger.error("Tavily search failed", error=str(e), query=query[:100])
             return SearchResponse(query=query, results=[], total_results=0)
 
     async def scrape(self, url: str) -> ScrapedContent:

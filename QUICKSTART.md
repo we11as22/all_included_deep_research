@@ -216,6 +216,7 @@ DEEP_SEARCH_QUALITY_ITERATIONS=3
 ## Что дальше?
 
 - Прочитайте полную документацию в [README.md](README.md)
+- Изучите детальную логику работы агентов в [AGENT_LOGIC.md](AGENT_LOGIC.md)
 - Изучите API в Swagger UI: http://localhost:8000/docs
 - Настройте память для сохранения результатов исследований
 - Интегрируйте с вашими приложениями через OpenAI-compatible API
