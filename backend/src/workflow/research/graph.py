@@ -136,6 +136,18 @@ def should_ask_clarification(state: ResearchState) -> str:
         return "proceed"
 
 
+# Global checkpointer shared across all graph instances
+# This ensures checkpoints persist between graph invocations
+_global_checkpointer = None
+
+def get_global_checkpointer():
+    """Get or create global checkpointer for graph state persistence."""
+    global _global_checkpointer
+    if _global_checkpointer is None:
+        _global_checkpointer = FilteredMemorySaver()
+        logger.info("Created global checkpointer for graph state persistence")
+    return _global_checkpointer
+
 def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") -> StateGraph:
     """
     Create LangGraph state machine for deep research.
@@ -212,10 +224,10 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
     workflow.add_edge("compress_findings", "generate_report")
     workflow.add_edge("generate_report", END)
 
-    # Compile with in-memory checkpointing (session data persists in SQLite via session_memory_service)
+    # Compile with global checkpointer to ensure state persists between invocations
     # Note: stream, llm, search_provider, scraper, supervisor_queue, settings are runtime dependencies
     # and should not be serialized. They are excluded from state before checkpointing.
-    checkpointer = FilteredMemorySaver()
+    checkpointer = get_global_checkpointer()
 
     compiled_graph = workflow.compile(checkpointer=checkpointer)
 
@@ -262,7 +274,21 @@ async def run_research_graph(
     # Create graph
     graph = create_research_graph()
 
-    # Create initial state
+    # CRITICAL: Check if this is a continuation (user answered clarification)
+    # If yes, check if checkpoint exists and use it instead of creating new state
+    is_continuation = False
+    for i in range(len(chat_history) - 1, -1, -1):
+        msg = chat_history[i]
+        if msg.get("role") == "assistant":
+            content = msg.get("content", "").lower()
+            if "clarification" in content or "🔍" in content or "clarify" in content:
+                # Check if there's a user message after this
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    is_continuation = True
+                    logger.info("Detected continuation - user answered clarification, will resume from checkpoint")
+                    break
+    
+    # Create initial state first
     initial_state = create_initial_state(
         query=query,
         chat_history=chat_history,
@@ -309,6 +335,35 @@ async def run_research_graph(
         "agent_file_service": agent_file_service,
     }
     
+    # CRITICAL: If continuation, try to get checkpoint state and merge it
+    # LangGraph automatically resumes from checkpoint, but we need to ensure state is correct
+    if is_continuation:
+        try:
+            # Get checkpoint state using graph's checkpointer
+            checkpointer = graph.checkpointer if hasattr(graph, 'checkpointer') else None
+            if checkpointer:
+                config = {"configurable": {"thread_id": session_id}}
+                checkpoint_tuple = checkpointer.get_tuple(config)
+                if checkpoint_tuple:
+                    checkpoint_state, metadata, parent_config = checkpoint_tuple
+                    if checkpoint_state and isinstance(checkpoint_state, dict):
+                        logger.info("Found checkpoint state for continuation", 
+                                   state_keys=list(checkpoint_state.keys()),
+                                   deep_search_result_exists="deep_search_result" in checkpoint_state)
+                        # Merge checkpoint state into initial_state (checkpoint takes precedence)
+                        # But update chat_history and query with latest
+                        for key, value in checkpoint_state.items():
+                            if key not in NON_SERIALIZABLE_FIELDS and key not in ["stream", "llm", "search_provider", "scraper", "settings"]:
+                                initial_state[key] = value
+                        # Always update chat_history and query with latest
+                        initial_state["chat_history"] = chat_history
+                        initial_state["query"] = query
+                        logger.info("Checkpoint state merged", 
+                                   deep_search_result_exists="deep_search_result" in initial_state,
+                                   clarification_needed=initial_state.get("clarification_needed", False))
+        except Exception as e:
+            logger.warning("Failed to get checkpoint state, will use initial state", error=str(e), exc_info=True)
+    
     # Remove non-serializable fields from state before passing to graph
     # They will be restored in nodes via contextvars or passed through config
     filtered_state = {k: v for k, v in initial_state.items() if k not in NON_SERIALIZABLE_FIELDS}
@@ -320,14 +375,31 @@ async def run_research_graph(
 
     try:
         # Run graph with filtered state (no non-serializable fields)
-        # Increase recursion limit to prevent premature termination
-        final_state = await graph.ainvoke(
-            filtered_state,
-            config={
-                "configurable": {"thread_id": session_id},
-                "recursion_limit": 100  # Increased from default 25 to handle complex workflows
+        config = {
+            "configurable": {"thread_id": session_id},
+            "recursion_limit": 100  # Increased from default 25 to handle complex workflows
+        }
+        
+        # CRITICAL: For continuation, only pass updated fields (chat_history, query)
+        # LangGraph will automatically load checkpoint and apply our updates
+        # This ensures graph continues from where it stopped (after clarify node), not from entry point
+        if is_continuation:
+            logger.info("Continuation detected - passing only updated fields to resume from checkpoint")
+            # Only update chat_history and query - LangGraph will load the rest from checkpoint
+            update_state = {
+                "chat_history": chat_history,
+                "query": query,
             }
-        )
+            # Remove non-serializable fields
+            update_state = {k: v for k, v in update_state.items() if k not in NON_SERIALIZABLE_FIELDS}
+            logger.info("Invoking graph with update state for continuation", 
+                       update_keys=list(update_state.keys()),
+                       has_checkpoint=True)
+            final_state = await graph.ainvoke(update_state, config=config)
+        else:
+            # No checkpoint - start fresh with full state
+            logger.info("No continuation - starting fresh with full state")
+            final_state = await graph.ainvoke(filtered_state, config=config)
         
         # Restore runtime deps to final_state for return
         for key, value in runtime_deps.items():
