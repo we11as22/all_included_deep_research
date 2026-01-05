@@ -109,7 +109,7 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, 'html.parser')
     
-    # Create PDF document
+    # Create PDF document with UTF-8 encoding support
     doc = SimpleDocTemplate(
         buffer,
         pagesize=A4,
@@ -118,6 +118,16 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         topMargin=72,
         bottomMargin=72,
     )
+    
+    # Ensure UTF-8 encoding for all text processing
+    import sys
+    if sys.version_info < (3, 7):
+        # Python < 3.7: ensure UTF-8 encoding
+        import codecs
+        report = report.encode('utf-8').decode('utf-8')
+    else:
+        # Python >= 3.7: UTF-8 is default
+        pass
     
     # Styles
     styles = getSampleStyleSheet()
@@ -180,6 +190,9 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         """Recursively process HTML elements."""
         if element.name is None:  # Text node
             text = str(element).strip()
+            # Ensure UTF-8 encoding for text
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
             if text:
                 # Check for links in text
                 if element.parent and element.parent.name == 'a':
@@ -201,24 +214,39 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         
         if tag == 'h1':
             text = element.get_text().strip()
+            # Ensure UTF-8 encoding
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
             if text:
                 story.append(Paragraph(text, heading1_style))
                 story.append(Spacer(1, 0.1 * inch))
         elif tag == 'h2':
             text = element.get_text().strip()
+            # Ensure UTF-8 encoding
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
             if text:
                 story.append(Paragraph(text, heading2_style))
                 story.append(Spacer(1, 0.08 * inch))
         elif tag == 'h3':
             text = element.get_text().strip()
+            # Ensure UTF-8 encoding
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
             if text:
                 story.append(Paragraph(f'<b>{text}</b>', body_style))
                 story.append(Spacer(1, 0.06 * inch))
         elif tag == 'p':
             text = element.get_text().strip()
+            # Ensure UTF-8 encoding
+            if isinstance(text, bytes):
+                text = text.decode('utf-8', errors='replace')
             if text:
                 # Check for links in paragraph
                 para_html = str(element)
+                # Ensure UTF-8 for HTML
+                if isinstance(para_html, bytes):
+                    para_html = para_html.decode('utf-8', errors='replace')
                 # Replace <a> tags with reportlab link format
                 para_html = re.sub(
                     r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
@@ -236,9 +264,15 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         elif tag == 'ul' or tag == 'ol':
             for li in element.find_all('li', recursive=False):
                 text = li.get_text().strip()
+                # Ensure UTF-8 encoding
+                if isinstance(text, bytes):
+                    text = text.decode('utf-8', errors='replace')
                 if text:
                     # Check for links in list item
                     li_html = str(li)
+                    # Ensure UTF-8 for HTML
+                    if isinstance(li_html, bytes):
+                        li_html = li_html.decode('utf-8', errors='replace')
                     li_html = re.sub(
                         r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
                         r'<link href="\1" color="blue"><u>\2</u></link>',

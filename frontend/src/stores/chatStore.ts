@@ -39,6 +39,9 @@ interface ChatStore {
 
   // Progress tracking
   progressByMessage: Record<string, ProgressState>;
+  progressByChat: Record<string, Record<string, ProgressState>>;
+  progressPanelByChat: Record<string, string | null>;
+  activeMessageByChat: Record<string, string | null>;
 
   // UI state
   isStreaming: boolean;
@@ -58,7 +61,7 @@ interface ChatStore {
   updateMessage: (id: string, updates: Partial<LocalChatMessage>) => void;
   queueMessage: (message: QueuedMessage) => void;
   dequeueMessage: (id: string) => void;
-  updateProgress: (messageId: string, progress: Partial<ProgressState>) => void;
+  updateProgress: (messageId: string, progress: Partial<ProgressState>, chatId?: string | null) => void;
   setIsStreaming: (streaming: boolean) => void;
   setActiveMessageId: (messageId: string | null) => void;
   setProgressPanelMessageId: (messageId: string | null) => void;
@@ -90,6 +93,9 @@ export const useChatStore = create<ChatStore>()(
       messages: [],
       messageQueue: [],
       progressByMessage: {},
+      progressByChat: {},
+      progressPanelByChat: {},
+      activeMessageByChat: {},
       isStreaming: false,
       activeMessageId: null,
       progressPanelMessageId: null,
@@ -139,19 +145,82 @@ export const useChatStore = create<ChatStore>()(
         set((state) => ({
           messageQueue: state.messageQueue.filter((msg) => msg.id !== id),
         })),
-      updateProgress: (messageId, progress) =>
-        set((state) => ({
-          progressByMessage: {
-            ...state.progressByMessage,
-            [messageId]: {
-              ...(state.progressByMessage[messageId] || {}),
-              ...progress,
-            } as ProgressState,
-          },
-        })),
+      updateProgress: (messageId, progress, chatId) =>
+        set((state) => {
+          const targetChatId = chatId || state.currentChatId;
+          const existingMessageProgress = state.progressByMessage[messageId] || {};
+          // Ensure all arrays are initialized to prevent undefined.length errors
+          // Merge existing progress with new progress, ensuring arrays are never undefined
+          const nextMessageProgress: ProgressState = {
+            status: progress.status !== undefined ? progress.status : (existingMessageProgress.status || ''),
+            step: progress.step !== undefined ? progress.step : (existingMessageProgress.step || ''),
+            memoryContext: progress.memoryContext !== undefined ? progress.memoryContext : (existingMessageProgress.memoryContext || []),
+            researchPlan: progress.researchPlan !== undefined ? progress.researchPlan : (existingMessageProgress.researchPlan ?? null),
+            topics: progress.topics !== undefined ? progress.topics : (existingMessageProgress.topics || []),
+            findings: progress.findings !== undefined ? progress.findings : (existingMessageProgress.findings || []),
+            sources: progress.sources !== undefined ? progress.sources : (existingMessageProgress.sources || []),
+            agentTodos: progress.agentTodos !== undefined ? progress.agentTodos : (existingMessageProgress.agentTodos || {}),
+            agentNotes: progress.agentNotes !== undefined ? progress.agentNotes : (existingMessageProgress.agentNotes || {}),
+            isComplete: progress.isComplete !== undefined ? progress.isComplete : (existingMessageProgress.isComplete || false),
+            mode: progress.mode !== undefined ? progress.mode : existingMessageProgress.mode,
+            sessionId: progress.sessionId !== undefined ? progress.sessionId : existingMessageProgress.sessionId,
+            error: progress.error !== undefined ? progress.error : existingMessageProgress.error,
+            queries: progress.queries !== undefined ? progress.queries : (existingMessageProgress.queries || []),
+          };
+
+          if (!targetChatId) {
+            return {
+              progressByMessage: {
+                ...state.progressByMessage,
+                [messageId]: nextMessageProgress,
+              },
+            };
+          }
+
+          const existingChatProgress = state.progressByChat[targetChatId] || {};
+          return {
+            progressByMessage: {
+              ...state.progressByMessage,
+              [messageId]: nextMessageProgress,
+            },
+            progressByChat: {
+              ...state.progressByChat,
+              [targetChatId]: {
+                ...existingChatProgress,
+                [messageId]: nextMessageProgress,
+              },
+            },
+          };
+        }),
       setIsStreaming: (streaming) => set({ isStreaming: streaming }),
-      setActiveMessageId: (messageId) => set({ activeMessageId: messageId }),
-      setProgressPanelMessageId: (messageId) => set({ progressPanelMessageId: messageId }),
+      setActiveMessageId: (messageId) =>
+        set((state) => {
+          const chatId = state.currentChatId;
+          if (!chatId) {
+            return { activeMessageId: messageId };
+          }
+          return {
+            activeMessageId: messageId,
+            activeMessageByChat: {
+              ...state.activeMessageByChat,
+              [chatId]: messageId,
+            },
+          };
+        }),
+      setProgressPanelMessageId: (messageId) =>
+        set((state) => {
+          const chatId = state.currentChatId;
+          if (!chatId) {
+            return { progressPanelMessageId: messageId };
+          }
+          return {
+            progressPanelMessageId: messageId,
+            progressPanelByChat: {
+              ...state.progressPanelByChat,
+              [chatId]: messageId,
+            },
+          };
+        }),
       setError: (error) => set({ error }),
       setMode: (mode) => set({ mode }),
       setInput: (input) => set({ input }),
@@ -209,14 +278,15 @@ export const useChatStore = create<ChatStore>()(
               status: 'sent' as MessageStatus,
             }));
 
-            set({
-              currentChatId: chatId,
+            get().setCurrentChatId(chatId);
+            set((state) => ({
               messages: loadedMessages,
-              activeMessageId: null,
-              progressPanelMessageId: null,
+              progressByMessage: state.progressByChat?.[chatId] || {},
+              activeMessageId: state.activeMessageByChat?.[chatId] || null,
+              progressPanelMessageId: state.progressPanelByChat?.[chatId] || null,
               isStreaming: false,
               error: null,
-            });
+            }));
           }
         } catch (error: any) {
           console.error('Failed to load chat:', error);
@@ -224,9 +294,9 @@ export const useChatStore = create<ChatStore>()(
         }
       },
 
-      clearCurrentChat: () =>
+      clearCurrentChat: () => {
+        get().setCurrentChatId(null);
         set({
-          currentChatId: null,
           messages: [],
           progressByMessage: {},
           isStreaming: false,
@@ -234,7 +304,8 @@ export const useChatStore = create<ChatStore>()(
           progressPanelMessageId: null,
           error: null,
           input: '',
-        }),
+        });
+      },
 
       clearMessages: () =>
         set({
@@ -250,6 +321,9 @@ export const useChatStore = create<ChatStore>()(
         currentChatId: state.currentChatId,
         currentSessionId: state.currentSessionId,
         mode: state.mode,
+        progressByChat: state.progressByChat,
+        progressPanelByChat: state.progressPanelByChat,
+        activeMessageByChat: state.activeMessageByChat,
       }),
     }
   )

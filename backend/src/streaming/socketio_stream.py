@@ -18,6 +18,7 @@ class SocketIOStreamingGenerator:
         sio: socketio.AsyncServer,
         message_id: str | None = None,
         chat_id: str | None = None,
+        session_id: str | None = None,
         app_state: dict[str, Any] | None = None,
     ):
         """Initialize Socket.IO streaming generator.
@@ -33,6 +34,7 @@ class SocketIOStreamingGenerator:
         self.sio = sio
         self.message_id = message_id
         self.chat_id = chat_id
+        self.session_id = session_id or sid
         self.app_state = app_state or {}
         self._event_count = 0
 
@@ -51,6 +53,8 @@ class SocketIOStreamingGenerator:
         if self.chat_id:
             payload.setdefault("chatId", self.chat_id)
             payload.setdefault("chat_id", self.chat_id)
+        if self.session_id:
+            payload.setdefault("sessionId", self.session_id)
         return payload
 
     async def _emit(self, event_type: str, data: Dict[str, Any]) -> None:
@@ -79,7 +83,7 @@ class SocketIOStreamingGenerator:
 
     def emit_init(self, mode: str) -> asyncio.Task | None:
         """Emit initialization event."""
-        return self._schedule(self._emit('stream:init', {'mode': mode, 'sessionId': self.sid}))
+        return self._schedule(self._emit('stream:init', {'mode': mode, 'sessionId': self.session_id}))
 
     def emit_status(self, message: str, step: Optional[str] = None) -> asyncio.Task | None:
         """Emit status update."""

@@ -1,9 +1,11 @@
 'use client';
 
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
-import { Brain, CheckCircle2, Loader2, Search } from 'lucide-react';
+import { Brain, CheckCircle2, Download, Loader2, Search } from 'lucide-react';
 import Markdown from 'markdown-to-jsx';
+import { downloadPDF } from '@/lib/api';
 
 const agentAccents = [
   { border: 'border-l-4 border-amber-400 dark:border-amber-500', badge: 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300' },
@@ -56,6 +58,8 @@ export type ProgressState = {
   agentTodos: Record<string, AgentTodoItem[]>;
   agentNotes: Record<string, AgentNote[]>;
   isComplete: boolean;
+  mode?: string;
+  sessionId?: string;
   error?: string | null;
   queries?: string[];
 };
@@ -63,9 +67,18 @@ export type ProgressState = {
 export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
   if (!progress) return null;
 
+  // Ensure all arrays are initialized to prevent undefined.length errors
+  const memoryContext = progress.memoryContext || [];
+  const topics = progress.topics || [];
+  const findings = progress.findings || [];
+  const sources = progress.sources || [];
+  const queries = progress.queries || [];
+  const agentTodos = progress.agentTodos || {};
+  const agentNotes = progress.agentNotes || {};
+
   return (
     <Card className="mb-4 border-border/60 bg-background/95 dark:bg-background/90 p-4 text-xs text-foreground shadow-sm">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           {progress.isComplete ? (
             <CheckCircle2 className="h-4 w-4 text-emerald-500" />
@@ -74,19 +87,32 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
           )}
           <span className="text-foreground dark:text-foreground">{progress.status}</span>
         </div>
-        <Badge variant="outline" className="text-[10px] uppercase tracking-[0.2em]">
-          {progress.step}
-        </Badge>
+        <div className="flex items-center gap-2">
+          {progress.isComplete && progress.mode === 'deep_research' && progress.sessionId && (
+            <Button
+              variant="outline"
+              size="sm"
+              className="h-7 px-2 text-[10px]"
+              onClick={() => downloadPDF(progress.sessionId!)}
+            >
+              <Download className="mr-1 h-3 w-3" />
+              PDF
+            </Button>
+          )}
+          <Badge variant="outline" className="text-[10px] uppercase tracking-[0.2em]">
+            {progress.step}
+          </Badge>
+        </div>
       </div>
 
-      {progress.queries && progress.queries.length > 0 && (
+      {queries.length > 0 && (
         <div className="mt-3">
           <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
             <Search className="h-4 w-4" />
             Search Queries
           </div>
           <div className="mt-2 flex flex-wrap gap-2">
-            {progress.queries.map((query, idx) => (
+            {queries.map((query, idx) => (
               <Badge key={idx} variant="secondary" className="text-[10px]">
                 {query}
               </Badge>
@@ -95,14 +121,14 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
         </div>
       )}
 
-      {progress.memoryContext.length > 0 && (
+      {memoryContext.length > 0 && (
         <div className="mt-3">
           <div className="flex items-center gap-2 text-xs font-semibold text-foreground">
             <Brain className="h-4 w-4" />
             Memory Context
           </div>
           <div className="mt-2 space-y-1">
-            {progress.memoryContext.map((item, idx) => (
+            {memoryContext.map((item, idx) => (
               <div 
                 key={idx} 
                 className="group relative flex items-center justify-between gap-2 rounded p-1 hover:bg-background/50 dark:hover:bg-background/70"
@@ -190,9 +216,9 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
               {progress.researchPlan}
             </Markdown>
           </div>
-          {progress.topics.length > 0 && (
+          {topics.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-2">
-              {progress.topics.map((topic, idx) => (
+              {topics.map((topic, idx) => (
                 <Badge key={idx} variant="outline" className="text-[10px]">
                   {topic}
                 </Badge>
@@ -202,11 +228,11 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
         </div>
       )}
 
-      {progress.findings.length > 0 && (
+      {findings.length > 0 && (
         <div className="mt-3">
           <div className="text-xs font-semibold text-foreground">Findings</div>
           <div className="mt-2 space-y-2">
-            {progress.findings.map((finding, idx) => (
+            {findings.map((finding, idx) => (
               <div 
                 key={idx} 
                 className="group relative rounded-lg border border-border/60 bg-background/80 dark:bg-background/70 p-2 hover:bg-background/90"
@@ -232,11 +258,11 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
         </div>
       )}
 
-      {progress.sources.length > 0 && (
+      {sources.length > 0 && (
         <div className="mt-3">
           <div className="text-xs font-semibold text-foreground">Sources</div>
           <div className="mt-2 space-y-1">
-            {progress.sources.slice(0, 6).map((source, idx) => (
+            {sources.slice(0, 6).map((source, idx) => (
               <a
                 key={idx}
                 href={source.url}
@@ -255,19 +281,19 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
                 )}
               </a>
             ))}
-            {progress.sources.length > 6 && (
-              <div className="text-[10px] text-foreground/70 dark:text-foreground/70">+{progress.sources.length - 6} more</div>
+            {sources.length > 6 && (
+              <div className="text-[10px] text-foreground/70 dark:text-foreground/70">+{sources.length - 6} more</div>
             )}
           </div>
         </div>
       )}
 
-      {Object.keys(progress.agentTodos).length > 0 && (
+      {Object.keys(agentTodos).length > 0 && (
         <div className="mt-3">
           <div className="text-xs font-semibold text-foreground">Agent Tasks</div>
           <div className="mt-2 space-y-2">
-            {Object.entries(progress.agentTodos).map(([agentId, todos]) => {
-              const notes = progress.agentNotes[agentId] || [];
+            {Object.entries(agentTodos).map(([agentId, todos]) => {
+              const notes = agentNotes[agentId] || [];
               const pending = todos.filter((item) => item.status !== 'done');
               const inProgress = todos.filter((item) => item.status === 'in_progress');
               const completed = todos.filter((item) => item.status === 'done');
@@ -291,9 +317,21 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
                     </div>
                   </div>
                   <div className="mt-2 space-y-1">
-                    {todos.map((todo, idx) => (
+                    {(() => {
+                      // Deduplicate todos by title and status to avoid showing duplicates
+                      const seen = new Set<string>();
+                      const uniqueTodos = todos.filter((todo) => {
+                        const key = `${todo.title}-${todo.status}`;
+                        if (seen.has(key)) {
+                          return false;
+                        }
+                        seen.add(key);
+                        return true;
+                      });
+                      return uniqueTodos;
+                    })().map((todo, idx) => (
                       <div 
-                        key={`${todo.title}-${idx}`} 
+                        key={`${todo.title}-${todo.status}-${idx}`} 
                         className={`flex items-start gap-2 text-[10px] transition-all duration-300 ${
                           todo.status === 'done' 
                             ? 'opacity-60' 

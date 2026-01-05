@@ -67,6 +67,7 @@ export function useChat() {
         agentTodos: {},
         agentNotes: {},
         isComplete: false,
+        mode: store.mode,
       });
 
       // Send via Socket.IO

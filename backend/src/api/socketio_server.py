@@ -9,6 +9,7 @@ import structlog
 
 from src.streaming.socketio_stream import SocketIOStreamingGenerator
 from src.memory.agent_session import create_agent_session_services, cleanup_agent_session_dir
+from src.api.routes.chat_stream import _store_session_report
 
 logger = structlog.get_logger(__name__)
 
@@ -83,12 +84,15 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "settings": settings,
         }
 
+        session_id = str(uuid4())
+
         # Create streaming generator
         stream_generator = SocketIOStreamingGenerator(
             sid,
             sio,
             message_id=message_id,
             chat_id=chat_id,
+            session_id=session_id,
             app_state=stream_app_state,
         )
 
@@ -136,9 +140,12 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                 # Process based on mode
                 if mode == 'chat':
                     # Simple chat without search
-                    await stream_generator.emit_status("Generating response...")
-                    # TODO: Implement chat mode
-                    await stream_generator.emit_error("Chat mode not yet implemented")
+                    result = await chat_service.answer_simple(
+                        query=message,
+                        stream=stream_generator,
+                        messages=chat_history,
+                    )
+                    await _emit_answer(stream_generator, result.answer)
                 elif mode in ['search', 'speed']:
                     # Fast web search
                     result = await chat_service.answer_web(
@@ -160,11 +167,9 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                     from src.workflow.research import run_research_graph
                     from src.config.modes import ResearchMode
 
-                    research_session_id = str(uuid4())
-
                     memory_root = Path(app_state.memory_manager.memory_dir)
                     agent_memory_service, agent_file_service, session_agent_dir = create_agent_session_services(
-                        memory_root, research_session_id
+                        memory_root, session_id
                     )
                     await agent_memory_service.read_main_file()
                     stream_generator.app_state["agent_memory_service"] = agent_memory_service
@@ -186,7 +191,7 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         search_provider=app_state.chat_service.search_provider,
                         scraper=app_state.chat_service.scraper,
                         stream=stream_generator,
-                        session_id=research_session_id,
+                        session_id=session_id,
                         mode_config=mode_config,
                         settings=app_state.settings,
                     )
@@ -228,6 +233,7 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(final_report)
+                        _store_session_report(app_state, session_id, final_report, message, mode)
                     else:
                         stream_generator.emit_error("No report generated")
                 else:

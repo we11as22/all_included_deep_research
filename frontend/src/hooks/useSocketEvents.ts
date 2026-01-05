@@ -10,6 +10,20 @@ export function useSocketEvents() {
 
     const resolveMessageId = (data: any) => data?.messageId || data?.message_id;
     const resolveChatId = (data: any) => data?.chatId || data?.chat_id;
+    const finalizeAgentTodos = (messageId: string, chatId?: string | null) => {
+      const progress = useChatStore.getState().progressByMessage[messageId];
+      if (!progress?.agentTodos) return;
+
+      const updated: typeof progress.agentTodos = {};
+      Object.entries(progress.agentTodos).forEach(([agentId, todos]) => {
+        updated[agentId] = (todos || []).map((item) => ({
+          ...item,
+          status: 'done',
+        }));
+      });
+
+      useChatStore.getState().updateProgress(messageId, { agentTodos: updated }, chatId);
+    };
 
     const flushChunkBuffer = (messageId: string) => {
       const buffered = chunkBuffers.get(messageId);
@@ -38,10 +52,10 @@ export function useSocketEvents() {
     const handleStreamEvent = (event: CustomEvent) => {
       const { type, data } = event.detail;
 
-      const currentMessages = useChatStore.getState().messages;
+      const currentMessages = useChatStore.getState().messages || [];
       const assistantMessage =
         currentMessages.find((m) => m.role === 'assistant' && m.content === '') ||
-        currentMessages[currentMessages.length - 1];
+        (currentMessages.length > 0 ? currentMessages[currentMessages.length - 1] : null);
 
       const messageId = resolveMessageId(data) || assistantMessage?.id;
       const chatId = resolveChatId(data) || useChatStore.getState().currentChatId;
@@ -63,6 +77,10 @@ export function useSocketEvents() {
           }
           if (data.sessionId) {
             useChatStore.getState().setCurrentSessionId(data.sessionId);
+            useChatStore.getState().updateProgress(messageId, {
+              sessionId: data.sessionId,
+              mode: data.mode,
+            }, chatId);
           }
           break;
 
@@ -70,26 +88,26 @@ export function useSocketEvents() {
           useChatStore.getState().updateProgress(messageId, {
             status: data.message,
             step: data.step,
-          });
+          }, chatId);
           break;
 
         case 'search_queries':
           useChatStore.getState().updateProgress(messageId, {
             queries: data.queries || [],
-          });
+          }, chatId);
           break;
 
         case 'planning':
           useChatStore.getState().updateProgress(messageId, {
             researchPlan: data.plan,
             topics: data.topics || [],
-          });
+          }, chatId);
           break;
 
         case 'memory_search':
           useChatStore.getState().updateProgress(messageId, {
             memoryContext: data.preview || [],
-          });
+          }, chatId);
           break;
 
         case 'source_found':
@@ -98,7 +116,7 @@ export function useSocketEvents() {
               ...(useChatStore.getState().progressByMessage[messageId]?.sources || []),
               { url: data.url, title: data.title },
             ].slice(-60), // Keep last 60
-          });
+          }, chatId);
           break;
 
         case 'finding':
@@ -107,7 +125,7 @@ export function useSocketEvents() {
               ...(useChatStore.getState().progressByMessage[messageId]?.findings || []),
               { topic: data.topic, summary: data.summary },
             ].slice(-30), // Keep last 30
-          });
+          }, chatId);
           break;
 
         case 'agent_todo':
@@ -117,7 +135,7 @@ export function useSocketEvents() {
                 ...(useChatStore.getState().progressByMessage[messageId]?.agentTodos || {}),
                 [data.researcher_id]: data.todos || [],
               },
-            });
+            }, chatId);
           }
           break;
 
@@ -130,7 +148,7 @@ export function useSocketEvents() {
                 ...(useChatStore.getState().progressByMessage[messageId]?.agentNotes || {}),
                 [data.researcher_id]: [...existingNotes, data.note].slice(-20),
               },
-            });
+            }, chatId);
           }
           break;
 
@@ -161,7 +179,8 @@ export function useSocketEvents() {
 
             useChatStore.getState().updateProgress(messageId, {
               isComplete: true,
-            });
+            }, chatId);
+            finalizeAgentTodos(messageId, chatId);
           }
           break;
 
@@ -186,7 +205,8 @@ export function useSocketEvents() {
           }
           useChatStore.getState().updateProgress(messageId, {
             isComplete: true,
-          });
+          }, chatId);
+          finalizeAgentTodos(messageId, chatId);
           break;
 
         default:

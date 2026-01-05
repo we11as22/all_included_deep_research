@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -168,17 +169,12 @@ class ChatSearchService:
         )
         
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
-        try:
-            response = await structured_llm.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-            )
-            if not isinstance(response, SynthesizedAnswer):
-                raise ValueError("SynthesizedAnswer response was not structured")
-            answer = response.answer.strip()
-        except Exception as exc:
-            logger.error("Structured answer generation failed", error=str(exc))
-            raise
-        
+        answer = await self._invoke_structured_answer(
+            structured_llm,
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
+            context="chat_simple",
+        )
+
         self._emit_status(stream, "Response generated", step="complete")
         
         return ChatSearchResult(
@@ -813,20 +809,21 @@ class ChatSearchService:
         )
 
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
-        try:
-            logger.debug("Calling LLM for answer synthesis", prompt_length=len(user_prompt))
-            response = await structured_llm.ainvoke(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
-            )
-            logger.debug("LLM response received", response_type=type(response).__name__)
-            if not isinstance(response, SynthesizedAnswer):
-                raise ValueError("SynthesizedAnswer response was not structured")
-            answer = response.answer.strip()
-            logger.info("Answer synthesis completed", answer_length=len(answer))
-            return answer
-        except Exception as exc:
-            logger.error("Structured answer synthesis failed", error=str(exc), exc_info=True)
-            raise
+        logger.debug(
+            "Calling LLM for answer synthesis",
+            prompt_length=len(user_prompt),
+            system_prompt_length=len(system_prompt),
+            sources_count=len(sources),
+            scraped_count=len(scraped),
+            mode=mode,
+        )
+        answer = await self._invoke_structured_answer(
+            structured_llm,
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
+            context="search_synthesis",
+        )
+        logger.info("Answer synthesis completed", answer_length=len(answer))
+        return answer
 
     def _format_sources(self, sources: list[SearchResult], scraped: list[ScrapedContent]) -> str:
         scraped_map = {item.url: item for item in scraped}
@@ -849,6 +846,150 @@ class ChatSearchService:
                 f"- {item['title']} ({item['file_path']}): {summarize_text(item['content'], 6000)}"
             )
         return "\n".join(lines)
+
+    def _coerce_synthesized_answer(self, response: Any) -> SynthesizedAnswer:
+        logger.debug(
+            "Coercing synthesized answer",
+            response_type=type(response).__name__,
+            response_is_none=response is None,
+            has_model_dump=hasattr(response, "model_dump") if response is not None else False,
+            has_content=hasattr(response, "content") if response is not None else False,
+        )
+        
+        if response is None:
+            logger.error("Response is None - cannot coerce to SynthesizedAnswer")
+            raise ValueError("SynthesizedAnswer response was None")
+        
+        if isinstance(response, SynthesizedAnswer):
+            logger.debug("Response is already SynthesizedAnswer")
+            return response
+        
+        if isinstance(response, list) and response:
+            first = response[0]
+            logger.debug("Response is list", list_length=len(response), first_type=type(first).__name__)
+            if isinstance(first, SynthesizedAnswer):
+                return first
+            if isinstance(first, dict):
+                try:
+                    return SynthesizedAnswer.model_validate(first)
+                except Exception as e:
+                    logger.error("Failed to validate dict from list", error=str(e), dict_keys=list(first.keys()) if isinstance(first, dict) else None)
+                    raise
+        
+        if isinstance(response, dict):
+            logger.debug("Response is dict", dict_keys=list(response.keys()))
+            try:
+                return SynthesizedAnswer.model_validate(response)
+            except Exception as e:
+                logger.error("Failed to validate dict", error=str(e), dict_keys=list(response.keys()))
+                raise
+        
+        if hasattr(response, "model_dump"):
+            logger.debug("Response has model_dump method")
+            try:
+                dumped = response.model_dump()
+                logger.debug("Model dumped", dumped_type=type(dumped).__name__, dumped_keys=list(dumped.keys()) if isinstance(dumped, dict) else None)
+                return SynthesizedAnswer.model_validate(dumped)
+            except Exception as e:
+                logger.error("Failed to validate model_dump result", error=str(e))
+                raise
+        
+        if hasattr(response, "content"):
+            content = getattr(response, "content", "")
+            logger.debug("Response has content", content_type=type(content).__name__, content_length=len(str(content)) if content else 0)
+            if isinstance(content, str) and content.strip():
+                try:
+                    return SynthesizedAnswer.model_validate_json(content)
+                except Exception as e:
+                    logger.error("Failed to parse content as JSON", error=str(e), content_preview=content[:200] if content else None)
+                    pass
+        
+        logger.error(
+            "Cannot coerce response to SynthesizedAnswer",
+            response_type=type(response).__name__,
+            response_str=str(response)[:500] if response else None,
+            response_repr=repr(response)[:500] if response else None,
+        )
+        raise ValueError("SynthesizedAnswer response was not structured")
+
+    async def _invoke_structured_answer(
+        self,
+        structured_llm: Any,
+        messages: list[Any],
+        context: str,
+    ) -> str:
+        retries = max(1, self.settings.max_structured_output_retries)
+        last_error: Exception | None = None
+
+        logger.debug(
+            "Invoking structured answer",
+            context=context,
+            retries=retries,
+            messages_count=len(messages),
+        )
+
+        for attempt in range(1, retries + 1):
+            try:
+                logger.debug("Calling structured LLM", context=context, attempt=attempt, retries=retries)
+                response = await structured_llm.ainvoke(messages)
+                
+                # CRITICAL: Log full response details before coercion
+                logger.info(
+                    "Structured answer response received",
+                    context=context,
+                    attempt=attempt,
+                    response_type=type(response).__name__,
+                    response_is_none=response is None,
+                    response_str_preview=str(response)[:1000] if response else None,
+                    response_repr_preview=repr(response)[:1000] if response else None,
+                )
+                
+                # Additional logging for debugging
+                if response is not None:
+                    if hasattr(response, "__dict__"):
+                        logger.debug("Response attributes", attrs=list(response.__dict__.keys()))
+                    if hasattr(response, "content"):
+                        content = getattr(response, "content", "")
+                        logger.debug("Response content", content_type=type(content).__name__, content_length=len(str(content)) if content else 0, content_preview=str(content)[:500] if content else None)
+                
+                if response is None:
+                    logger.error("LLM returned None response", context=context, attempt=attempt)
+                    raise ValueError("LLM returned None response")
+                
+                synthesized = self._coerce_synthesized_answer(response)
+                answer = synthesized.answer.strip()
+                if not answer:
+                    logger.warning("Synthesized answer is empty", context=context, attempt=attempt)
+                    raise ValueError("Structured answer was empty")
+                
+                logger.info(
+                    "Structured answer generated successfully",
+                    context=context,
+                    attempt=attempt,
+                    answer_length=len(answer),
+                )
+                return answer
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "Structured answer parsing failed",
+                    context=context,
+                    attempt=attempt,
+                    retries=retries,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    exc_info=True,
+                )
+
+        logger.error(
+            "All attempts to generate structured answer failed",
+            context=context,
+            retries=retries,
+            last_error=str(last_error) if last_error else None,
+        )
+        if last_error:
+            raise last_error
+        raise ValueError("Structured answer generation failed")
 
     def _emit_status(self, stream: Any | None, message: str, step: str) -> None:
         if stream:
