@@ -340,6 +340,12 @@ class ResearchStreamingGenerator(StreamingGenerator):
     def emit_report_chunk(self, chunk: str) -> None:
         """Emit report generation chunk."""
         self.add(self._create_event(StreamEventType.REPORT_CHUNK, {"content": chunk}))
+        
+        # CRITICAL: Accumulate chunks for DB saving
+        # Store accumulated content in app_state for saving when done
+        if not hasattr(self, "_accumulated_content"):
+            self._accumulated_content = ""
+        self._accumulated_content += chunk
 
     def emit_final_report(self, report: str) -> None:
         """Emit final report."""
@@ -353,6 +359,102 @@ class ResearchStreamingGenerator(StreamingGenerator):
                 },
             )
         )
+        
+        # CRITICAL: Save final report to DB immediately
+        # This ensures all assistant messages are persisted for ALL modes (chat, search, deep_search, deep_research)
+        # Mark that we saved final report to avoid duplicate saving in emit_done
+        self._final_report_saved = True
+        logger.info("Saving final report to DB via emit_final_report", 
+                   report_length=len(report), 
+                   session_id=self.session_id,
+                   has_chat_id=bool(self.app_state.get("chat_id")))
+        asyncio.create_task(self._save_final_message_to_db(report))
+
+    async def _save_final_message_to_db(self, content: str) -> None:
+        """
+        Save final message to database asynchronously.
+        
+        This is called for all final reports (chat, search, deep_search, deep_research).
+        Works for ALL modes that use ResearchStreamingGenerator.
+        """
+        if not content or not content.strip():
+            logger.warning("Cannot save final message to DB - content is empty")
+            return
+        
+        # Get chat_id and session_factory from app_state
+        chat_id = self.app_state.get("chat_id")
+        session_factory = self.app_state.get("session_factory")
+        
+        if not chat_id or not session_factory:
+            logger.warning("Cannot save final message to DB - chat_id or session_factory missing",
+                          has_chat_id=bool(chat_id), 
+                          has_session_factory=bool(session_factory),
+                          app_state_keys=list(self.app_state.keys()) if self.app_state else [])
+            return
+        
+        # Use accumulated content if available, otherwise use provided content
+        final_content = getattr(self, "_accumulated_content", "") or content
+        if not final_content.strip():
+            return
+        
+        # Generate unique message_id
+        import time
+        message_id = f"assistant_{self.session_id}_{int(time.time() * 1000)}"
+        
+        # Save with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                from src.database.schema import ChatMessageModel, ChatModel
+                from sqlalchemy import select
+                from datetime import datetime
+                
+                async with session_factory() as session:
+                    # Verify chat exists
+                    result = await session.execute(
+                        select(ChatModel).where(ChatModel.id == chat_id)
+                    )
+                    chat = result.scalar_one_or_none()
+                    
+                    if not chat:
+                        logger.warning("Chat not found for final message save", chat_id=chat_id)
+                        return
+                    
+                    # Check if message already exists
+                    existing_result = await session.execute(
+                        select(ChatMessageModel).where(ChatMessageModel.message_id == message_id)
+                    )
+                    existing_message = existing_result.scalar_one_or_none()
+                    
+                    if existing_message:
+                        # Update existing message
+                        existing_message.content = final_content
+                        existing_message.role = "assistant"
+                        chat.updated_at = datetime.now()
+                        await session.commit()
+                        logger.info("Final message updated in DB", message_id=message_id, content_length=len(final_content))
+                        return
+                    else:
+                        # Create new message
+                        message = ChatMessageModel(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            role="assistant",
+                            content=final_content,
+                        )
+                        session.add(message)
+                        chat.updated_at = datetime.now()
+                        await session.commit()
+                        logger.info("Final message saved to DB", message_id=message_id, content_length=len(final_content))
+                        return
+                        
+            except Exception as e:
+                logger.error(f"Failed to save final message to DB (attempt {attempt + 1}/{max_retries})",
+                            error=str(e), message_id=message_id, exc_info=True)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error("Failed to save final message to DB after all retries", message_id=message_id)
 
     def emit_error(self, error: str, details: str | None = None) -> None:
         """Emit error event."""
@@ -362,4 +464,18 @@ class ResearchStreamingGenerator(StreamingGenerator):
     def emit_done(self) -> None:
         """Emit completion and finish stream."""
         self.add(self._create_event(StreamEventType.DONE, {}))
+        
+        # CRITICAL: If we have accumulated content but no final_report was called,
+        # save it to DB now (fallback for any mode that doesn't call emit_final_report)
+        # This ensures messages are persisted even if client disconnects before final_report
+        accumulated = getattr(self, "_accumulated_content", "")
+        if accumulated and accumulated.strip():
+            # Check if we already saved (final_report was called)
+            if not hasattr(self, "_final_report_saved"):
+                logger.info("Saving accumulated content to DB via emit_done (final_report not called)",
+                           content_length=len(accumulated), session_id=self.session_id)
+                asyncio.create_task(self._save_final_message_to_db(accumulated))
+            else:
+                logger.debug("Skipping save in emit_done - final_report already saved", session_id=self.session_id)
+        
         self.finish()

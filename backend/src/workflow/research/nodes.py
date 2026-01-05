@@ -60,6 +60,91 @@ from src.models.agent_models import AgentTodoItem
 logger = structlog.get_logger(__name__)
 
 
+# ==================== Helper Functions ====================
+
+async def _save_message_to_db_async(
+    stream: Any,
+    role: str,
+    content: str,
+    message_id: str,
+    max_retries: int = 3,
+) -> bool:
+    """
+    Save message to database asynchronously with retry logic.
+    
+    This ensures all assistant messages (deep search, clarification, etc.) are persisted
+    even if stream fails or user switches chats.
+    """
+    if not stream or not hasattr(stream, "app_state"):
+        logger.warning("Cannot save message to DB - stream or app_state missing")
+        return False
+    
+    app_state = stream.app_state
+    chat_id = app_state.get("chat_id")
+    session_factory = app_state.get("session_factory")
+    
+    if not chat_id or not session_factory:
+        logger.warning("Cannot save message to DB - chat_id or session_factory missing", 
+                      has_chat_id=bool(chat_id), has_session_factory=bool(session_factory))
+        return False
+    
+    for attempt in range(max_retries):
+        try:
+            from src.database.schema import ChatMessageModel, ChatModel
+            from sqlalchemy import select
+            from datetime import datetime
+            
+            async with session_factory() as session:
+                # Verify chat exists
+                result = await session.execute(
+                    select(ChatModel).where(ChatModel.id == chat_id)
+                )
+                chat = result.scalar_one_or_none()
+                
+                if not chat:
+                    logger.warning("Chat not found for message save", chat_id=chat_id)
+                    return False
+                
+                # Check if message already exists
+                existing_result = await session.execute(
+                    select(ChatMessageModel).where(ChatMessageModel.message_id == message_id)
+                )
+                existing_message = existing_result.scalar_one_or_none()
+                
+                if existing_message:
+                    # Update existing message
+                    existing_message.content = content
+                    existing_message.role = role
+                    chat.updated_at = datetime.now()
+                    await session.commit()
+                    logger.info("Message updated in DB", message_id=message_id, role=role, content_length=len(content))
+                    return True
+                else:
+                    # Create new message
+                    message = ChatMessageModel(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        role=role,
+                        content=content,
+                    )
+                    session.add(message)
+                    chat.updated_at = datetime.now()
+                    await session.commit()
+                    logger.info("Message saved to DB", message_id=message_id, role=role, content_length=len(content))
+                    return True
+                    
+        except Exception as e:
+            logger.error(f"Failed to save message to DB (attempt {attempt + 1}/{max_retries})", 
+                        error=str(e), message_id=message_id, exc_info=True)
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+            else:
+                logger.error("Failed to save message to DB after all retries", message_id=message_id)
+                return False
+    
+    return False
+
+
 # ==================== Memory Search Node ====================
 
 async def search_memory_node(state: ResearchState) -> Dict:
@@ -97,38 +182,82 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
     query = state["query"]
     chat_history = state.get("chat_history", [])
     
-    # Check if deep search was already done by looking at chat_history
-    # If there's a message with "Initial Deep Search Context" and user has answered clarification, skip
+    # CRITICAL: Check if deep search was already done and user answered clarification
+    # Proper sequence: deep search -> clarification questions -> user answer -> skip deep search
     deep_search_done = False
+    deep_search_index = -1
+    clarification_index = -1
     has_user_answer = False
     found_clarification = False
     
+    # Step 1: Find deep search result in chat history
     for i, msg in enumerate(chat_history):
         if msg.get("role") == "assistant":
             content = msg.get("content", "").lower()
             # Check if this message contains deep search result
             if "initial deep search context" in content or "deep search completed" in content:
                 deep_search_done = True
-            # Check if this message contains clarification questions
-            if "clarification" in content or "🔍" in content or "clarify" in content:
-                found_clarification = True
-                # Check if next message is from user (user answered)
-                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
-                    has_user_answer = True
-                    logger.info("User answered clarification questions")
-                    break
+                deep_search_index = i
+                logger.info("Found deep search result in chat history", message_index=i)
+                break
     
-    # If deep search was done and user answered clarification, skip deep search
+    # Step 2: Find clarification questions (should come AFTER deep search)
+    if deep_search_done:
+        for i in range(deep_search_index + 1, len(chat_history)):
+            msg = chat_history[i]
+            if msg.get("role") == "assistant":
+                content = msg.get("content", "").lower()
+                if "clarification" in content or "🔍" in content or "clarify" in content:
+                    found_clarification = True
+                    clarification_index = i
+                    logger.info("Found clarification questions in chat history", message_index=i, after_deep_search=True)
+                    # Step 3: Check if user answered (next message should be from user)
+                    if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                        has_user_answer = True
+                        logger.info("User answered clarification questions", answer_preview=chat_history[i + 1].get("content", "")[:100])
+                        break
+    
+    # If deep search was done AND clarification was asked AND user answered, skip deep search
     if deep_search_done and found_clarification and has_user_answer:
-        logger.info("Skipping deep search - already completed and user answered clarification, proceeding to research")
-        # Return empty result to indicate skip (clarify node will use existing context from chat_history)
-        return {"deep_search_result": {"type": "override", "value": ""}}
+        logger.info("CRITICAL: Skipping deep search - already completed, clarification asked, and user answered. Proceeding directly to research.")
+        # CRITICAL: Return the existing deep_search_result from state if available, otherwise return empty
+        # This ensures the result is preserved for the rest of the workflow
+        existing_result = state.get("deep_search_result", "")
+        if existing_result and not (isinstance(existing_result, dict) and existing_result.get("type") == "override" and existing_result.get("value") == ""):
+            logger.info("Using existing deep_search_result from state for continuation")
+            return {"deep_search_result": existing_result}
+        else:
+            # Return empty result - clarify node will use existing context, then proceed to research
+            return {"deep_search_result": {"type": "override", "value": ""}}
     
     # Also check if deep_search_result already exists in state (from checkpoint)
+    # This is CRITICAL for continuation after clarification
     deep_search_result_raw = state.get("deep_search_result", "")
-    if deep_search_result_raw and found_clarification and has_user_answer:
-        logger.info("Skipping deep search - result exists in state and user answered clarification")
-        return {"deep_search_result": deep_search_result_raw}
+    if deep_search_result_raw:
+        # Extract actual value if it's a dict with "type": "override"
+        if isinstance(deep_search_result_raw, dict) and deep_search_result_raw.get("type") == "override":
+            actual_result = deep_search_result_raw.get("value", "")
+        else:
+            actual_result = deep_search_result_raw
+        
+        # CRITICAL: If deep_search_result exists in state (from checkpoint), check if user answered clarification
+        # ONLY skip if user actually answered - otherwise we might loop
+        if actual_result or (isinstance(deep_search_result_raw, dict) and deep_search_result_raw.get("type") == "override"):
+            # CRITICAL: Only skip if user answered clarification - check both chat_history and state
+            # If user hasn't answered, we should NOT skip - let the graph wait for user input
+            if has_user_answer:
+                logger.info("CRITICAL: Skipping deep search - result exists in state (from checkpoint) and user answered clarification. Proceeding directly to research.")
+                return {"deep_search_result": deep_search_result_raw}
+            elif clarification_index >= 0:
+                # Clarification was asked but user hasn't answered yet
+                # CRITICAL: Return existing result to avoid re-running deep search, but don't skip node
+                # The graph will continue to clarify node, which will stop and wait for user input
+                logger.info("CRITICAL: Deep search result exists but user hasn't answered clarification yet. Returning existing result - graph will stop at clarify node and wait for user.")
+                # Return existing result - this prevents re-running deep search
+                # Graph will proceed to clarify node, which will detect no answer and stop (END)
+                # CRITICAL: Return empty override to signal that we should NOT re-run deep search
+                # but also NOT proceed to research (wait for user answer)
+                return {"deep_search_result": {"type": "override", "value": ""}}
     
     # Restore runtime dependencies if not in state
     state = _restore_runtime_deps(state)
@@ -209,6 +338,21 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
                         await asyncio.sleep(0.03)  # Small delay between chunks
                 
                 logger.info("Deep search FULL result emitted to stream", result_length=len(result), chunks_sent=len(chunks))
+                
+                # CRITICAL: Save deep search result to DB immediately after emitting
+                # This ensures it's persisted even if stream fails or user switches chats
+                # Use unique message_id based on session_id and timestamp
+                from uuid import uuid4
+                import time
+                session_id = state.get("session_id", "unknown")
+                message_id = f"deep_search_{session_id}_{int(time.time() * 1000)}"
+                await _save_message_to_db_async(
+                    stream=stream,
+                    role="assistant",
+                    content=full_message,
+                    message_id=message_id,
+                )
+                
                 # Small delay to ensure all chunks are sent before continuing
                 await asyncio.sleep(0.15)
             except Exception as e:
@@ -398,6 +542,20 @@ Research will proceed after you provide your answers.*
                 try:
                     stream.emit_report_chunk(clarification_message)
                     logger.info("Clarification questions emitted as report chunk", message_length=len(clarification_message))
+                    
+                    # CRITICAL: Save clarification questions to DB immediately after emitting
+                    # This ensures they're persisted even if stream fails or user switches chats
+                    # Use unique message_id based on session_id and timestamp
+                    from uuid import uuid4
+                    import time
+                    session_id = state.get("session_id", "unknown")
+                    message_id = f"clarification_{session_id}_{int(time.time() * 1000)}"
+                    await _save_message_to_db_async(
+                        stream=stream,
+                        role="assistant",
+                        content=clarification_message,
+                        message_id=message_id,
+                    )
                 except Exception as e:
                     logger.error("Failed to emit clarification questions as report chunk", error=str(e), exc_info=True)
                 
@@ -496,15 +654,29 @@ async def analyze_query_node(state: Dict[str, Any]) -> Dict[str, Any]:
     
     deep_search_context = f"\n\n**Initial Deep Search Context:**\n{deep_search_result[:1500] if deep_search_result else 'No initial deep search context available.'}\n" if deep_search_result else ""
     
+    # CRITICAL: Extract user clarification answers from chat_history
+    clarification_context = ""
+    chat_history = state.get("chat_history", [])
+    if chat_history:
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    user_answer = chat_history[i + 1].get("content", "")
+                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\nThese answers refine the research scope. Use them when analyzing the query."
+                    break
+    
     prompt = f"""Analyze this research query to determine the best approach:
 
 Query: {query}
+{clarification_context}
 {deep_search_context}
 Assess:
 1. What are the main topics/subtopics?
 2. How complex is this query?
 3. How many specialized research agents would be optimal?
 4. What research angles should different agents cover?
+
+IMPORTANT: If user provided clarification answers, use them to refine your analysis.
 """
 
     try:
@@ -572,16 +744,28 @@ async def plan_research_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
         stream.emit_status("Creating research plan...", step="planning")
 
     context_info = f"\n\nDeep search context:\n{deep_search_result}" if deep_search_result else ""
+    
+    # CRITICAL: Extract user clarification answers from chat_history
+    clarification_context = ""
+    chat_history = state.get("chat_history", [])
+    if chat_history:
+        for i, msg in enumerate(chat_history):
+            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    user_answer = chat_history[i + 1].get("content", "")
+                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\nThese answers refine the research scope and priorities. Use them to focus the research plan."
+                    break
 
     prompt = f"""Create a comprehensive research plan for this query:
 
 Query: {query}
-
+{clarification_context}
 Query analysis: {query_analysis.get('reasoning', '')}
 Identified topics: {', '.join(query_analysis.get('topics', []))}
 Complexity: {query_analysis.get('complexity', 'moderate')}{context_info}
 
 Create a detailed research plan with specific topics for different agents to investigate.
+IMPORTANT: If user provided clarification answers, use them to refine and focus the research plan.
 """
 
     try:

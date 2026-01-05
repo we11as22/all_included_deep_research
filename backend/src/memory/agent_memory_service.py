@@ -262,19 +262,26 @@ class AgentMemoryService:
         # Items are available in items/ directory, main.md stays focused on key insights
 
     def _get_initial_main_content(self) -> str:
-        """Get initial main.md content."""
+        """Get initial main.md content for session."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        return f"""# Agent Memory - Main Index
+        return f"""# Research Session - Main Index
 
 Last Updated: {today}
 
 ## Overview
 
-This is the main index file for agent memory. All agent notes and findings are stored in the `items/` directory and referenced here.
+This is the main index file for this research session.
 
-## Items
+## File Index
 
+### Agents
+<!-- Agent files will be listed here -->
+
+### Items
 <!-- Agent notes and findings will be listed here -->
+
+### Reports
+<!-- Research reports will be listed here -->
 
 ---
 

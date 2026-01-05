@@ -252,6 +252,7 @@ Personality: {personality}
 Character: {character}
 
 **ORIGINAL USER QUERY:** {original_query}
+{clarification_context}
 **IMPORTANT: Respond in {user_language} whenever generating text for the user.**
 
 Current task: {current_task.title}
@@ -264,7 +265,12 @@ Strategy: {plan.search_strategy}
 
 **INITIAL DEEP SEARCH CONTEXT:**
 {deep_search_result[:1500] if deep_search_result else "No initial deep search context available."}
-{clarification_context}
+
+**CRITICAL: When you find information, provide DETAILED, COMPREHENSIVE summaries with full context, not just links.**
+- Include specific facts, data, and insights in your summaries
+- Explain what you found and why it's relevant
+- Provide full context, not just "found X sources"
+- Your findings should be self-contained and informative
 
 Your previous notes (recent important findings):
 {notes_context}
@@ -758,24 +764,57 @@ Create an updated research plan incorporating this new direction.
             important_notes.append(note)
     
     # Build summary with ONLY real findings, NO metadata
+    # CRITICAL: Create comprehensive summary with detailed information, not just links
     summary_parts = []
     
-    # Add real findings from sources
+    # Add comprehensive findings from sources with full context
     if real_findings_from_sources:
-        findings_text = "\n".join([f"- {f}" for f in real_findings_from_sources[:10]])
-        summary_parts.append(f"Key findings from research:\n{findings_text}")
+        # Include more detailed information from sources
+        detailed_findings = []
+        for finding in real_findings_from_sources[:15]:  # More findings for comprehensive summary
+            # Extract more context from sources
+            for src in sources:
+                snippet = src.get("snippet", "").strip()
+                title = src.get("title", "").strip()
+                if finding in snippet or (title and finding.startswith(title)):
+                    # Include full snippet if available
+                    if len(snippet) > 100:
+                        detailed_findings.append(f"{title}: {snippet[:400]}")
+                    else:
+                        detailed_findings.append(finding)
+                    break
+            else:
+                detailed_findings.append(finding)
+        
+        findings_text = "\n\n".join([f"• {f}" for f in detailed_findings[:12]])
+        summary_parts.append(f"**Detailed Research Findings:**\n\n{findings_text}")
     
-    # Add real findings from notes
+    # Add comprehensive findings from notes with full context
     if important_notes:
-        notes_text = "\n".join([f"- {note.title}: {note.summary[:200]}..." for note in important_notes[:8]])
-        summary_parts.append(f"\nImportant discoveries:\n{notes_text}")
+        notes_text = "\n\n".join([
+            f"**{note.title}:**\n{note.summary[:500]}{'...' if len(note.summary) > 500 else ''}" 
+            for note in important_notes[:10]  # More notes for comprehensive summary
+        ])
+        summary_parts.append(f"\n**Important Discoveries:**\n\n{notes_text}")
     
     # If no real findings, indicate that research needs to go deeper
     if not summary_parts:
         summary_parts.append(f"Research completed on '{current_task.title}' but no substantial findings extracted. May need deeper investigation.")
     
-    # Create summary (NO metadata like "Found X sources")
-    summary = "\n".join(summary_parts)
+    # Create comprehensive summary (NO metadata like "Found X sources")
+    summary = "\n\n".join(summary_parts)
+    
+    # Ensure summary is substantial (at least 200 chars) - if too short, expand it
+    if len(summary) < 200 and sources:
+        # Add more context from sources
+        additional_context = []
+        for src in sources[:5]:
+            snippet = src.get("snippet", "").strip()
+            title = src.get("title", "").strip()
+            if snippet and len(snippet) > 50:
+                additional_context.append(f"{title}: {snippet[:300]}")
+        if additional_context:
+            summary += "\n\n**Additional Context:**\n\n" + "\n\n".join([f"• {ctx}" for ctx in additional_context])
     
     # Extract key findings - ONLY real information, NO metadata
     key_findings = []

@@ -384,17 +384,28 @@ async def run_research_graph(
         # LangGraph will automatically load checkpoint and apply our updates
         # This ensures graph continues from where it stopped (after clarify node), not from entry point
         if is_continuation:
-            logger.info("Continuation detected - passing only updated fields to resume from checkpoint")
+            logger.info("Continuation detected - passing only updated fields to resume from checkpoint",
+                       has_deep_search_result="deep_search_result" in filtered_state,
+                       deep_search_result_type=type(filtered_state.get("deep_search_result")).__name__ if "deep_search_result" in filtered_state else "none")
             # Only update chat_history and query - LangGraph will load the rest from checkpoint
+            # BUT: CRITICAL - Preserve deep_search_result if it exists in filtered_state (from checkpoint merge)
             update_state = {
                 "chat_history": chat_history,
                 "query": query,
             }
+            # CRITICAL: If deep_search_result exists in filtered_state (from checkpoint), preserve it
+            # This ensures deep search is not re-run when continuing after clarification
+            if "deep_search_result" in filtered_state:
+                update_state["deep_search_result"] = filtered_state["deep_search_result"]
+                logger.info("CRITICAL: Preserving deep_search_result from checkpoint for continuation",
+                           result_type=type(filtered_state["deep_search_result"]).__name__,
+                           is_dict=isinstance(filtered_state["deep_search_result"], dict))
             # Remove non-serializable fields
             update_state = {k: v for k, v in update_state.items() if k not in NON_SERIALIZABLE_FIELDS}
             logger.info("Invoking graph with update state for continuation", 
                        update_keys=list(update_state.keys()),
-                       has_checkpoint=True)
+                       has_checkpoint=True,
+                       has_deep_search_result="deep_search_result" in update_state)
             final_state = await graph.ainvoke(update_state, config=config)
         else:
             # No checkpoint - start fresh with full state

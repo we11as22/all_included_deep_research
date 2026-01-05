@@ -68,6 +68,91 @@ export default function HomePage() {
   const [currentChatId, setCurrentChatId] = useState<string | null>(null);
   const [showChatSearch, setShowChatSearch] = useState(false);
   const [chatListRefreshTrigger, setChatListRefreshTrigger] = useState(0);
+  
+  // CRITICAL: Restore session ID and chat ID from localStorage on mount and load chat from DB
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const savedSessionId = localStorage.getItem('currentSessionId');
+      const savedChatId = localStorage.getItem('currentChatId');
+      if (savedSessionId) {
+        setCurrentSessionId(savedSessionId);
+      }
+      if (savedChatId) {
+        setCurrentChatId(savedChatId);
+        // CRITICAL: Load chat from DB immediately to ensure we have all messages
+        // This ensures frontend always works with DB, not just local state
+        getChat(savedChatId)
+          .then((chatData) => {
+            if (chatData && chatData.chat && chatData.messages) {
+              const dbMessages: DBChatMessage[] = chatData.messages as DBChatMessage[];
+              
+              // Sort by created_at to maintain order
+              const sortedMessages = [...dbMessages].sort((a, b) => {
+                const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+                const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+                return aTime - bTime;
+              });
+              
+              const loadedMessages = sortedMessages.map((msg) => ({
+                id: msg.message_id || makeId(),
+                role: msg.role as 'user' | 'assistant',
+                content: msg.content || '',
+              }));
+              
+              // CRITICAL: Set messages from DB - this ensures frontend always works with DB
+              setMessages(loadedMessages);
+              
+              // Mark all loaded messages as complete
+              setProgressByMessage((prev) => {
+                const updated = { ...prev };
+                loadedMessages.forEach((msg) => {
+                  if (msg.role === 'assistant' && msg.content.trim()) {
+                    updated[msg.id] = {
+                      ...updated[msg.id],
+                      isComplete: true,
+                      status: 'Complete',
+                      step: 'complete',
+                    };
+                  }
+                });
+                return updated;
+              });
+              
+              if (DEBUG_MODE) {
+                console.debug('[debug] chat loaded from DB on mount', { 
+                  chatId: savedChatId, 
+                  messagesCount: loadedMessages.length 
+                });
+              }
+            }
+          })
+          .catch((err) => {
+            console.error('Failed to load chat from DB on mount:', err);
+            // If chat doesn't exist, clear saved chatId
+            if (err instanceof Error && err.message.includes('not found')) {
+              localStorage.removeItem('currentChatId');
+              setCurrentChatId(null);
+            }
+          });
+      }
+    }
+  }, []);
+  
+  // CRITICAL: Save session ID and chat ID to localStorage for recovery
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      if (currentSessionId) {
+        localStorage.setItem('currentSessionId', currentSessionId);
+      } else {
+        localStorage.removeItem('currentSessionId');
+      }
+      if (currentChatId) {
+        localStorage.setItem('currentChatId', currentChatId);
+      } else {
+        localStorage.removeItem('currentChatId');
+      }
+    }
+  }, [currentSessionId, currentChatId]);
   const scrollRef = useRef<HTMLDivElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -127,35 +212,98 @@ export default function HomePage() {
 
   const handleSubmit = async (event: React.FormEvent) => {
     event.preventDefault();
-    if (!input.trim() || isStreaming) return;
+    if (!input.trim() || isStreaming) {
+      if (isStreaming) {
+        console.warn('Cannot submit - streaming is still active. This may indicate a stuck stream.');
+      }
+      return;
+    }
 
     setError(null);
     const userMessage: LocalChatMessage = { id: makeId(), role: 'user', content: input.trim() };
-    const assistantMessage: LocalChatMessage = { id: makeId(), role: 'assistant', content: '' };
-    const nextMessages = [...messages, userMessage];
+    let assistantMessage: LocalChatMessage = { id: makeId(), role: 'assistant', content: '' };
 
-    // Create chat if it doesn't exist
+    // CRITICAL: Create chat if it doesn't exist BEFORE saving message
+    // This ensures message is saved to the correct chat
     let chatId = currentChatId;
     if (!chatId) {
       try {
         const newChat = await createChat(input.trim().slice(0, 80) || 'New Chat');
         chatId = newChat.id;
         setCurrentChatId(chatId);
+        // Save chatId to localStorage for persistence
+        if (typeof window !== 'undefined') {
+          localStorage.setItem('currentChatId', chatId);
+        }
       } catch (err) {
         console.error('Failed to create chat:', err);
+        setError('Failed to create chat. Please try again.');
+        return; // Can't proceed without chat
       }
     }
 
-    // Save user message to DB if chat exists
+    // CRITICAL: Save user message to DB FIRST before updating local state
+    // This ensures all user messages are persisted in DB
     if (chatId) {
       try {
         await addMessage(chatId, 'user', userMessage.content, userMessage.id);
+        if (DEBUG_MODE) {
+          console.debug('[debug] user message saved to DB', { 
+            chatId, 
+            messageId: userMessage.id, 
+            contentLength: userMessage.content.length 
+          });
+        }
       } catch (err) {
-        console.error('Failed to save user message:', err);
+        console.error('Failed to save user message to DB:', err);
+        // Still proceed, but log error - message might be saved on retry
       }
     }
 
-    setMessages([...nextMessages, assistantMessage]);
+    // CRITICAL: Reload messages from DB to ensure we have the latest state
+    // This ensures frontend always works with DB, not just local state
+    let dbMessages: LocalChatMessage[] = [];
+    if (chatId) {
+      try {
+        const chatData = await getChat(chatId);
+        if (chatData && chatData.messages) {
+          const sortedMessages = [...chatData.messages].sort((a, b) => {
+            const aTime = a.created_at ? new Date(a.created_at).getTime() : 0;
+            const bTime = b.created_at ? new Date(b.created_at).getTime() : 0;
+            return aTime - bTime;
+          });
+          
+          dbMessages = sortedMessages.map((msg) => ({
+            id: msg.message_id || makeId(),
+            role: msg.role as 'user' | 'assistant',
+            content: msg.content || '',
+          }));
+          
+          // CRITICAL: Check if assistantMessage already exists in dbMessages (from previous stream)
+          // If it exists, use it instead of creating a new one
+          const existingAssistantMsg = dbMessages.find(m => m.id === assistantMessage.id);
+          if (existingAssistantMsg) {
+            // Use existing message from DB
+            setMessages([...dbMessages]);
+            // Update assistantMessage reference to use existing one
+            assistantMessage = existingAssistantMsg;
+          } else {
+            // Add new assistant message for streaming
+            setMessages([...dbMessages, assistantMessage]);
+          }
+        } else {
+          // Fallback: use local messages if DB load fails
+          setMessages([...messages, userMessage, assistantMessage]);
+        }
+      } catch (err) {
+        console.error('Failed to reload messages from DB:', err);
+        // Fallback: use local messages if DB load fails
+        setMessages([...messages, userMessage, assistantMessage]);
+      }
+    } else {
+      // No chat ID - use local state (shouldn't happen, but handle gracefully)
+      setMessages([...messages, userMessage, assistantMessage]);
+    }
     setProgressByMessage((prev) => ({
       ...prev,
       [assistantMessage.id]: {
@@ -180,8 +328,24 @@ export default function HomePage() {
       // Map frontend mode to backend mode
       const backendMode = mode === 'chat' ? 'chat' : mode === 'search' ? 'search' : mode === 'deep_search' ? 'deep_search' : 'deep_research';
       
-      for await (const event of streamChatProgress(
-        [...messagePayload, { role: 'user' as const, content: userMessage.content }],
+      // CRITICAL: Use messages from DB (dbMessages) instead of local state (messagePayload)
+      // This ensures backend always gets the latest messages from DB
+      // If dbMessages is empty (DB load failed), fallback to messagePayload + new user message
+      const messagesForBackend = dbMessages.length > 0 
+        ? dbMessages.map(m => ({ role: m.role, content: m.content }))
+        : [...messagePayload, { role: 'user' as const, content: userMessage.content }];
+      
+      // CRITICAL: Add timeout protection to prevent infinite loops
+      // If stream doesn't complete within 5 minutes, force stop
+      const streamTimeout = setTimeout(() => {
+        console.error('Stream timeout - forcing stop after 5 minutes', { mode: backendMode, chatId });
+        setIsStreaming(false);
+        setError('Stream timeout - please try again');
+      }, 5 * 60 * 1000); // 5 minutes
+      
+      try {
+        for await (const event of streamChatProgress(
+        messagesForBackend,
         backendMode as any,
         chatId,  // Pass chat_id to load messages from database
         currentSessionId || null,  // Pass session ID for reconnection
@@ -190,10 +354,13 @@ export default function HomePage() {
         if (DEBUG_MODE) {
           console.debug('[debug] stream event', { type: event.type, data: event.data, sessionId: event.sessionId });
         }
-        // Capture session ID from first event
-        if (event.sessionId && !sessionId) {
-          sessionId = event.sessionId;
-          setCurrentSessionId(sessionId);
+        // Capture session ID from any event (not just first)
+        if (event.sessionId) {
+          if (!sessionId) {
+            sessionId = event.sessionId;
+          }
+          // Always update currentSessionId if event has sessionId
+          setCurrentSessionId(event.sessionId);
         }
         setProgressByMessage((prev) => {
           const existing = prev[assistantMessage.id];
@@ -287,12 +454,21 @@ export default function HomePage() {
               break;
             case 'done':
               next.isComplete = true;
+              // CRITICAL: Mark streaming as complete immediately when done event is received
+              // This ensures UI is unblocked even if there are delays in saving messages
+              setIsStreaming(false);
+              
               // Save assistant message to DB if not already saved and chat exists
               // CRITICAL: Use chatId from closure (created in handleSubmit) or currentChatId
               const targetChatIdForDone = chatId || currentChatId;
               if (targetChatIdForDone && !messageSaved) {
-                // Use setTimeout to ensure messages state is updated from report_chunk events
-                setTimeout(async () => {
+                // CRITICAL: Check if this is clarification (graph stopped waiting for user)
+                // If yes, save immediately without delay to prevent message loss when switching chats
+                const isClarification = next.step === 'clarification' || 
+                                       (next.status && (next.status.toLowerCase().includes('clarification') || 
+                                                        next.status.toLowerCase().includes('waiting')));
+                
+                const saveMessage = () => {
                   setMessages((prev) => {
                     const currentMessage = prev.find(m => m.id === assistantMessage.id);
                     if (currentMessage && currentMessage.content.trim()) {
@@ -304,7 +480,8 @@ export default function HomePage() {
                             console.debug('[debug] saved assistant message on done', { 
                               messageId: assistantMessage.id,
                               chatId: targetChatIdForDone,
-                              contentLength: currentMessage.content.length 
+                              contentLength: currentMessage.content.length,
+                              isClarification
                             });
                           }
                         })
@@ -324,7 +501,17 @@ export default function HomePage() {
                     }
                     return prev;
                   });
-                }, 500);
+                };
+                
+                // For clarification, save immediately (no delay) to prevent message loss
+                // For other cases, use small delay to ensure all report_chunk events are processed
+                if (isClarification) {
+                  // Save immediately - clarification messages must be saved before user can switch chats
+                  saveMessage();
+                } else {
+                  // Use setTimeout to ensure messages state is updated from report_chunk events
+                  setTimeout(saveMessage, 500);
+                }
               } else if (!targetChatIdForDone) {
                 console.warn('Cannot save assistant message on done - no chat ID available', {
                   chatId,
@@ -343,16 +530,94 @@ export default function HomePage() {
         });
 
         if (event.type === 'report_chunk') {
-          setMessages((prev) =>
-            prev.map((message) =>
+          setMessages((prev) => {
+            const updated = prev.map((message) =>
               message.id === assistantMessage.id
                 ? { ...message, content: message.content + event.data.content }
                 : message
-            )
-          );
-          if (DEBUG_MODE) {
-            console.debug('[debug] report chunk', { length: event.data.content?.length || 0 });
-          }
+            );
+            
+            // CRITICAL: Auto-save deep search and clarification messages immediately
+            // This ensures they're persisted even if user switches chats or page reloads
+            const updatedMessage = updated.find(m => m.id === assistantMessage.id);
+            if (updatedMessage) {
+              const newContent = updatedMessage.content;
+              const isDeepSearch = newContent.toLowerCase().includes('initial deep search context') || 
+                                  newContent.toLowerCase().includes('deep search completed');
+              const isClarification = newContent.toLowerCase().includes('clarification needed') ||
+                                      newContent.toLowerCase().includes('🔍') ||
+                                      (newContent.toLowerCase().includes('clarify') && newContent.length > 500);
+              
+              // Save immediately if it's deep search or clarification (critical messages)
+              if ((isDeepSearch || isClarification) && newContent.length > 100) {
+                const targetChatIdForChunk = chatId || currentChatId;
+                if (targetChatIdForChunk && !messageSaved) {
+                  // Clear any existing timeout
+                  if ((window as any).__saveTimeout) {
+                    clearTimeout((window as any).__saveTimeout);
+                  }
+                  
+                  // Debounce: save after a short delay to avoid too many DB calls
+                  (window as any).__saveTimeout = setTimeout(async () => {
+                    setMessages((prevState) => {
+                      const currentMessage = prevState.find(m => m.id === assistantMessage.id);
+                      if (currentMessage && currentMessage.content.trim() && currentMessage.content.length > 100) {
+                        addMessage(targetChatIdForChunk, 'assistant', currentMessage.content, assistantMessage.id)
+                          .then(() => {
+                            messageSaved = true;
+                            if (DEBUG_MODE) {
+                              console.debug('[debug] auto-saved critical message (deep search/clarification)', { 
+                                messageId: assistantMessage.id,
+                                chatId: targetChatIdForChunk,
+                                contentLength: currentMessage.content.length,
+                                isDeepSearch,
+                                isClarification
+                              });
+                            }
+                          })
+                          .catch((err) => {
+                            console.error('Failed to auto-save critical message:', err);
+                            // Retry once
+                            setTimeout(async () => {
+                              try {
+                                setMessages((prevRetry) => {
+                                  const retryMessage = prevRetry.find(m => m.id === assistantMessage.id);
+                                  if (retryMessage) {
+                                    addMessage(targetChatIdForChunk, 'assistant', retryMessage.content, assistantMessage.id)
+                                      .then(() => {
+                                        messageSaved = true;
+                                        console.log('Critical message saved on retry');
+                                      })
+                                      .catch((retryErr) => {
+                                        console.error('Failed to save critical message on retry:', retryErr);
+                                      });
+                                  }
+                                  return prevRetry;
+                                });
+                              } catch (retryErr) {
+                                console.error('Failed to save critical message on retry:', retryErr);
+                              }
+                            }, 2000);
+                          });
+                      }
+                      return prevState;
+                    });
+                  }, 2000); // Save after 2 seconds of no new chunks
+                }
+              }
+              
+              if (DEBUG_MODE) {
+                console.debug('[debug] report chunk', { 
+                  length: event.data.content?.length || 0, 
+                  totalLength: newContent.length,
+                  isDeepSearch, 
+                  isClarification 
+                });
+              }
+            }
+            
+            return updated;
+          });
         }
 
         if (event.type === 'final_report') {
@@ -477,8 +742,18 @@ export default function HomePage() {
         },
       }));
     } finally {
+      // CRITICAL: Clear timeout and reset streaming state
+      try {
+        if (typeof streamTimeout !== 'undefined') {
+          clearTimeout(streamTimeout);
+        }
+      } catch (e) {
+        // Ignore errors clearing timeout
+      }
       setIsStreaming(false);
-      setCurrentSessionId(null);
+      // CRITICAL: Don't clear sessionId on error - keep it for reconnection
+      // Only clear if stream completed successfully (done event)
+      // setCurrentSessionId(null);
 
       // Auto-generate title if this is the first message
       if (chatId && messages.length <= 2) {
@@ -864,7 +1139,8 @@ export default function HomePage() {
               <Card className="border-border/60 bg-background/85 dark:bg-background/95 shadow-lg backdrop-blur h-full flex flex-col">
                 <div className="border-b border-border/60 px-4 py-3 flex items-center justify-between flex-shrink-0">
                   <h3 className="text-sm font-semibold">Research Progress</h3>
-                  {currentProgress?.isComplete && mode === 'deep_research' && currentSessionId && (
+                  {/* Show PDF button when deep research is complete or when there's a session ID */}
+                  {(mode === 'deep_research' && currentSessionId && (currentProgress?.isComplete || messages.some(m => m.role === 'assistant' && m.content.trim().length > 1000))) && (
                     <Button
                       variant="outline"
                       size="sm"

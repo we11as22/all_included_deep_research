@@ -46,114 +46,45 @@ class MemoryManager:
         self._initialize_structure()
 
     def _initialize_structure(self) -> None:
-        """Ensure base folder structure and index files exist."""
+        """Ensure base folder structure exists.
+        
+        CRITICAL: Do NOT create main.md or files_index.json in root memory_dir.
+        These files should only be created in agent session subdirectories during deep_research.
+        """
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
         # Only create agent_sessions directory for agent memory
-        # Old legacy folders (projects, concepts, conversations, preferences, items, agents) are not used
         # Agent sessions are created separately via create_agent_session_services()
+        # Each session has: main.md, draft_report.md, agents/, items/, files_index.json
         (self.memory_dir / "agent_sessions").mkdir(exist_ok=True)
 
-        main_file = self.memory_dir / "main.md"
-        if not main_file.exists():
-            main_file.write_text(self._default_main_content(), encoding="utf-8")
-            logger.info("main_file_created", path=str(main_file))
-
-        json_index = self.memory_dir / "files_index.json"
-        if not json_index.exists():
-            json_index.write_text(
-                json.dumps(
-                    {
-                        "version": "1.0",
-                        "last_updated": datetime.now(timezone.utc).isoformat(),
-                        "files": [],
-                    },
-                    indent=2,
-                    ensure_ascii=True,
-                ),
-                encoding="utf-8",
-            )
-            logger.info("json_index_created", path=str(json_index))
-
-        self.index_manager = IndexManager(main_file)
-        self.json_index_manager = JsonIndexManager(json_index)
-
-    def _default_main_content(self) -> str:
-        """Template for main.md."""
-        return """# Agent Memory - Main Notes
-
-Last Updated: 2025-01-01
-
-## File Index
-
-This section maintains an index of all specialized memory files with descriptions.
-
-### Projects
-<!-- Add project files here -->
-
-### Concepts
-<!-- Add concept files here -->
-
-### Conversations
-<!-- Add conversation files here -->
-
-### Preferences
-<!-- Add preference files here -->
-
-### Other
-<!-- Add other files here -->
-
----
-
-## Current Goals
-
-<!-- Active goals -->
-
----
-
-## Completed Tasks
-
-<!-- Completed tasks -->
-
----
-
-## Future Plans
-
-<!-- Long-term plans -->
-
----
-
-## Plans
-
-<!-- Detailed plans -->
-
----
-
-## Recent Notes
-
-<!-- Recent session notes -->
-
----
-
-## Quick Reference
-
-<!-- Frequently needed info -->
-"""
+        # DO NOT create main.md or files_index.json in root - they are created per-session
+        # Initialize index managers as None - they will be created per-session if needed
+        self.index_manager = None
+        self.json_index_manager = None
 
     def _category_from_path(self, file_path: str) -> str:
+        """
+        Extract category from file path.
+        
+        For session files:
+        - agents/{agent_id}.md -> agent
+        - items/{item}.md -> item
+        - draft_report.md -> report
+        - main.md -> main
+        """
         parts = file_path.split("/")
         if len(parts) > 1:
             category = parts[0]
-            # Handle special case: chat_{id} -> chat (old format)
-            if category.startswith("chat_"):
-                return "chat"
-            # Handle conversations folder: conversations/chat_{id}/... -> chat
-            if category == "conversations" and len(parts) > 1:
-                # Check if second part starts with chat_
-                if parts[1].startswith("chat_"):
-                    return "chat"
-            # Remove trailing 's' for plural forms (conversations -> conversation, etc.)
-            return category.rstrip("s")
+            # Map session subdirectories
+            if category == "agents":
+                return "agent"
+            elif category == "items":
+                return "item"
+            elif category == "draft_report.md" or file_path.endswith("draft_report.md"):
+                return "report"
+            elif category == "main.md" or file_path.endswith("main.md"):
+                return "main"
         return "other"
 
     async def create_file(
@@ -170,17 +101,21 @@ This section maintains an index of all specialized memory files with description
         category = self._category_from_path(file_path)
         description = title.strip() if title.strip() else Path(file_path).stem.replace("_", " ").title()
 
-        self.index_manager.update_file_index(file_path, description, category)
-        self.index_manager.touch_updated_at()
-        self.json_index_manager.upsert_file(
-            {
-                "file_path": file_path,
-                "title": description,
-                "category": category,
-                "tags": tags,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            }
-        )
+        # Index managers are only used for deep research sessions (per-session)
+        # They are None for root memory_dir - skip indexing here
+        if self.index_manager is not None:
+            self.index_manager.update_file_index(file_path, description, category)
+            self.index_manager.touch_updated_at()
+        if self.json_index_manager is not None:
+            self.json_index_manager.upsert_file(
+                {
+                    "file_path": file_path,
+                    "title": description,
+                    "category": category,
+                    "tags": tags,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+            )
 
         logger.info("memory_file_created", file_path=file_path)
         return {"file_path": file_path, "title": description}
@@ -221,8 +156,11 @@ This section maintains an index of all specialized memory files with description
     async def delete_file(self, file_path: str) -> None:
         """Delete a file from disk and database."""
         await self.file_manager.delete_file(file_path)
-        self.json_index_manager.remove_file(file_path)
-        self.index_manager.touch_updated_at()
+        # Index managers are only used for deep research sessions (per-session)
+        if self.json_index_manager is not None:
+            self.json_index_manager.remove_file(file_path)
+        if self.index_manager is not None:
+            self.index_manager.touch_updated_at()
 
         async with self.session_factory() as session:
             repository = MemoryRepository(session)

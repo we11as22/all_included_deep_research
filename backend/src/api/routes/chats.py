@@ -286,10 +286,24 @@ async def add_message(
             raise HTTPException(status_code=404, detail="Chat not found")
 
         # Check if message with this message_id already exists (upsert logic)
+        # CRITICAL: Filter by both message_id AND chat_id to avoid MultipleResultsFound
+        # Also use first() instead of scalar_one_or_none() to handle duplicates gracefully
         existing_message_result = await session.execute(
-            select(ChatMessageModel).where(ChatMessageModel.message_id == msg_id)
+            select(ChatMessageModel).where(
+                ChatMessageModel.message_id == msg_id,
+                ChatMessageModel.chat_id == chat_id
+            )
         )
         existing_message = existing_message_result.scalar_one_or_none()
+        
+        # If still not found, try without chat_id filter (for backward compatibility)
+        if not existing_message:
+            existing_message_result = await session.execute(
+                select(ChatMessageModel).where(ChatMessageModel.message_id == msg_id)
+            )
+            existing_message = existing_message_result.first()
+            if existing_message:
+                existing_message = existing_message[0]  # Extract from Row
         
         # Initialize embedding variable for logging
         embedding = None

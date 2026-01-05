@@ -1033,10 +1033,20 @@ async def run_supervisor_agent(
                summary_length=len(findings_summary),
                findings_preview=findings_summary[:500] if findings_summary else "No findings")
     
-    # Get clarification context if available
+    # Get clarification context if available - extract from chat_history
     clarification_context = state.get("clarification_context", "")
     if not clarification_context:
-        clarification_context = ""
+        # Extract user clarification answers from chat_history
+        chat_history = state.get("chat_history", [])
+        if chat_history:
+            for i, msg in enumerate(chat_history):
+                if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                    if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                        user_answer = chat_history[i + 1].get("content", "")
+                        clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\nThese answers refine the research scope and priorities. Use them when reviewing findings and writing the report."
+                        break
+        if not clarification_context:
+            clarification_context = ""
     
     # Format chat history to show actual messages from chat
     # For deep_research, use only 2 messages as they can be very long

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 import shutil
+from datetime import datetime, timezone
 
 import structlog
 
@@ -15,10 +17,37 @@ logger = structlog.get_logger(__name__)
 
 
 def create_agent_session_services(memory_root: Path, session_id: str) -> tuple[AgentMemoryService, AgentFileService, Path]:
+    """
+    Create agent session services for deep research.
+    
+    Creates session directory structure:
+    - agent_sessions/{session_id}/
+      - agents/ (agent personal files)
+      - items/ (agent notes)
+      - main.md (session main file - created by AgentMemoryService.read_main_file())
+      - files_index.json (session index - created here)
+    """
     session_dir = memory_root / "agent_sessions" / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     (session_dir / "agents").mkdir(exist_ok=True)
     (session_dir / "items").mkdir(exist_ok=True)
+
+    # Create files_index.json for this session (only for deep research)
+    json_index = session_dir / "files_index.json"
+    if not json_index.exists():
+        json_index.write_text(
+            json.dumps(
+                {
+                    "version": "1.0",
+                    "last_updated": datetime.now(timezone.utc).isoformat(),
+                    "files": [],
+                },
+                indent=2,
+                ensure_ascii=True,
+            ),
+            encoding="utf-8",
+        )
+        logger.info("Session files_index.json created", session_id=session_id, path=str(json_index))
 
     file_manager = FileManager(str(session_dir))
     return AgentMemoryService(file_manager), AgentFileService(file_manager), session_dir

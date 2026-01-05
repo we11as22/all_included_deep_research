@@ -229,11 +229,17 @@ async def research_agent(
     chat_history = chat_history or []
 
     # Mode-specific iteration limits (Perplexica style)
+    # CRITICAL: These are hard limits to prevent infinite loops
     max_iterations = {
         "speed": 2,
         "balanced": 6,
         "quality": 25
-    }[mode]
+    }.get(mode, 6)  # Default to 6 if mode is unknown
+    
+    # CRITICAL: Additional safety check - ensure max_iterations is reasonable
+    if max_iterations > 50:
+        logger.warning(f"max_iterations is too high ({max_iterations}), capping at 50 to prevent infinite loops", mode=mode)
+        max_iterations = 50
 
     # Get available tools based on mode
     # Handle case where classification might be None (shouldn't happen, but safety check)
@@ -450,8 +456,13 @@ async def research_agent(
                     done = True
                     break
 
-            if not tool_calls or done:
-                logger.info(f"Research completed at iteration {iteration+1}")
+            # CRITICAL: Exit conditions - prevent infinite loops
+            if not tool_calls:
+                logger.info(f"Research completed at iteration {iteration+1} - no tool calls returned")
+                break
+            
+            if done:
+                logger.info(f"Research completed at iteration {iteration+1} - agent called 'done'")
                 break
 
             # Execute tools in parallel where possible

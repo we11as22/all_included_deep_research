@@ -36,26 +36,28 @@ class IndexManager:
         Args:
             file_path: Relative path to the memory file
             description: Short description
-            category: One of projects, concepts, conversations, preferences, other
+            category: One of agent, item, report, main, other
         """
         content = self.read_main_file()
         category_map = {
-            "project": "Projects",
-            "projects": "Projects",
-            "concept": "Concepts",
-            "concepts": "Concepts",
-            "conversation": "Conversations",
-            "conversations": "Conversations",
-            "preference": "Preferences",
-            "preferences": "Preferences",
+            "agent": "Agents",
+            "item": "Items",
+            "report": "Reports",
             "main": "Main",
             "other": "Other",
         }
         category_header = f"### {category_map.get(category, category.title())}"
-        link = f"- [{Path(file_path).stem.replace('_', ' ').title()}](/memory_files/{file_path}) - {description}"
+        link = f"- [{Path(file_path).stem.replace('_', ' ').title()}]({file_path}) - {description}"
 
+        # Create category section if it doesn't exist
         if category_header not in content:
-            logger.warning("category_not_found_in_index", category=category)
+            # Add before "---" or at the end
+            if "---" in content:
+                content = content.replace("---", f"{category_header}\n{link}\n\n---", 1)
+            else:
+                content += f"\n\n{category_header}\n{link}\n"
+            self.write_main_file(content)
+            logger.info("file_index_updated", file_path=file_path, category=category)
             return
 
         pattern = rf"({re.escape(category_header)}.*?)(\n###|\n---|\Z)"
@@ -66,11 +68,11 @@ class IndexManager:
             return
 
         section_content = match.group(1)
-        file_pattern = rf"- \[.*?\]\(/memory_files/{re.escape(file_path)}\)"
+        file_pattern = rf"- \[.*?\]\({re.escape(file_path)}\)"
         if re.search(file_pattern, section_content):
             new_section = re.sub(file_pattern, link, section_content)
         else:
-            new_section = section_content.replace("<!-- Add", link + "\n<!-- Add")
+            new_section = section_content.rstrip() + "\n" + link + "\n"
 
         content = content.replace(section_content, new_section)
         self.write_main_file(content)

@@ -71,13 +71,10 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     if not user_messages:
         raise HTTPException(status_code=400, detail="No user message found in request")
 
-    query = user_messages[-1].content
-    raw_mode = request.model or "search"
-    normalized = raw_mode.lower().replace("-", "_")
-    settings = app_request.app.state.settings
-    
+    # CRITICAL: Get the ORIGINAL query (first user message before any clarification)
     # Load chat history from database if chat_id is provided
     chat_history = []
+    original_query = None
     if request.chat_id:
         try:
             from src.database.schema import ChatMessageModel
@@ -99,14 +96,41 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                         "content": msg.content
                     })
                 
-                logger.info("Loaded chat history from database", chat_id=request.chat_id, messages_count=len(chat_history))
+                # Find original query - first user message before any clarification
+                for msg in chat_history:
+                    if msg.get("role") == "user":
+                        # Check if this is before any clarification
+                        msg_idx = chat_history.index(msg)
+                        has_clarification_before = False
+                        for prev_msg in chat_history[:msg_idx]:
+                            if prev_msg.get("role") == "assistant":
+                                content = prev_msg.get("content", "").lower()
+                                if "clarification" in content or "🔍" in content or "clarify" in content:
+                                    has_clarification_before = True
+                                    break
+                        if not has_clarification_before:
+                            original_query = msg.get("content", "")
+                            break
+                
+                logger.info("Loaded chat history from database", chat_id=request.chat_id, messages_count=len(chat_history), original_query=original_query[:100] if original_query else None)
         except Exception as e:
             logger.warning("Failed to load chat history from database", chat_id=request.chat_id, error=str(e))
             # Fallback to request messages
             chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
+            # Original query is first user message
+            original_query = user_messages[0].content if user_messages else None
     else:
         # Use messages from request
         chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
+        # Original query is first user message
+        original_query = user_messages[0].content if user_messages else None
+    
+    # Use original query if found, otherwise use last user message
+    query = original_query if original_query else user_messages[-1].content
+    
+    raw_mode = request.model or "search"
+    normalized = raw_mode.lower().replace("-", "_")
+    settings = app_request.app.state.settings
     
     # Limit chat history length
     if settings.chat_history_limit and len(chat_history) > settings.chat_history_limit:
@@ -132,9 +156,11 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     logger.info("Chat stream request", mode=mode, query=query[:100])
 
     session_id = str(uuid4())
-    # Pass app state to stream generator
+    # Pass app state to stream generator - include chat_id for DB saving
     app_state = {
         "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
+        "chat_id": request.chat_id,  # CRITICAL: Pass chat_id for saving messages to DB
+        "session_factory": app_request.app.state.session_factory,  # For DB access
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
@@ -184,13 +210,16 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
                     # Emit final answer
                     if result.answer:
-                        logger.debug("Emitting final answer", answer_length=len(result.answer))
+                        logger.info("Emitting final answer", answer_length=len(result.answer), mode=mode)
                         stream_generator.emit_status("Finalizing answer...", step="answer")
+                        # CRITICAL: Send answer in chunks so user sees progress even if connection is slow
                         for chunk in _chunk_text(result.answer, size=180):
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
+                        # CRITICAL: emit_final_report will automatically save to DB
+                        # This ensures answer is persisted even if client disconnects
                         stream_generator.emit_final_report(result.answer)
-                        logger.debug("Final report emitted")
+                        logger.info("Final report emitted and saved to DB", answer_length=len(result.answer), mode=mode)
                     else:
                         logger.warning("No answer generated from search workflow")
                         stream_generator.emit_error(error="No answer generated", details="Search completed but no answer was generated")
@@ -520,23 +549,21 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
     async def watch_disconnect() -> None:
         """
-        Watch for client disconnection, but DON'T cancel deep_research tasks.
-        Deep research can take a long time and should complete even if client disconnects.
-        Client can reconnect and get the result.
+        Watch for client disconnection, but DON'T cancel ANY tasks.
+        ALL modes (chat, search, deep_search, deep_research) should complete even if client disconnects.
+        This ensures all messages are persisted in DB and client can reconnect to get results.
         """
         try:
             while not task.done():
                 if await app_request.is_disconnected():
-                    # For deep_research mode, log but don't cancel - let it complete
-                    if mode == "deep_research":
-                        logger.info("Client disconnected during deep_research, but continuing task to completion", session_id=session_id)
-                        # Don't cancel - let the research complete
-                        # Client can reconnect and get the result
-                    else:
-                        # For other modes, cancel on disconnect
-                        logger.warning("Client disconnected, cancelling task", session_id=session_id)
-                        if not task.done():
-                            task.cancel()
+                    # CRITICAL: For ALL modes, don't cancel - let tasks complete even if client disconnects
+                    # This ensures all messages are persisted in DB and client can reconnect to get results
+                    # All modes (chat, search, deep_search, deep_research) should be resilient to disconnections
+                    logger.info(f"Client disconnected during {mode}, but continuing task to completion", 
+                               session_id=session_id, mode=mode)
+                    # Don't cancel - let the task complete
+                    # Client can reconnect and get the result from DB
+                    # All messages are saved via emit_final_report or emit_done
                     break
                 await asyncio.sleep(0.5)
         except Exception as exc:
