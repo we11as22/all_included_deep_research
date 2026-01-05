@@ -33,7 +33,7 @@ export function ChatSearch({ onChatSelect, onClose }: ChatSearchProps) {
     const timeoutId = setTimeout(async () => {
       setIsSearching(true);
       try {
-        const searchResults = await searchChatMessages(query, 5);
+        const searchResults = await searchChatMessages(query, 5, 3);
         setResults(searchResults);
       } catch (error) {
         console.error('Chat message search failed:', error);
@@ -149,10 +149,14 @@ export function ChatSearch({ onChatSelect, onClose }: ChatSearchProps) {
                   {/* Footer with role and date */}
                   <div className="flex items-center gap-3 text-xs text-muted-foreground">
                     <div className="flex items-center gap-1">
-                      <div className={cn(
-                        "px-2 py-0.5 rounded",
-                        message.role === 'user' ? "bg-blue-500/10 text-blue-600 dark:text-blue-400" : "bg-green-500/10 text-green-600 dark:text-green-400"
-                      )}>
+                      <div
+                        className={cn(
+                          "px-2 py-0.5 rounded",
+                          message.role === 'user' && "bg-blue-500/10 text-blue-600 dark:text-blue-400",
+                          message.role === 'assistant' && "bg-green-500/10 text-green-600 dark:text-green-400",
+                          message.role === 'system' && "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                        )}
+                      >
                         {message.role}
                       </div>
                     </div>
@@ -178,4 +182,3 @@ export function ChatSearch({ onChatSelect, onClose }: ChatSearchProps) {
     </div>
   );
 }
-

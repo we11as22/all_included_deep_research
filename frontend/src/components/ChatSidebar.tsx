@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Plus, Trash2, MessageSquare } from 'lucide-react';
-import { listChats, createChat, deleteChat, type Chat } from '@/lib/api';
+import { listChats, createChat, deleteChat, deleteAllChats, type Chat, type Pagination } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface ChatSidebarProps {
@@ -15,24 +15,67 @@ interface ChatSidebarProps {
 }
 
 export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTrigger }: ChatSidebarProps) {
+  const pageSize = 50;
   const [chats, setChats] = useState<Chat[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [pagination, setPagination] = useState<Pagination>({
+    limit: pageSize,
+    offset: 0,
+    total: 0,
+    has_more: false,
+  });
+  const cacheKey = 'chatListCache';
 
-  const loadChats = async (): Promise<Chat[]> => {
+  const loadChats = async (options?: { offset?: number; append?: boolean }): Promise<Chat[]> => {
+    const offset = options?.offset ?? 0;
+    const append = options?.append ?? false;
+
     try {
-      setLoading(true);
-      const chatList = await listChats();
-      setChats(chatList);
-      return chatList;
+      if (append) {
+        setLoadingMore(true);
+      } else {
+        setLoading(true);
+      }
+      const response = await listChats({ limit: pageSize, offset });
+      setChats((prevChats) => (append ? [...prevChats, ...response.chats] : response.chats));
+      setPagination(response.pagination);
+      if (!append) {
+        try {
+          localStorage.setItem(cacheKey, JSON.stringify({
+            chats: response.chats,
+            pagination: response.pagination,
+          }));
+        } catch (error) {
+          console.warn('Failed to cache chat list:', error);
+        }
+      }
+      return response.chats;
     } catch (error) {
       console.error('Failed to load chats:', error);
       return [];
     } finally {
       setLoading(false);
+      setLoadingMore(false);
     }
   };
 
   useEffect(() => {
+    try {
+      const cached = localStorage.getItem(cacheKey);
+      if (cached) {
+        const parsed = JSON.parse(cached);
+        if (Array.isArray(parsed?.chats)) {
+          setChats(parsed.chats);
+          if (parsed.pagination) {
+            setPagination(parsed.pagination);
+          }
+          setLoading(false);
+        }
+      }
+    } catch (error) {
+      console.warn('Failed to read chat list cache:', error);
+    }
     loadChats();
   }, []);
 
@@ -50,9 +93,14 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
       // Reload chat list to remove deleted chat
       loadChats();
     };
+    const handleChatRefresh = () => {
+      loadChats();
+    };
     window.addEventListener('chat-not-found', handleChatNotFound as EventListener);
+    window.addEventListener('chat-list-refresh', handleChatRefresh as EventListener);
     return () => {
       window.removeEventListener('chat-not-found', handleChatNotFound as EventListener);
+      window.removeEventListener('chat-list-refresh', handleChatRefresh as EventListener);
     };
   }, []);
 
@@ -105,12 +153,20 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
   const handleNewChat = async () => {
     try {
       const newChat = await createChat('New Chat');
-      setChats([newChat, ...chats]);
       onChatSelect(newChat.id);
+      await loadChats();
     } catch (error) {
       console.error('Failed to create chat:', error);
       onNewChat();
     }
+  };
+
+  const handleLoadMore = async () => {
+    if (!pagination.has_more || loadingMore) {
+      return;
+    }
+    const nextOffset = pagination.offset + pagination.limit;
+    await loadChats({ offset: nextOffset, append: true });
   };
 
   const handleClearAll = async () => {
@@ -120,44 +176,22 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
 
     try {
       setLoading(true);
-      // Save chats list before clearing UI
-      const chatsToDelete = [...chats];
-      const chatsCount = chatsToDelete.length;
-      
       // Immediately clear the chat list in UI to prevent showing stale data
       setChats([]);
-      
-      // Also clear current chat selection if it's one of the deleted chats
-      if (currentChatId && chatsToDelete.some(c => c.id === currentChatId)) {
+
+      // Clear current chat selection immediately
+      if (currentChatId) {
         onNewChat();
       }
-      
-      // Delete all chats - use allSettled to continue even if some fail
-      const results = await Promise.allSettled(
-        chatsToDelete.map(chat => deleteChat(chat.id))
-      );
-      
-      // Count successful deletions
-      const successful = results.filter(r => r.status === 'fulfilled').length;
-      const failed = results.filter(r => r.status === 'rejected').length;
-      
-      if (failed > 0) {
-        console.warn(`Failed to delete ${failed} chat(s)`, results.filter(r => r.status === 'rejected'));
-      }
-      
-      // Wait for database transactions to fully commit
-      await new Promise(resolve => setTimeout(resolve, 500));
-      
-      // Reload chat list to get current state from server (should be empty)
-      const finalChats = await loadChats();
-      
-      // If all chats were deleted, switch to new chat
-      if (successful === chatsCount && finalChats.length === 0) {
-        onNewChat();
-      } else if (finalChats.length > 0) {
-        // Some chats remain - show warning
-        console.warn(`Some chats could not be deleted. ${finalChats.length} chat(s) remain.`);
-      }
+
+      await deleteAllChats();
+
+      setPagination({
+        limit: pageSize,
+        offset: 0,
+        total: 0,
+        has_more: false,
+      });
     } catch (error) {
       console.error('Failed to clear all chats:', error);
       // Reload chat list anyway to sync with server
@@ -193,39 +227,52 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
         ) : chats.length === 0 ? (
           <div className="text-sm text-muted-foreground text-center py-4">No chats yet</div>
         ) : (
-          chats.map((chat) => (
-            <Card
-              key={chat.id}
-              className={cn(
-                'p-3 cursor-pointer hover:bg-accent transition-colors',
-                currentChatId === chat.id && 'bg-accent border-primary'
-              )}
-              onClick={() => onChatSelect(chat.id)}
-            >
-              <div className="flex items-start justify-between gap-2">
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 mb-1">
-                    <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
-                    <p className="text-sm font-medium truncate">{chat.title}</p>
+          <>
+            {chats.map((chat) => (
+              <Card
+                key={chat.id}
+                className={cn(
+                  'p-3 cursor-pointer hover:bg-accent transition-colors',
+                  currentChatId === chat.id && 'bg-accent border-primary'
+                )}
+                onClick={() => onChatSelect(chat.id)}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 mb-1">
+                      <MessageSquare className="h-4 w-4 text-muted-foreground shrink-0" />
+                      <p className="text-sm font-medium truncate">{chat.title}</p>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {new Date(chat.updated_at).toLocaleDateString()}
+                    </p>
                   </div>
-                  <p className="text-xs text-muted-foreground">
-                    {new Date(chat.updated_at).toLocaleDateString()}
-                  </p>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-6 w-6 shrink-0"
+                    onClick={(e) => handleDelete(chat.id, e)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </Button>
                 </div>
+              </Card>
+            ))}
+            {pagination.has_more && (
+              <div className="flex justify-center py-2">
                 <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-6 w-6 shrink-0"
-                  onClick={(e) => handleDelete(chat.id, e)}
+                  variant="outline"
+                  size="sm"
+                  onClick={handleLoadMore}
+                  disabled={loadingMore}
                 >
-                  <Trash2 className="h-3 w-3" />
+                  {loadingMore ? 'Loading...' : 'Load more'}
                 </Button>
               </div>
-            </Card>
-          ))
+            )}
+          </>
         )}
       </div>
     </div>
   );
 }
-

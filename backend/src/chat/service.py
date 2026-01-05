@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -243,7 +244,7 @@ class ChatSearchService:
             # Classify query
             from src.workflow.search.classifier import classify_query
             if stream:
-                stream.emit_status("Classifying query...", step="classification")
+                self._emit_status(stream, "Classifying query...", step="classification")
             
             classification = await classify_query(
                 query, 
@@ -259,7 +260,7 @@ class ChatSearchService:
             from src.workflow.search.researcher import research_agent
             
             if stream:
-                stream.emit_status(f"Starting {research_mode} research...", step="research")
+                self._emit_status(stream, f"Starting {research_mode} research...", step="research")
             
             research_results = await research_agent(
                 query=query,
@@ -851,31 +852,42 @@ class ChatSearchService:
 
     def _emit_status(self, stream: Any | None, message: str, step: str) -> None:
         if stream:
-            stream.emit_status(message, step=step)
+            self._fire_and_forget(stream.emit_status(message, step=step))
 
     def _emit_sources(self, stream: Any | None, sources: list[SearchResult], label: str) -> None:
         if not stream:
             return
         for source in sources[: self.settings.sources_limit]:
-            stream.emit_source(
-                researcher_id=label,
-                source={"url": source.url, "title": source.title},
+            self._fire_and_forget(
+                stream.emit_source(
+                    researcher_id=label,
+                    source={"url": source.url, "title": source.title},
+                )
             )
 
     def _emit_search_queries(self, stream: Any | None, queries: list[str], label: str) -> None:
         if stream:
-            stream.emit_search_queries(queries, label=label)
+            self._fire_and_forget(stream.emit_search_queries(queries, label=label))
 
     def _emit_finding(self, stream: Any | None, topic: str, summary: str) -> None:
         if not stream:
             return
         findings = self._extract_key_findings(summary)
-        stream.emit_finding({
+        self._fire_and_forget(stream.emit_finding({
             "researcher_id": "search",
             "topic": topic,
             "summary": summary,
             "key_findings": findings,
-        })
+        }))
+
+    def _fire_and_forget(self, result: Any) -> None:
+        if inspect.isawaitable(result):
+            if isinstance(result, asyncio.Task):
+                return
+            try:
+                asyncio.create_task(result)
+            except RuntimeError:
+                return
 
     def _extract_key_findings(self, summary: str) -> list[str]:
         lines = [line.strip("- ").strip() for line in summary.splitlines() if line.strip()]

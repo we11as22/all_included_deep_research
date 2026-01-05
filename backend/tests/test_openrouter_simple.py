@@ -1,41 +1,50 @@
 #!/usr/bin/env python3
 """Simple OpenRouter test."""
 
-import asyncio
+import os
+from pathlib import Path
+
+import pytest
 from openai import AsyncOpenAI
 
+from src.config.settings import Settings
+
+
+def _load_settings() -> Settings:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if env_path.exists():
+        return Settings(_env_file=env_path)
+    return Settings()
+
+
+@pytest.mark.asyncio
 async def test_openrouter():
     """Test OpenRouter API directly."""
-    
-    api_key = "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"
-    
+    settings = _load_settings()
+    api_key = settings.openai_api_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        pytest.skip("OPENAI_API_KEY not set")
+
+    base_url = settings.openai_base_url or "https://openrouter.ai/api/v1"
+    headers = {}
+    if settings.openai_api_http_referer:
+        headers["HTTP-Referer"] = settings.openai_api_http_referer
+    if settings.openai_api_x_title:
+        headers["X-Title"] = settings.openai_api_x_title
+
     client = AsyncOpenAI(
         api_key=api_key,
-        base_url="https://openrouter.ai/api/v1",
-        default_headers={
-            "HTTP-Referer": "https://github.com/all-included-deep-research",
-            "X-Title": "All-Included Deep Research Test",
-        }
+        base_url=base_url,
+        default_headers=headers or None,
     )
-    
-    try:
-        print("Testing OpenRouter with gpt-4o-mini...")
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "user", "content": "Say 'Hello from OpenRouter!' in one sentence."}
-            ],
-            max_tokens=50
-        )
-        
-        print(f"✓ Success!")
-        print(f"Response: {response.choices[0].message.content}")
-        return True
-        
-    except Exception as e:
-        print(f"✗ Failed: {e}")
-        return False
 
-if __name__ == "__main__":
-    asyncio.run(test_openrouter())
+    response = await client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "user", "content": "Say 'Hello from OpenRouter!' in one sentence."}
+        ],
+        max_tokens=50,
+    )
 
+    content = response.choices[0].message.content
+    assert content

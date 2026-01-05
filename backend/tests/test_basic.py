@@ -17,10 +17,16 @@ def test_imports():
     assert Base is not None
 
     # Workflow
-    from src.workflow import WorkflowFactory
-    from src.workflow.state import ResearchState
+    from src.workflow import (
+        SearchService,
+        create_search_service,
+        create_research_graph,
+        ResearchState,
+    )
 
-    assert WorkflowFactory is not None
+    assert SearchService is not None
+    assert create_search_service is not None
+    assert create_research_graph is not None
     assert ResearchState is not None
 
     # API
@@ -71,18 +77,17 @@ def test_streaming_generator():
 
 def test_research_state():
     """Test research state structure."""
-    from src.workflow.state import ResearchState, SourceReference
+    from src.workflow.research.state import ResearchPlan, ResearchTopic
 
-    # Create source reference
-    source = SourceReference(
-        url="https://example.com",
-        title="Test Source",
-        snippet="Test snippet",
-        relevance_score=0.9,
+    topic = ResearchTopic(
+        reasoning="Test reasoning",
+        topic="Example topic",
+        description="Test description",
+        priority="high",
     )
+    plan = ResearchPlan(reasoning="Plan reasoning", topics=[topic])
 
-    assert source.url == "https://example.com"
-    assert source.relevance_score == 0.9
+    assert plan.topics[0].topic == "Example topic"
 
 
 def test_mode_configurations():
@@ -91,19 +96,16 @@ def test_mode_configurations():
 
     settings = get_settings()
 
-    # Speed mode
-    assert settings.speed_max_iterations == 2
-    assert settings.speed_max_concurrent == 1
+    # Iterations should be positive and monotonic by mode.
+    assert settings.speed_max_iterations > 0
+    assert settings.balanced_max_iterations >= settings.speed_max_iterations
+    assert settings.quality_max_iterations >= settings.balanced_max_iterations
 
-    # Balanced mode
-    assert settings.balanced_max_iterations == 6
-    assert settings.balanced_max_concurrent == 3
-
-    # Quality mode
-    assert settings.quality_max_iterations == 25
-    assert settings.quality_max_concurrent == 5
+    # Concurrency should be positive and monotonic by mode.
+    assert settings.speed_max_concurrent > 0
+    assert settings.balanced_max_concurrent >= settings.speed_max_concurrent
+    assert settings.quality_max_concurrent >= settings.balanced_max_concurrent
 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
-

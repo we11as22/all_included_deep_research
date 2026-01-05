@@ -13,6 +13,18 @@ class MessageRole(str, Enum):
     SYSTEM = "system"
 
 
+class ChatMode(str, Enum):
+    """Chat modes for different research workflows."""
+
+    CHAT = "chat"
+    SEARCH = "search"
+    SPEED = "speed"
+    DEEP_SEARCH = "deep_search"
+    BALANCED = "balanced"
+    DEEP_RESEARCH = "deep_research"
+    QUALITY = "quality"
+
+
 class ChatMessage(BaseModel):
     """Chat message."""
 

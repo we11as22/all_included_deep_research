@@ -1,165 +1,85 @@
-#!/usr/bin/env python3
-"""Test OpenRouter and HuggingFace integration."""
+"""OpenRouter + HuggingFace integration tests."""
 
-import asyncio
-import os
-import sys
+from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+import pytest
+from langchain_core.messages import HumanMessage
+from langchain_openai import ChatOpenAI
 
-async def test_settings():
-    """Test settings loading."""
-    print("=" * 60)
-    print("1. Testing Settings...")
-    print("=" * 60)
-    
-    try:
-        from src.config.settings import get_settings
-        settings = get_settings()
-        
-        print(f"✓ Settings loaded")
-        print(f"  - Embedding provider: {settings.embedding_provider}")
-        print(f"  - Embedding dimension: {settings.embedding_dimension}")
-        print(f"  - HuggingFace model: {settings.huggingface_model}")
-        print(f"  - Research model: {settings.research_model}")
-        print(f"  - OpenAI base URL: {settings.openai_base_url}")
-        print(f"  - API key present: {'Yes' if settings.openai_api_key else 'No'}")
-        return True
-    except Exception as e:
-        print(f"✗ Settings failed: {e}")
-        return False
+from src.config.settings import Settings
+from src.embeddings.huggingface_provider import HuggingFaceEmbeddingProvider
 
 
+def _load_settings() -> Settings:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if env_path.exists():
+        return Settings(_env_file=env_path)
+    return Settings()
+
+
+def _build_llm(settings: Settings) -> ChatOpenAI:
+    llm_kwargs = {
+        "model": "gpt-4o-mini",
+        "api_key": settings.openai_api_key,
+        "max_tokens": 100,
+        "temperature": 0.7,
+    }
+
+    if settings.openai_base_url:
+        llm_kwargs["base_url"] = settings.openai_base_url
+        if "openrouter.ai" in settings.openai_base_url:
+            headers = {}
+            if settings.openai_api_http_referer:
+                headers["HTTP-Referer"] = settings.openai_api_http_referer
+            if settings.openai_api_x_title:
+                headers["X-Title"] = settings.openai_api_x_title
+            if headers:
+                llm_kwargs["default_headers"] = headers
+
+    return ChatOpenAI(**llm_kwargs)
+
+
+@pytest.mark.asyncio
+async def test_settings_load():
+    settings = _load_settings()
+
+    assert settings.embedding_provider
+    assert settings.research_model
+    assert settings.embedding_dimension > 0
+
+
+@pytest.mark.asyncio
 async def test_huggingface_embeddings():
-    """Test HuggingFace embeddings."""
-    print("\n" + "=" * 60)
-    print("2. Testing HuggingFace Embeddings...")
-    print("=" * 60)
-    
-    try:
-        from src.config.settings import get_settings
-        from src.embeddings.huggingface_provider import HuggingFaceEmbeddingProvider
-        
-        settings = get_settings()
-        
-        print(f"Loading model: {settings.huggingface_model}...")
-        provider = HuggingFaceEmbeddingProvider(settings)
-        
-        print("Generating test embedding...")
-        test_text = "This is a test sentence for embeddings."
-        embedding = await provider.embed_text(test_text)
-        
-        print(f"✓ HuggingFace embeddings work")
-        print(f"  - Embedding dimension: {len(embedding)}")
-        print(f"  - First 5 values: {embedding[:5]}")
-        return True
-    except Exception as e:
-        print(f"✗ HuggingFace embeddings failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    settings = _load_settings()
+    if settings.embedding_provider != "huggingface":
+        pytest.skip("Embedding provider is not HuggingFace")
+    pytest.importorskip("sentence_transformers")
+
+    provider = HuggingFaceEmbeddingProvider(
+        model=settings.huggingface_model,
+        api_key=settings.huggingface_api_key,
+        use_local=settings.huggingface_use_local,
+    )
+
+    embedding = await provider.embed_text("This is a test sentence for embeddings.")
+    assert isinstance(embedding, list)
+    assert len(embedding) == provider.get_dimension()
 
 
+@pytest.mark.asyncio
 async def test_openrouter_llm():
-    """Test OpenRouter LLM."""
-    print("\n" + "=" * 60)
-    print("3. Testing OpenRouter LLM...")
-    print("=" * 60)
-    
-    try:
-        from src.config.settings import get_settings
-        from langchain_openai import ChatOpenAI
-        from langchain_core.messages import HumanMessage
-        
-        settings = get_settings()
-        
-        print(f"Creating LLM with model: {settings.research_model}")
-        print(f"Using base URL: {settings.openai_base_url}")
-        
-        llm_kwargs = {
-            "model": "gpt-4o-mini",
-            "api_key": settings.openai_api_key,
-            "max_tokens": 100,
-            "temperature": 0.7,
-        }
-        
-        if settings.openai_base_url:
-            llm_kwargs["base_url"] = settings.openai_base_url
-            
-            # Add OpenRouter-specific headers
-            if "openrouter.ai" in settings.openai_base_url:
-                llm_kwargs["default_headers"] = {
-                    "HTTP-Referer": "https://github.com/all-included-deep-research",
-                    "X-Title": "All-Included Deep Research",
-                }
-            
-        llm = ChatOpenAI(**llm_kwargs)
-        
-        print("Sending test message...")
-        message = HumanMessage(content="Say 'Hello from OpenRouter!' in one sentence.")
-        response = await llm.ainvoke([message])
-        
-        print(f"✓ OpenRouter LLM works")
-        print(f"  - Response: {response.content}")
-        return True
-    except Exception as e:
-        print(f"✗ OpenRouter LLM failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+    settings = _load_settings()
+    if not settings.openai_api_key:
+        pytest.skip("OPENAI_API_KEY not set")
+
+    llm = _build_llm(settings)
+    response = await llm.ainvoke([HumanMessage(content="Say 'Hello from OpenRouter!' in one sentence.")])
+
+    assert response.content
 
 
-async def test_workflow_factory():
-    """Test workflow factory."""
-    print("\n" + "=" * 60)
-    print("4. Testing Workflow Factory...")
-    print("=" * 60)
-    
-    try:
-        from src.config.settings import get_settings
-        # We can't test full workflow without database, but we can test factory creation
-        
-        print("✓ Workflow factory would work (skipping full test without DB)")
-        return True
-    except Exception as e:
-        print(f"✗ Workflow factory failed: {e}")
-        return False
+def test_workflow_factory_imports():
+    from src.workflow import create_search_service, create_research_graph
 
-
-async def main():
-    """Run all tests."""
-    print("\n")
-    print("=" * 60)
-    print("OpenRouter + HuggingFace Integration Tests")
-    print("=" * 60)
-    print()
-    
-    results = []
-    
-    # Run tests
-    results.append(await test_settings())
-    results.append(await test_huggingface_embeddings())
-    results.append(await test_openrouter_llm())
-    results.append(await test_workflow_factory())
-    
-    # Summary
-    print("\n" + "=" * 60)
-    print("Test Summary")
-    print("=" * 60)
-    passed = sum(results)
-    total = len(results)
-    
-    print(f"Passed: {passed}/{total}")
-    
-    if passed == total:
-        print("✅ All tests passed!")
-        return 0
-    else:
-        print("❌ Some tests failed")
-        return 1
-
-
-if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
-
+    assert callable(create_search_service)
+    assert callable(create_research_graph)

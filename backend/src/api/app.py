@@ -226,4 +226,38 @@ def create_app() -> FastAPI:
 
 
 # Create app instance
-app = create_app()
+_fastapi_app = create_app()
+
+# Wrap with Socket.IO
+try:
+    import socketio
+    from src.api.socketio_server import get_sio
+
+    sio = get_sio()
+
+    # Create ASGI app that combines FastAPI and Socket.IO
+    app = socketio.ASGIApp(
+        socketio_server=sio,
+        other_asgi_app=_fastapi_app,
+        socketio_path='/socket.io',
+    )
+
+    logger.info("Socket.IO integration enabled")
+
+    # Add helper functions to access app state
+    def get_app_state():
+        """Get FastAPI app state."""
+        return _fastapi_app.state
+
+    def get_session_factory():
+        """Get database session factory."""
+        return _fastapi_app.state.session_factory
+
+    # Make these available globally
+    import src.main
+    src.main.get_app_state = get_app_state
+    src.main.get_session_factory = get_session_factory
+
+except ImportError as e:
+    logger.warning("Socket.IO not available, running without Socket.IO support", error=str(e))
+    app = _fastapi_app

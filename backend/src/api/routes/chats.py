@@ -5,7 +5,7 @@ from uuid import uuid4
 from datetime import datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi import APIRouter, HTTPException, Request, Query, Body
 from pydantic import BaseModel
 from sqlalchemy import select, func, delete
 
@@ -21,19 +21,47 @@ class ChatCreateRequest(BaseModel):
     title: str = "New Chat"
 
 
+class ChatCreateWithMessageRequest(BaseModel):
+    """Request model for creating a chat with the first message."""
+    title: str
+    message: str
+    message_id: str
+
+
+class ChatMessageCreateRequest(BaseModel):
+    """Request model for adding a chat message."""
+    role: str
+    content: str
+    message_id: str | None = None
+
+
 @router.get("")
-async def list_chats(app_request: Request):
-    """List all chats."""
+async def list_chats(
+    app_request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List chats with pagination."""
     session_factory = app_request.app.state.session_factory
     
     async with session_factory() as session:
+        total_result = await session.execute(select(func.count(ChatModel.id)))
+        total = total_result.scalar() or 0
         result = await session.execute(
             select(ChatModel).order_by(ChatModel.updated_at.desc())
+            .limit(limit)
+            .offset(offset)
         )
         chats = result.scalars().all()
         
         return {
-            "chats": [chat.to_dict() for chat in chats]
+            "chats": [chat.to_dict() for chat in chats],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "has_more": offset + len(chats) < total,
+            },
         }
 
 
@@ -42,6 +70,7 @@ async def search_chats(
     app_request: Request,
     q: str = Query(..., description="Search query"),
     limit: int = Query(5, ge=1, le=20, description="Maximum results (top N messages)"),
+    role: str | None = Query(None, description="Optional role filter (user/assistant/system)"),
 ):
     """
     Search chat messages using hybrid search (vector + fulltext).
@@ -56,7 +85,13 @@ async def search_chats(
 
     try:
         # Search messages using hybrid search
-        results = await chat_message_search_engine.search(query=q, limit=limit)
+        role_filter = role
+        if role_filter and role_filter not in {"user", "assistant", "system"}:
+            raise HTTPException(status_code=400, detail="Invalid role filter")
+
+        results = await chat_message_search_engine.search(query=q, limit=limit, role_filter=role_filter)
+        if role_filter is None:
+            results = [item for item in results if item.role != "system"]
 
         # Convert results to dict
         messages = [result.to_dict() for result in results]
@@ -94,9 +129,30 @@ async def create_chat(chat_request: ChatCreateRequest, app_request: Request):
         raise HTTPException(status_code=500, detail=f"Failed to create chat: {str(e)}")
 
 
+@router.delete("")
+async def delete_all_chats(app_request: Request):
+    """Delete all chats and messages."""
+    session_factory = app_request.app.state.session_factory
+
+    async with session_factory() as session:
+        async with session.begin():
+            messages_result = await session.execute(delete(ChatMessageModel))
+            chats_result = await session.execute(delete(ChatModel))
+
+    return {
+        "deleted_messages": messages_result.rowcount,
+        "deleted_chats": chats_result.rowcount,
+    }
+
+
 @router.get("/{chat_id}")
-async def get_chat(chat_id: str, app_request: Request):
-    """Get chat with messages."""
+async def get_chat(
+    chat_id: str,
+    app_request: Request,
+    limit: int | None = Query(None, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """Get chat with messages (optional pagination)."""
     session_factory = app_request.app.state.session_factory
     
     async with session_factory() as session:
@@ -110,16 +166,82 @@ async def get_chat(chat_id: str, app_request: Request):
             raise HTTPException(status_code=404, detail="Chat not found")
         
         # Get messages
-        result = await session.execute(
+        messages_query = (
             select(ChatMessageModel)
             .where(ChatMessageModel.chat_id == chat_id)
             .order_by(ChatMessageModel.created_at.asc())
         )
+        if limit is not None:
+            messages_query = messages_query.limit(limit).offset(offset)
+        result = await session.execute(messages_query)
         messages = result.scalars().all()
+
+        pagination = None
+        if limit is not None:
+            total_result = await session.execute(
+                select(func.count(ChatMessageModel.id)).where(ChatMessageModel.chat_id == chat_id)
+            )
+            total = total_result.scalar() or 0
+            pagination = {
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "has_more": offset + len(messages) < total,
+            }
         
         return {
             "chat": chat.to_dict(),
-            "messages": [msg.to_dict() for msg in messages]
+            "messages": [msg.to_dict() for msg in messages],
+            "pagination": pagination,
+        }
+
+
+@router.get("/{chat_id}/messages")
+async def get_chat_messages(
+    chat_id: str,
+    app_request: Request,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    order: str = Query("asc"),
+):
+    """Get chat messages with pagination."""
+    session_factory = app_request.app.state.session_factory
+
+    order_value = order.lower()
+    if order_value not in {"asc", "desc"}:
+        raise HTTPException(status_code=400, detail="Invalid order, must be 'asc' or 'desc'")
+
+    async with session_factory() as session:
+        # Verify chat exists
+        result = await session.execute(select(ChatModel).where(ChatModel.id == chat_id))
+        chat = result.scalar_one_or_none()
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        total_result = await session.execute(
+            select(func.count(ChatMessageModel.id)).where(ChatMessageModel.chat_id == chat_id)
+        )
+        total = total_result.scalar() or 0
+
+        order_by = ChatMessageModel.created_at.asc() if order_value == "asc" else ChatMessageModel.created_at.desc()
+        result = await session.execute(
+            select(ChatMessageModel)
+            .where(ChatMessageModel.chat_id == chat_id)
+            .order_by(order_by)
+            .limit(limit)
+            .offset(offset)
+        )
+        messages = result.scalars().all()
+
+        return {
+            "chat_id": chat_id,
+            "messages": [msg.to_dict() for msg in messages],
+            "pagination": {
+                "limit": limit,
+                "offset": offset,
+                "total": total,
+                "has_more": offset + len(messages) < total,
+            },
         }
 
 
@@ -257,11 +379,20 @@ async def delete_chat(chat_id: str, app_request: Request):
 async def add_message(
     chat_id: str,
     app_request: Request,
-    role: str,
-    content: str,
+    payload: ChatMessageCreateRequest | None = Body(None),
+    role: str | None = None,
+    content: str | None = None,
     message_id: str | None = None,
 ):
     """Add a message to a chat and index it for search."""
+    if payload:
+        role = payload.role
+        content = payload.content
+        message_id = payload.message_id
+
+    if role is None or content is None:
+        raise HTTPException(status_code=422, detail="role and content are required")
+
     # Decode content if it's URL-encoded
     if content and '%' in content:
         try:
@@ -366,6 +497,12 @@ async def add_message(
         # Update chat updated_at
         chat.updated_at = datetime.now()
 
+        # Auto-update title for default placeholder chats on first user message
+        if role == "user" and (chat.title or "").strip().lower() == "new chat":
+            updated_title = summarize_text(content, 60).strip()
+            if updated_title:
+                chat.title = updated_title
+
         await session.commit()
         await session.refresh(message)
 
@@ -379,3 +516,80 @@ async def add_message(
             has_embedding=embedding is not None
         )
         return message.to_dict()
+
+
+@router.post("/create-with-message")
+async def create_chat_with_message(
+    app_request: Request,
+    payload: ChatCreateWithMessageRequest | None = Body(None),
+    title: str | None = None,
+    message: str | None = None,
+    message_id: str | None = None,
+):
+    """
+    Create a new chat and first message atomically in a single transaction.
+    This prevents race conditions when creating a chat with the first message.
+    """
+    session_factory = app_request.app.state.session_factory
+    if payload:
+        title = payload.title
+        message = payload.message
+        message_id = payload.message_id
+
+    if not title or not message or not message_id:
+        raise HTTPException(status_code=422, detail="title, message, and message_id are required")
+
+    async with session_factory() as session:
+        async with session.begin():
+            # Create chat
+            chat = ChatModel(
+                id=str(uuid4()),
+                title=title,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
+            )
+            session.add(chat)
+
+            # Create first message
+            msg = ChatMessageModel(
+                chat_id=chat.id,
+                message_id=message_id,
+                role="user",
+                content=message,
+                created_at=datetime.utcnow(),
+            )
+            session.add(msg)
+
+            # Generate embedding for search
+            try:
+                embedding_provider = app_request.app.state.embedding_provider
+                if embedding_provider:
+                    embedding_vector = await embedding_provider.embed_text(message)
+                    from src.database.schema import EMBEDDING_DIMENSION
+
+                    if len(embedding_vector) < EMBEDDING_DIMENSION:
+                        embedding_vector = list(embedding_vector) + [0.0] * (EMBEDDING_DIMENSION - len(embedding_vector))
+                    elif len(embedding_vector) > EMBEDDING_DIMENSION:
+                        embedding_vector = embedding_vector[:EMBEDDING_DIMENSION]
+
+                    msg.embedding = embedding_vector
+            except Exception as e:
+                logger.warning(
+                    "Failed to generate embedding for first message",
+                    chat_id=chat.id,
+                    error=str(e),
+                )
+
+            # Commit transaction
+            await session.commit()
+
+            logger.info(
+                "Chat created with first message atomically",
+                chat_id=chat.id,
+                message_id=message_id,
+            )
+
+            return {
+                "chat": chat.to_dict(),
+                "message": msg.to_dict(),
+            }

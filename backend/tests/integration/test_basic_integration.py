@@ -9,7 +9,6 @@ backend_path = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(backend_path))
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
 
 
 @pytest.mark.asyncio
@@ -18,14 +17,14 @@ async def test_database_schema_imports():
     from src.database.schema_sqlite import (
         Base,
         ChatModel,
-        MessageModel,
+        ChatMessageModel,
         ResearchSessionModel,
         AgentMemoryModel
     )
 
     assert Base is not None
     assert ChatModel.__tablename__ == "chats"
-    assert MessageModel.__tablename__ == "messages"
+    assert ChatMessageModel.__tablename__ == "chat_messages"
     assert ResearchSessionModel.__tablename__ == "research_sessions"
     assert AgentMemoryModel.__tablename__ == "agent_memory"
 
@@ -33,11 +32,10 @@ async def test_database_schema_imports():
 @pytest.mark.asyncio
 async def test_vector_store_adapter():
     """Test vector store adapter factory."""
-    from src.memory.vector_store_adapter import create_vector_store, MockAdapter
+    pytest.importorskip("faiss")
+    from src.memory.vector_store_adapter import create_vector_store
 
-    # Test mock adapter creation
-    adapter = create_vector_store(store_type="mock")
-    assert isinstance(adapter, MockAdapter)
+    adapter = create_vector_store(store_type="faiss", dimension=3)
 
     # Test basic operations
     await adapter.add_embeddings(
@@ -59,54 +57,46 @@ async def test_vector_store_adapter():
 async def test_llm_provider_abstraction():
     """Test LLM provider abstraction."""
     from src.llm.provider_abstraction import create_llm
-    from src.config.settings import Settings
+    from src.config.settings import get_settings
+    from langchain_core.messages import HumanMessage
 
-    settings = Settings()
+    settings = get_settings()
+    if not settings.openai_api_key:
+        pytest.skip("OPENAI_API_KEY not set")
 
-    # Test mock provider
     llm = create_llm(
-        model_string="mock:test-model",
+        model_string=settings.chat_model,
         settings=settings,
         temperature=0.7,
-        max_tokens=1000
+        max_tokens=256
     )
 
-    assert llm is not None
-    assert llm.provider == "mock"
+    response = await llm.ainvoke([HumanMessage(content="Reply with the word: ping")])
+    assert response.content
 
 
 @pytest.mark.asyncio
 async def test_search_classifier():
-    """Test query classifier with mock LLM."""
-    from src.workflow.search.classifier import classify_query, QueryClassification
-    from pydantic import BaseModel, Field
+    """Test query classifier with real LLM."""
+    from src.config.settings import get_settings
+    from src.llm.provider_abstraction import create_llm
+    from src.workflow.search.classifier import classify_query
 
-    # Create mock LLM
-    mock_llm = MagicMock()
+    settings = get_settings()
+    if not settings.openai_api_key:
+        pytest.skip("OPENAI_API_KEY not set")
 
-    # Mock the structured output
-    class MockStructuredLLM:
-        async def ainvoke(self, messages):
-            return QueryClassification(
-                reasoning="Test reasoning",
-                query_type="factual",
-                standalone_query="What is Python?",
-                suggested_mode="web",
-                requires_sources=True,
-                time_sensitive=False
-            )
-
-    mock_llm.with_structured_output = lambda schema, **kwargs: MockStructuredLLM()
+    llm = create_llm(settings.chat_model, settings, temperature=0.3, max_tokens=512)
 
     result = await classify_query(
         query="What is Python?",
         chat_history=[],
-        llm=mock_llm
+        llm=llm,
     )
 
-    assert isinstance(result, QueryClassification)
-    assert result.query_type == "factual"
-    assert result.suggested_mode == "web"
+    assert result.standalone_query
+    assert result.query_type
+    assert result.suggested_mode
 
 
 @pytest.mark.asyncio
@@ -134,11 +124,22 @@ async def test_action_registry():
 async def test_research_state():
     """Test research state creation."""
     from src.workflow.research.state import create_initial_state, ResearchState
+    from src.streaming.sse import ResearchStreamingGenerator
+    from src.config.settings import get_settings
+
+    settings = get_settings()
+    mode_config = {
+        "max_iterations": settings.balanced_max_iterations,
+    }
 
     state = create_initial_state(
         query="Test query",
         chat_history=[],
-        mode="balanced"
+        mode="balanced",
+        stream=ResearchStreamingGenerator(session_id="test_state"),
+        session_id="test_state",
+        mode_config=mode_config,
+        settings=settings,
     )
 
     assert isinstance(state, dict)
@@ -163,14 +164,17 @@ async def test_supervisor_queue():
     assert queue.size() == 2
 
     # Process batch
-    mock_supervisor = AsyncMock(return_value=[{"directive": "continue"}])
+    async def supervisor_func(state, batch):
+        return {"directives": [{"directive": "continue"}], "should_continue": True}
+
     results = await queue.process_batch(
         state={"iteration": 1},
-        supervisor_func=mock_supervisor,
+        supervisor_func=supervisor_func,
         max_batch_size=10
     )
 
-    assert isinstance(results, list)
+    assert isinstance(results, dict)
+    assert results["directives"]
     assert queue.size() == 0  # Queue should be empty after processing
 
 
@@ -178,6 +182,7 @@ async def test_supervisor_queue():
 async def test_session_memory_service():
     """Test session memory service."""
     import tempfile
+    from pathlib import Path
     from src.memory.session_memory_service import SessionMemoryService
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -186,18 +191,9 @@ async def test_session_memory_service():
             base_memory_dir=tmpdir
         )
 
-        # Test initialization
-        await service.initialize()
-
-        # Test main file update
-        await service.update_main_section(
-            section="## Overview",
-            content="Test content"
-        )
-
         # Read main file
         main_content = await service.read_main()
-        assert "Test content" in main_content
+        assert "Research Session" in main_content
 
         # Save agent file
         await service.save_agent_file(
@@ -207,10 +203,18 @@ async def test_session_memory_service():
             character=None
         )
 
-        # Load agent state
-        agent_state = await service.load_agent_state("agent_r0_0")
-        assert "todos" in agent_state
-        assert len(agent_state["todos"]) == 1
+        agent_file = Path(tmpdir) / "sessions" / "test_session_123" / "agents" / "agent_r0_0.md"
+        assert agent_file.exists()
+
+        note_path = await service.save_note(
+            agent_id="agent_r0_0",
+            title="Test Note",
+            summary="Summary",
+            urls=["https://example.com"],
+            tags=["test"],
+            share=True,
+        )
+        assert (Path(tmpdir) / "sessions" / "test_session_123" / note_path).exists()
 
 
 if __name__ == "__main__":

@@ -9,8 +9,10 @@ import { useState, useRef, useEffect } from 'react';
 export type ChatMode = 'chat' | 'search' | 'deep_search' | 'deep_research';
 
 interface ModeSelectorDropdownProps {
-  selected: ChatMode;
+  value?: ChatMode;
+  selected?: ChatMode;
   onChange: (mode: ChatMode) => void;
+  disabled?: boolean;
 }
 
 const modes = [
@@ -56,12 +58,19 @@ const modes = [
   },
 ];
 
-export function ModeSelectorDropdown({ selected, onChange }: ModeSelectorDropdownProps) {
+export function ModeSelectorDropdown({ value, selected, onChange, disabled = false }: ModeSelectorDropdownProps) {
   const [isOpen, setIsOpen] = useState(false);
   const dropdownRef = useRef<HTMLDivElement>(null);
 
-  const selectedMode = modes.find(m => m.id === selected) || modes[0];
+  const activeMode = value ?? selected ?? modes[0].id;
+  const selectedMode = modes.find(m => m.id === activeMode) || modes[0];
   const Icon = selectedMode.icon;
+
+  useEffect(() => {
+    if (disabled && isOpen) {
+      setIsOpen(false);
+    }
+  }, [disabled, isOpen]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -84,11 +93,17 @@ export function ModeSelectorDropdown({ selected, onChange }: ModeSelectorDropdow
       <Button
         type="button"
         variant="outline"
-        onClick={() => setIsOpen(!isOpen)}
+        onClick={() => {
+          if (!disabled) {
+            setIsOpen(!isOpen);
+          }
+        }}
+        disabled={disabled}
         className={cn(
           "flex items-center gap-2 rounded-lg px-3 py-2 text-xs font-medium transition-all",
           "border-border/60 bg-background/80 hover:bg-background",
-          "dark:bg-background/90 dark:hover:bg-background"
+          "dark:bg-background/90 dark:hover:bg-background",
+          disabled && "cursor-not-allowed opacity-60"
         )}
       >
         <Icon className={cn("h-3.5 w-3.5", selectedMode.color)} />
@@ -101,16 +116,19 @@ export function ModeSelectorDropdown({ selected, onChange }: ModeSelectorDropdow
           <div className="p-2 space-y-1">
             {modes.map((mode) => {
               const ModeIcon = mode.icon;
-              const isSelected = selected === mode.id;
+              const isSelected = activeMode === mode.id;
 
               return (
                 <button
                   key={mode.id}
                   type="button"
                   onClick={() => {
-                    onChange(mode.id);
-                    setIsOpen(false);
+                    if (!disabled) {
+                      onChange(mode.id);
+                      setIsOpen(false);
+                    }
                   }}
+                  disabled={disabled}
                   className={cn(
                     "w-full flex items-start gap-3 rounded-lg p-3 text-left transition-all",
                     "hover:bg-muted/50",
@@ -143,4 +161,3 @@ export function ModeSelectorDropdown({ selected, onChange }: ModeSelectorDropdow
     </div>
   );
 }
-
