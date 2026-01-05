@@ -199,11 +199,11 @@ EMBEDDING_PROVIDER=mock
 ```bash
 # Увеличить количество итераций
 BALANCED_MAX_ITERATIONS=10  # По умолчанию: 6
-QUALITY_MAX_ITERATIONS=30   # По умолчанию: 25
+QUALITY_MAX_ITERATIONS=20   # По умолчанию: 15 (было 25)
 
 # Увеличить количество параллельных исследователей
 BALANCED_MAX_CONCURRENT=5   # По умолчанию: 3
-QUALITY_MAX_CONCURRENT=8    # По умолчанию: 5
+QUALITY_MAX_CONCURRENT=5    # По умолчанию: 3 (было 4)
 
 # Настройка глубины deep search (quality web search)
 DEEP_SEARCH_QUALITY_MAX_RESULTS=16
