@@ -324,6 +324,7 @@ export default function HomePage() {
 
     let sessionId: string | null = null;
     let messageSaved = false; // Track if message was already saved
+    let streamTimeout: NodeJS.Timeout | null = null; // Declare outside try block for use in finally
     try {
       // Map frontend mode to backend mode
       const backendMode = mode === 'chat' ? 'chat' : mode === 'search' ? 'search' : mode === 'deep_search' ? 'deep_search' : 'deep_research';
@@ -337,11 +338,11 @@ export default function HomePage() {
       
       // CRITICAL: Add timeout protection to prevent infinite loops
       // If stream doesn't complete within 5 minutes, force stop
-      const streamTimeout = setTimeout(() => {
+      streamTimeout = setTimeout(() => {
         console.error('Stream timeout - forcing stop after 5 minutes', { mode: backendMode, chatId });
         setIsStreaming(false);
         setError('Stream timeout - please try again');
-      }, 5 * 60 * 1000); // 5 minutes
+      }, 5 * 60 * 1000) as NodeJS.Timeout; // 5 minutes
       
       try {
         for await (const event of streamChatProgress(
@@ -711,44 +712,55 @@ export default function HomePage() {
           }
         }
       }
+      } catch (innerErr) {
+        // Handle errors from the inner try (stream processing)
+        let errorMessage = 'Chat request failed';
+        if (innerErr instanceof Error) {
+          errorMessage = innerErr.message;
+        } else if (typeof innerErr === 'string') {
+          errorMessage = innerErr;
+        } else if (innerErr && typeof innerErr === 'object') {
+          errorMessage = (innerErr as any).message || (innerErr as any).error || JSON.stringify(innerErr);
+        }
+        
+        console.error('Chat stream error:', innerErr);
+        setError(errorMessage);
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === assistantMessage.id
+              ? { ...message, content: `${message.content}\n\n❌ **Ошибка:** ${errorMessage}` }
+              : message
+          )
+        );
+        setProgressByMessage((prev) => ({
+          ...prev,
+          [assistantMessage.id]: {
+            ...prev[assistantMessage.id],
+            status: 'Error',
+            step: 'error',
+            error: errorMessage,
+            isComplete: true,
+          },
+        }));
+      }
     } catch (err) {
+      // Handle errors from the outer try (setup, timeout, etc.)
       let errorMessage = 'Chat request failed';
       if (err instanceof Error) {
         errorMessage = err.message;
       } else if (typeof err === 'string') {
         errorMessage = err;
       } else if (err && typeof err === 'object') {
-        // Try to extract error message from object
         errorMessage = (err as any).message || (err as any).error || JSON.stringify(err);
       }
       
-      console.error('Chat stream error:', err);
+      console.error('Chat setup error:', err);
       setError(errorMessage);
-      setMessages((prev) =>
-        prev.map((message) =>
-          message.id === assistantMessage.id
-            ? { ...message, content: `${message.content}\n\n❌ **Ошибка:** ${errorMessage}` }
-            : message
-        )
-      );
-      setProgressByMessage((prev) => ({
-        ...prev,
-        [assistantMessage.id]: {
-          ...prev[assistantMessage.id],
-          status: 'Error',
-          step: 'error',
-          error: errorMessage,
-          isComplete: true,
-        },
-      }));
+      setIsStreaming(false);
     } finally {
       // CRITICAL: Clear timeout and reset streaming state
-      try {
-        if (typeof streamTimeout !== 'undefined') {
-          clearTimeout(streamTimeout);
-        }
-      } catch (e) {
-        // Ignore errors clearing timeout
+      if (streamTimeout !== null) {
+        clearTimeout(streamTimeout);
       }
       setIsStreaming(false);
       // CRITICAL: Don't clear sessionId on error - keep it for reconnection
