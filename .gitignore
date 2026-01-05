@@ -213,3 +213,5 @@ memory_files/
 !memory_files/.gitkeep
 __pycache__/
 *.pyc
+archive/
+cursor_docs/
