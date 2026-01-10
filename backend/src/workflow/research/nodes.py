@@ -446,16 +446,39 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
                    result_length=len(deep_search_result) if deep_search_result else 0,
                    result_preview=deep_search_result[:200] if deep_search_result else "")
     
-    # Analyze if clarification is needed
-    # Deep search result is already a synthesized answer, use it fully for context
-    from src.utils.text import summarize_text
-    deep_search_summary = summarize_text(deep_search_result, 1000) if deep_search_result and len(deep_search_result) > 1000 else deep_search_result
-    deep_search_context = f"\n\nDeep search provided this context:\n{deep_search_summary}" if deep_search_summary else ""
+    # Extract original user message (first user message before deep search/clarification)
+    original_user_message = ""
+    if chat_history:
+        for msg in chat_history:
+            if msg.get("role") == "user":
+                # Check if this is before any deep search or clarification
+                msg_idx = chat_history.index(msg)
+                has_deep_search_or_clarification_before = False
+                for prev_msg in chat_history[:msg_idx]:
+                    if prev_msg.get("role") == "assistant":
+                        content = prev_msg.get("content", "").lower()
+                        if ("deep search" in content or "clarification" in content or "🔍" in content or "clarify" in content or 
+                            "initial deep search context" in content or "deep search completed" in content):
+                            has_deep_search_or_clarification_before = True
+                            break
+                if not has_deep_search_or_clarification_before:
+                    original_user_message = msg.get("content", "")
+                    break
+    
+    # Use original user message if found, otherwise use query from state
+    user_message_for_context = original_user_message if original_user_message else query
+    logger.info("Original user message extracted", 
+               has_original=bool(original_user_message),
+               message_preview=user_message_for_context[:100])
+    
+    # Use full deep search result (not summary) so LLM sees everything
+    deep_search_context = f"\n\n**DEEP SEARCH RESULT:**\n{deep_search_result}" if deep_search_result else ""
     logger.info("Deep search context prepared", context_length=len(deep_search_context))
     
     prompt = f"""Generate clarifying questions about the research topic and approach.
 
-Query: {query}
+**ORIGINAL USER MESSAGE:**
+{user_message_for_context}
 {deep_search_context}
 
 You MUST always generate 2-3 clarifying questions about:
@@ -466,18 +489,25 @@ You MUST always generate 2-3 clarifying questions about:
 These questions help guide the research direction and ensure comprehensive coverage.
 Even if the query seems clear, ask questions to refine the research approach.
 
+**CRITICAL: LANGUAGE REQUIREMENT**
+- You MUST write all questions in the SAME LANGUAGE as the original user message above
+- If the user wrote in Russian, write questions in Russian
+- If the user wrote in English, write questions in English
+- Match the user's language exactly
+
 IMPORTANT: You MUST always return at least 2 questions in the questions list, even if the query seems clear.
 Set needs_clarification=True and provide meaningful questions that help improve research quality.
 
 Format questions with:
-- question: The actual question
-- why_needed: Why this clarification helps improve research
-- default_assumption: What we'll assume if not answered
+- question: The actual question (in the same language as the user's message)
+- why_needed: Why this clarification helps improve research (in the same language as the user's message)
+- default_assumption: What we'll assume if not answered (in the same language as the user's message)
 """
     
     try:
+        system_prompt = "You are a research planning expert. You MUST always generate clarifying questions to help improve research quality. CRITICAL: Write all questions in the SAME LANGUAGE as the user's original message - match their language exactly."
         clarification = await llm.with_structured_output(ClarificationNeeds).ainvoke([
-            {"role": "system", "content": "You are a research planning expert. You MUST always generate clarifying questions to help improve research quality."},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ])
         

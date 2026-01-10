@@ -3,8 +3,8 @@
 These schemas are used by ChatSearchService for web and deep search modes.
 """
 
-from typing import Literal
-from pydantic import BaseModel, Field
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class QueryRewrite(BaseModel):
@@ -57,6 +57,13 @@ class FollowupQueries(BaseModel):
 
 class SummarizedContent(BaseModel):
     """Structured output for content summarization."""
+    
+    model_config = ConfigDict(
+        # Force key_points to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["summary", "key_points"]
+        }
+    )
 
     summary: str = Field(
         ...,
@@ -72,6 +79,14 @@ class SummarizedContent(BaseModel):
 
 class SynthesizedAnswer(BaseModel):
     """Structured output for answer synthesis."""
+    
+    model_config = ConfigDict(
+        # Force key_points to be in required array for Azure/OpenRouter compatibility
+        # Even though it has a default, some providers require all properties in required
+        json_schema_extra={
+            "required": ["reasoning", "answer", "key_points"]
+        }
+    )
 
     reasoning: str = Field(..., description="Why the answer follows from the evidence")
 
@@ -81,6 +96,7 @@ class SynthesizedAnswer(BaseModel):
         min_length=100
     )
 
+    # key_points has default but must be in required array for Azure/OpenRouter
     key_points: list[str] = Field(
         default_factory=list,
         description="Key points in the answer"

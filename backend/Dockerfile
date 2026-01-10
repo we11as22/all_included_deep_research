@@ -21,6 +21,8 @@ RUN apt-get update -o Acquire::Retries=3 && apt-get install -y --no-install-reco
     gnupg \
     ca-certificates \
     fonts-liberation \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
     libasound2 \
     libatk-bridge2.0-0 \
     libatk1.0-0 \

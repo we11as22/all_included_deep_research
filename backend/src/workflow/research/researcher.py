@@ -251,20 +251,24 @@ Expertise: {expertise}
 Personality: {personality}
 Character: {character}
 
-**ORIGINAL USER QUERY:** {original_query}
-{clarification_context}
 **IMPORTANT: Respond in {user_language} whenever generating text for the user.**
+
+**CRITICAL: YOU DO NOT HAVE ACCESS TO THE ORIGINAL USER QUERY OR CHAT HISTORY**
+- You ONLY see the task assigned to you below
+- Use the task description to understand what you need to research
+- The task objective and guidance contain all the context you need
 
 Current task: {current_task.title}
 Objective: {current_task.objective}
+Guidance: {current_task.note if hasattr(current_task, 'note') else 'No specific guidance provided'}
 
 Research plan:
 Goal: {plan.current_goal}
 Next steps: {', '.join(plan.next_steps)}
 Strategy: {plan.search_strategy}
 
-**INITIAL DEEP SEARCH CONTEXT:**
-{deep_search_result[:1500] if deep_search_result else "No initial deep search context available."}
+**NOTE: You do NOT have access to the original user query or chat history.**
+**Your task description above contains all the context you need to complete this research.**
 
 **CRITICAL: When you find information, provide DETAILED, COMPREHENSIVE summaries with full context, not just links.**
 - Include specific facts, data, and insights in your summaries
@@ -314,10 +318,38 @@ Available actions:
 - Don't repeat the same query multiple times - reformulate it with different keywords or phrasing
 - Try different angles: synonyms, related terms, more specific or more general queries
 - Example: If "ВВС Германии" gives irrelevant results, try "Luftwaffe техника", "немецкая военная авиация", "современные самолеты Германии"
-- You have up to {max_steps} steps - use them wisely to try different search approaches
-- If after 2-3 different search attempts you still don't find relevant results, signal done() and report what you found (even if limited)
+- You have up to {max_steps} steps - use them ALL to thoroughly investigate the topic from multiple angles
+- **MANDATORY**: Use your full step limit to dig DEEP - don't stop after finding basic information
 
-Be thorough, cite sources with links, and fulfill the objective. Go DEEP, not just surface-level!
+**CRITICAL: VERIFICATION AND DEEP RESEARCH REQUIREMENTS:**
+- **MANDATORY**: All important claims, facts, and data MUST be verified in MULTIPLE independent sources
+- Never rely on a single source - always cross-reference important information
+- If you find a key fact or claim, search for it in different sources to verify accuracy
+- **DIG DEEP**: Don't stop at surface-level information - investigate:
+  * Technical specifications and detailed parameters
+  * Expert opinions and critical analysis from multiple perspectives
+  * Historical context and evolution
+  * Real-world case studies and practical applications
+  * Comparative analysis with alternatives
+  * Controversial aspects and different viewpoints
+- **VERIFICATION STRATEGY**: For each important finding:
+  1. Find the information in the first source
+  2. Search for the same information in 2-3 additional independent sources
+  3. Compare findings - note any discrepancies or different perspectives
+  4. Document all sources that confirm or contradict the finding
+- **DEEP DIVE**: When you find interesting information, don't just note it - investigate related aspects:
+  * If you find technical specs, also find expert analysis of those specs
+  * If you find historical info, also find current state and future trends
+  * If you find one perspective, also find alternative or critical viewpoints
+  * If you find general info, dig into specific examples and case studies
+- **USE ALL YOUR STEPS**: You have {max_steps} steps - use them to thoroughly research, verify, and cross-reference information
+- Only signal done() when you have:
+  * Verified important claims in multiple sources
+  * Explored the topic from multiple angles
+  * Found specific examples, case studies, and detailed information
+  * Cross-referenced key findings across different sources
+
+Be thorough, cite sources with links, verify everything in multiple sources, and fulfill the objective. Go DEEP, not just surface-level!
 """
 
     agent_history.append({

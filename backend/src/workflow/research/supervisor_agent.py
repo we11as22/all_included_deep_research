@@ -440,16 +440,16 @@ async def update_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         updated = False
         for todo in current_todos:
             if todo.title == todo_title:
-                # Update fields if provided
-                if "status" in args and args["status"]:
+                # Update fields if provided (ignore empty strings from defaults)
+                if "status" in args and args.get("status"):
                     todo.status = args["status"]
-                if "objective" in args and args["objective"]:
+                if "objective" in args and args.get("objective"):
                     todo.objective = args["objective"]
-                if "expected_output" in args and args["expected_output"]:
+                if "expected_output" in args and args.get("expected_output"):
                     todo.expected_output = args["expected_output"]
-                if "guidance" in args and args["guidance"]:
+                if "guidance" in args and args.get("guidance"):
                     todo.note = args["guidance"]
-                if "priority" in args and args["priority"]:
+                if "priority" in args and args.get("priority"):
                     todo.priority = args["priority"]
                 if "reasoning" in args and args["reasoning"]:
                     todo.reasoning = args["reasoning"]
@@ -589,7 +589,8 @@ class SupervisorToolsRegistry:
                         "default": 5000
                     }
                 },
-                "required": []
+                # Azure/OpenRouter require all properties to be in required array
+                "required": ["max_length"]
             },
             "handler": read_main_document_handler
         },
@@ -651,7 +652,8 @@ class SupervisorToolsRegistry:
                         "default": 10000
                     }
                 },
-                "required": []
+                # Azure/OpenRouter require all properties to be in required array
+                "required": ["max_length"]
             },
             "handler": read_draft_report_handler
         },
@@ -668,7 +670,8 @@ class SupervisorToolsRegistry:
                         "default": 5000
                     }
                 },
-                "required": []
+                # Azure/OpenRouter require all properties to be in required array
+                "required": ["max_length"]
             },
             "handler": read_supervisor_file_handler
         },
@@ -694,9 +697,13 @@ class SupervisorToolsRegistry:
             "name": "create_agent_todo",
             "description": "Create a new todo task for a specific research agent. "
                           "Use this to assign new research tasks or follow-up investigations. "
-                          "CRITICAL: Ensure each agent gets DIFFERENT tasks covering different aspects "
+                          "CRITICAL: Researcher agents DO NOT have access to the original user query or chat history - "
+                          "they ONLY see the task you assign. You MUST provide COMPREHENSIVE, EXHAUSTIVE task descriptions "
+                          "that include full context, specific details, and background information. "
+                          "Ensure each agent gets DIFFERENT tasks covering different aspects "
                           "(history, technical, expert views, applications, trends, comparisons, impact, challenges) "
-                          "to build a complete picture. Avoid duplicate/overlapping tasks between agents.",
+                          "to build a complete picture. Avoid duplicate/overlapping tasks between agents. "
+                          "ACTIVELY create multiple follow-up tasks to promote deep research and verification.",
             "args_schema": {
                 "type": "object",
                 "properties": {
@@ -714,11 +721,11 @@ class SupervisorToolsRegistry:
                     },
                     "objective": {
                         "type": "string",
-                        "description": "What the agent should achieve"
+                        "description": "What the agent should achieve. MUST be COMPREHENSIVE and include: full context about the user's query, specific aspect to research, why this is important, and any background information needed. The agent has NO access to dialogue context!"
                     },
                     "expected_output": {
                         "type": "string",
-                        "description": "Expected result format"
+                        "description": "Expected result format. Be specific about what kind of information is needed (technical specs, expert opinions, case studies, etc.)"
                     },
                     "priority": {
                         "type": "string",
@@ -728,10 +735,11 @@ class SupervisorToolsRegistry:
                     },
                     "guidance": {
                         "type": "string",
-                        "description": "Specific guidance on how to approach this task"
+                        "description": "Specific guidance on how to approach this task. MUST include: context about the original user query, what specific information to find, how to verify findings in multiple sources, and what aspects to investigate deeply."
                     }
                 },
-                "required": ["agent_id", "title", "objective", "expected_output"]
+                # Azure/OpenRouter require all properties to be in required array
+                "required": ["agent_id", "title", "objective", "expected_output", "priority", "guidance", "reasoning"]
             },
             "handler": create_agent_todo_handler
         },
@@ -754,31 +762,38 @@ class SupervisorToolsRegistry:
                     "status": {
                         "type": "string",
                         "description": "New status (pending, in_progress, done)",
-                        "enum": ["pending", "in_progress", "done"]
+                        "enum": ["pending", "in_progress", "done"],
+                        "default": ""
                     },
                     "objective": {
                         "type": "string",
-                        "description": "Updated objective"
+                        "description": "Updated objective",
+                        "default": ""
                     },
                     "expected_output": {
                         "type": "string",
-                        "description": "Updated expected result format"
+                        "description": "Updated expected result format",
+                        "default": ""
                     },
                     "guidance": {
                         "type": "string",
-                        "description": "Updated guidance on how to approach this task"
+                        "description": "Updated guidance on how to approach this task",
+                        "default": ""
                     },
                     "priority": {
                         "type": "string",
                         "description": "Updated priority: high/medium/low",
-                        "enum": ["high", "medium", "low"]
+                        "enum": ["high", "medium", "low"],
+                        "default": ""
                     },
                     "reasoning": {
                         "type": "string",
-                        "description": "Updated reasoning for why this task is needed"
+                        "description": "Updated reasoning for why this task is needed",
+                        "default": ""
                     }
                 },
-                "required": ["agent_id", "todo_title"]
+                # Azure/OpenRouter require all properties to be in required array
+                "required": ["agent_id", "todo_title", "status", "objective", "expected_output", "guidance", "priority", "reasoning"]
             },
             "handler": update_agent_todo_handler
         },
@@ -1113,11 +1128,34 @@ CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
 - From diverse agent findings, you will assemble a COMPLETE, comprehensive picture
 - If multiple agents research the same aspect, redirect them to different angles
 
+**CRITICAL: RESEARCHER AGENTS HAVE NO DIALOGUE CONTEXT!**
+- **MANDATORY**: Researcher agents DO NOT have access to the original user query or chat history
+- They ONLY see the task you assign them (title, objective, expected_output, guidance)
+- **YOU MUST provide COMPREHENSIVE, EXHAUSTIVE task descriptions** that include:
+  * Full context about what the user asked for
+  * Specific details about what aspect to research
+  * What kind of information is needed (technical specs, expert opinions, case studies, etc.)
+  * Why this research is important for answering the user's query
+  * Any relevant background information they need to understand the task
+- When creating todos, write DETAILED objectives and guidance that make the task completely self-contained
+- Include the original user query context in the task description so agents understand what they're researching
+- Example of GOOD task: "Research technical specifications of [topic] mentioned in user query '[original query]'. Find detailed technical parameters, performance characteristics, and expert analysis. The user wants comprehensive information about this aspect."
+- Example of BAD task: "Research [topic]" (too vague, no context)
+
 CRITICAL: Your agents must go DEEP, not just surface-level!
-- If an agent only provides basic/general information, create a todo forcing them to dig into SPECIFIC details
-- Examples of deep research: technical specifications, expert analysis, case studies, historical context, advanced features, industry trends
+- **ACTIVELY PROMOTE DEEP DIVE RESEARCH** - constantly create additional tasks for agents to dig deeper into different aspects
+- If an agent only provides basic/general information, create MULTIPLE todos forcing them to dig into SPECIFIC details from different angles
+- **PROACTIVELY assign follow-up tasks** to explore deeper questions, verify findings, and investigate related aspects
+- Examples of deep research: technical specifications, expert analysis, case studies, historical context, advanced features, industry trends, comparative analysis, critical perspectives
 - Examples of shallow research: basic definitions, general overviews, simple facts
-- When creating todos, explicitly instruct agents to find: technical details, expert opinions, real-world examples, advanced features, specific data
+- When creating todos, explicitly instruct agents to find: technical details, expert opinions, real-world examples, advanced features, specific data, multiple sources for verification
+- **STRATEGY**: Break down complex topics into multiple deep-dive tasks - assign different aspects to different agents or create sequential tasks for the same agent
+- **MANDATORY**: After agents complete initial tasks, review their findings and create ADDITIONAL tasks to:
+  * Verify important claims in multiple independent sources
+  * Investigate related aspects that emerged from initial research
+  * Dig deeper into specific technical details or expert perspectives
+  * Explore alternative viewpoints or controversial aspects
+  * Find real-world case studies and practical applications
 
 Available tools:
 - read_supervisor_file: Read YOUR personal file (agents/supervisor.md) with your notes and observations
@@ -1142,10 +1180,18 @@ CRITICAL WORKFLOW:
 4. Add only KEY INSIGHTS to main.md (not all items - items stay in items/ directory) - ONLY essential shared information
 5. Check each agent's progress - ensure they cover DIFFERENT aspects
 6. **CRITICAL**: 
-   - If findings are basic, create todos forcing deeper research with specific instructions
+   - **ACTIVELY PROMOTE DEEP RESEARCH** - constantly create additional tasks for deeper investigation
+   - If findings are basic, create MULTIPLE todos forcing deeper research with specific, detailed instructions
+   - **PROACTIVELY assign follow-up tasks** to verify findings in multiple sources and explore related aspects
    - If agents overlap, redirect them to DIFFERENT angles to build complete picture
    - Ensure comprehensive coverage: history, technical, expert views, applications, trends, comparisons, impact, challenges
+   - **After agents complete tasks, review findings and create ADDITIONAL tasks** to:
+     * Verify important claims in multiple independent sources
+     * Investigate deeper aspects that emerged from initial research
+     * Explore different angles and perspectives on the same topic
+     * Find case studies, real-world examples, and practical applications
    - **OPTIMAL**: Use update_agent_todo to refine existing tasks when agents need more specific instructions or when research direction changes
+   - **STRATEGY**: Break complex topics into multiple deep-dive tasks - don't stop at surface-level findings
 7. **MANDATORY: You MUST call at least ONE tool on EVERY iteration** - never return empty tool_calls!
    - If you need to review findings: call read_draft_report, read_main_document, or review_agent_progress
    - **After reviewing agent findings, you MUST call write_draft_report** to synthesize their findings

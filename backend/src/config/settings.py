@@ -175,7 +175,7 @@ class Settings(BaseSettings):
     
     # Deep Research Limits (centralized configuration)
     deep_research_max_supervisor_calls: int = Field(default=6, description="Max supervisor calls in deep research")  # Old value: 10
-    deep_research_agent_max_steps: int = Field(default=5, description="Max steps per agent task in deep research")  # Old value: 8
+    deep_research_agent_max_steps: int = Field(default=10, description="Max steps per agent task in deep research")  # Increased for deeper research
     deep_research_supervisor_max_iterations: int = Field(default=10, description="Max ReAct iterations for supervisor agent")  # Old value: 15 (was increased from 10)
     deep_research_default_max_iterations: int = Field(default=15, description="Default max iterations for deep research cycles")  # Old value: 25
 

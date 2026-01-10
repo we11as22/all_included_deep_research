@@ -1,6 +1,7 @@
 """PDF generation utility for research reports."""
 
 import re
+import os
 from io import BytesIO
 from typing import Any
 
@@ -12,8 +13,108 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.platypus import Paragraph, Spacer, SimpleDocTemplate, PageBreak, Table, TableStyle
 from reportlab.platypus.flowables import HRFlowable
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 
 logger = structlog.get_logger(__name__)
+
+# Register Unicode-compatible fonts
+# Try to use system fonts or fallback to built-in fonts
+_UNICODE_FONT_REGISTERED = False
+
+def _register_unicode_fonts():
+    """Register Unicode-compatible fonts for PDF generation."""
+    global _UNICODE_FONT_REGISTERED
+    if _UNICODE_FONT_REGISTERED:
+        return
+    
+    # Try to find and register DejaVu Sans (common Unicode font)
+    font_paths = [
+        # Linux common paths
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/TTF/DejaVuSans.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans.ttf',
+        # macOS common paths
+        '/Library/Fonts/Arial Unicode.ttf',
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+        # Windows common paths
+        'C:/Windows/Fonts/arial.ttf',
+        'C:/Windows/Fonts/arialuni.ttf',
+    ]
+    
+    bold_font_paths = [
+        # Linux common paths
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/TTF/DejaVuSans-Bold.ttf',
+        '/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf',
+        # macOS common paths
+        '/Library/Fonts/Arial Unicode.ttf',  # Arial Unicode supports bold
+        '/System/Library/Fonts/Supplemental/Arial Unicode.ttf',
+        # Windows common paths
+        'C:/Windows/Fonts/arialbd.ttf',
+        'C:/Windows/Fonts/arialuni.ttf',
+    ]
+    
+    font_registered = False
+    base_font_path = None
+    
+    # Find base font
+    for font_path in font_paths:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(TTFont('UnicodeFont', font_path))
+                base_font_path = font_path
+                font_registered = True
+                logger.info("Registered Unicode font", path=font_path)
+                break
+            except Exception as e:
+                logger.warning("Failed to register font", path=font_path, error=str(e))
+                continue
+    
+    # Find bold font
+    if font_registered and base_font_path:
+        bold_registered = False
+        for bold_path in bold_font_paths:
+            if os.path.exists(bold_path):
+                try:
+                    pdfmetrics.registerFont(TTFont('UnicodeFont-Bold', bold_path))
+                    bold_registered = True
+                    logger.info("Registered Unicode bold font", path=bold_path)
+                    break
+                except Exception as e:
+                    logger.warning("Failed to register bold font", path=bold_path, error=str(e))
+                    continue
+        
+        # If bold font not found, use base font for bold (will be rendered as regular)
+        if not bold_registered:
+            try:
+                pdfmetrics.registerFont(TTFont('UnicodeFont-Bold', base_font_path))
+                logger.info("Using base font for bold variant")
+            except Exception:
+                pass
+    
+    # If no system font found, try to use ReportLab's built-in Unicode support
+    if not font_registered:
+        try:
+            # Use ReportLab's built-in Unicode font support via CID fonts
+            # This should work for most Unicode characters including Cyrillic
+            from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+            # Try different CID fonts that support Unicode
+            # CID fonts support many Unicode ranges including Cyrillic
+            cid_fonts = ['SimSun', 'STSong-Light', 'HeiseiMin-W3', 'HeiseiKakuGo-W5']
+            for cid_font in cid_fonts:
+                try:
+                    pdfmetrics.registerFont(UnicodeCIDFont(cid_font))
+                    font_registered = True
+                    logger.info("Using ReportLab built-in Unicode CID font", font=cid_font)
+                    break
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.warning("Failed to register built-in Unicode font", error=str(e))
+            # Last resort: will use Helvetica (may show squares for unsupported characters)
+    
+    _UNICODE_FONT_REGISTERED = True
 
 
 def _extract_sources_from_report(report: str) -> dict[int, tuple[str, str]]:
@@ -91,6 +192,9 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     Returns:
         BytesIO buffer containing PDF data
     """
+    # Register Unicode fonts first
+    _register_unicode_fonts()
+    
     buffer = BytesIO()
     
     # Extract sources for citation linking
@@ -129,13 +233,33 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         # Python >= 3.7: UTF-8 is default
         pass
     
+    # Determine which font to use
+    # Try to use registered Unicode font, fallback to Helvetica
+    registered_fonts = pdfmetrics.getRegisteredFontNames()
+    
+    # Check for TTF Unicode fonts first
+    if 'UnicodeFont' in registered_fonts:
+        unicode_font_name = 'UnicodeFont'
+        unicode_bold_font_name = 'UnicodeFont-Bold' if 'UnicodeFont-Bold' in registered_fonts else 'UnicodeFont'
+    # Check for CID fonts (they register with their own names)
+    elif any(font in registered_fonts for font in ['SimSun', 'STSong-Light', 'HeiseiMin-W3', 'HeiseiKakuGo-W5']):
+        # Use the first CID font found
+        cid_font = next((f for f in ['SimSun', 'STSong-Light', 'HeiseiMin-W3', 'HeiseiKakuGo-W5'] if f in registered_fonts), 'SimSun')
+        unicode_font_name = cid_font
+        unicode_bold_font_name = cid_font  # CID fonts don't have separate bold variants
+    else:
+        # Fallback to Helvetica (may show squares for unsupported characters)
+        unicode_font_name = 'Helvetica'
+        unicode_bold_font_name = 'Helvetica-Bold'
+    
     # Styles
     styles = getSampleStyleSheet()
     
-    # Custom styles
+    # Custom styles with Unicode font support
     title_style = ParagraphStyle(
         'CustomTitle',
         parent=styles['Heading1'],
+        fontName=unicode_font_name,
         fontSize=18,
         textColor=colors.HexColor('#1a1a1a'),
         spaceAfter=12,
@@ -145,6 +269,7 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     heading1_style = ParagraphStyle(
         'CustomHeading1',
         parent=styles['Heading1'],
+        fontName=unicode_bold_font_name,
         fontSize=16,
         textColor=colors.HexColor('#2c3e50'),
         spaceAfter=12,
@@ -154,6 +279,7 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     heading2_style = ParagraphStyle(
         'CustomHeading2',
         parent=styles['Heading2'],
+        fontName=unicode_bold_font_name,
         fontSize=14,
         textColor=colors.HexColor('#34495e'),
         spaceAfter=10,
@@ -163,6 +289,7 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     body_style = ParagraphStyle(
         'CustomBody',
         parent=styles['BodyText'],
+        fontName=unicode_font_name,
         fontSize=11,
         textColor=colors.HexColor('#333333'),
         spaceAfter=6,
@@ -172,6 +299,7 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     link_style = ParagraphStyle(
         'LinkStyle',
         parent=body_style,
+        fontName=unicode_font_name,
         textColor=colors.HexColor('#0066cc'),
         underline=True,
     )
@@ -340,12 +468,12 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                     ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f0f0f0')),
                     ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#333333')),
                     ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTNAME', (0, 0), (-1, 0), unicode_bold_font_name),
                     ('FONTSIZE', (0, 0), (-1, 0), 10),
                     ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
                     ('BACKGROUND', (0, 1), (-1, -1), colors.white),
                     ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#333333')),
-                    ('FONTNAME', (0, 1), (-1, -1), 'Helvetica'),
+                    ('FONTNAME', (0, 1), (-1, -1), unicode_font_name),
                     ('FONTSIZE', (0, 1), (-1, -1), 9),
                     ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e0e0e0')),
                     ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9f9f9')]),

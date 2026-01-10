@@ -1,7 +1,7 @@
 """Pydantic models for deep research workflow structured outputs."""
 
 from typing import Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ==================== Query Analysis ====================
@@ -40,6 +40,13 @@ class ResearchPlan(BaseModel):
 
 class AgentTodo(BaseModel):
     """Individual todo item for agent."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "title", "objective", "expected_output", "sources_needed", "priority"]
+        }
+    )
 
     reasoning: str = Field(description="Why this task is important")
     title: str = Field(description="Task title", min_length=5)
@@ -83,6 +90,13 @@ class AgentPlan(BaseModel):
 
 class AgentReflection(BaseModel):
     """Agent's reflection on research progress."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "progress_assessment", "findings_quality", "should_replan", "new_direction", "ready_for_next_task"]
+        }
+    )
 
     reasoning: str = Field(description="Analysis of current progress and obstacles")
     progress_assessment: Literal["on_track", "needs_adjustment", "stuck", "complete"] = Field(
@@ -100,6 +114,13 @@ class AgentReflection(BaseModel):
 
 class ResearchGap(BaseModel):
     """Identified gap in research coverage."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["gap_description", "severity", "suggested_action", "assign_to_agent"]
+        }
+    )
 
     gap_description: str = Field(description="What is missing")
     severity: Literal["critical", "important", "minor"] = Field(description="Gap severity")
@@ -109,6 +130,13 @@ class ResearchGap(BaseModel):
 
 class AgentDirective(BaseModel):
     """New directive/todo for an agent from supervisor."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "title", "objective", "expected_output", "priority", "guidance"]
+        }
+    )
 
     reasoning: str = Field(description="Why this task is needed")
     title: str = Field(description="Task title")
@@ -120,6 +148,13 @@ class AgentDirective(BaseModel):
 
 class SupervisorAssessment(BaseModel):
     """Supervisor's assessment of research progress."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "overall_progress", "gaps_found", "quality_assessment", "should_continue", "completion_criteria_met", "agent_directives", "main_document_update"]
+        }
+    )
 
     reasoning: str = Field(description="Detailed analysis of all agents' work and overall progress")
     overall_progress: int = Field(description="Overall progress percentage", ge=0, le=100)
@@ -140,6 +175,13 @@ class SupervisorAssessment(BaseModel):
 
 class ReportSection(BaseModel):
     """Section of the final report."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["title", "content", "sources"]
+        }
+    )
 
     title: str = Field(description="Section title")
     content: str = Field(description="Detailed section content in markdown (300-800 words, comprehensive analysis with specific facts, data, and evidence)")
@@ -162,6 +204,13 @@ class FinalReport(BaseModel):
 
 class ReportValidation(BaseModel):
     """Validation of report before submission."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "is_complete", "quality_score", "missing_aspects", "needs_revision", "revision_suggestions"]
+        }
+    )
 
     reasoning: str = Field(description="Analysis of report completeness and quality")
     is_complete: bool = Field(description="Whether report covers all required aspects")
@@ -183,6 +232,13 @@ class ClarifyingQuestion(BaseModel):
 
 class ClarificationNeeds(BaseModel):
     """Assessment of whether clarification is needed."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "needs_clarification", "questions", "can_proceed_without"]
+        }
+    )
 
     reasoning: str = Field(description="Analysis of query clarity")
     needs_clarification: bool = Field(description="Whether user input is needed")

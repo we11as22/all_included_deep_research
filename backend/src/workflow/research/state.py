@@ -6,7 +6,7 @@ Defines the state structure for the multi-agent research system.
 import operator
 from typing import Annotated, Any, TypedDict
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ==================== State Schema ====================
@@ -94,6 +94,13 @@ class ResearchState(TypedDict):
 
 class ResearchTopic(BaseModel):
     """Single research topic."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "topic", "description", "priority"]
+        }
+    )
 
     reasoning: str = Field(description="Why this topic is important")
     topic: str = Field(description="Research topic title")
@@ -103,6 +110,13 @@ class ResearchTopic(BaseModel):
 
 class ResearchPlan(BaseModel):
     """Initial research plan from supervisor."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "topics", "stop"]
+        }
+    )
 
     reasoning: str = Field(description="Overall research strategy")
     topics: list[ResearchTopic] = Field(description="List of research topics")
@@ -111,6 +125,13 @@ class ResearchPlan(BaseModel):
 
 class SupervisorReActOutput(BaseModel):
     """Supervisor's reaction after agent actions."""
+    
+    model_config = ConfigDict(
+        # Force all fields to be in required array for Azure/OpenRouter compatibility
+        json_schema_extra={
+            "required": ["reasoning", "should_continue", "replanning_needed", "directives", "new_topics", "gaps_identified"]
+        }
+    )
 
     reasoning: str = Field(description="Analysis of current research state")
     should_continue: bool = Field(description="Whether research should continue")

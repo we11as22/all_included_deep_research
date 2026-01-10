@@ -7,13 +7,21 @@ const nextConfig = {
     domains: ['localhost'],
   },
   async rewrites() {
-    // In Docker, use backend service name; otherwise use localhost or env var
-    // Use 127.0.0.1 instead of localhost to avoid IPv6 issues
-    const backendUrl = process.env.NEXT_PUBLIC_API_URL 
-      ? process.env.NEXT_PUBLIC_API_URL 
-      : process.env.NODE_ENV === 'production' 
-        ? 'http://backend:8000'
-        : 'http://127.0.0.1:8000';
+    // For SSR (server-side), try to use Docker internal hostname first
+    // Fallback to NEXT_PUBLIC_API_URL or localhost
+    // This allows the app to work both in Docker and locally
+    let backendUrl;
+    
+    // Check if we have a specific backend URL for SSR
+    if (process.env.BACKEND_URL) {
+      backendUrl = process.env.BACKEND_URL;
+    } else if (process.env.NODE_ENV === 'production') {
+      // In production (Docker), try internal hostname first
+      backendUrl = 'http://backend:8000';
+    } else {
+      // Development or fallback
+      backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000';
+    }
     
     return [
       {

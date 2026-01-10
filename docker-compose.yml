@@ -108,7 +108,11 @@ services:
     depends_on:
       - backend
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:8000
+      # For browser clients, use the public server IP or localhost
+      # This will be auto-detected by socket.ts if needed
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+      # For SSR (server-side), use Docker internal hostname
+      BACKEND_URL: http://backend:8000
       NODE_ENV: production
       NEXT_PUBLIC_DEBUG_MODE: ${NEXT_PUBLIC_DEBUG_MODE:-false}
     ports:

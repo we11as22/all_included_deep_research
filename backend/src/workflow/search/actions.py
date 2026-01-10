@@ -219,8 +219,18 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
             # Step 1: Scrape URL
             content = await scraper.scrape(url)
 
-            # Extract full content
-            full_content = content.content if hasattr(content, "content") else ""
+            # Extract content - prefer markdown if available, fallback to plain text
+            # Step 1: Try markdown first (better structure for LLM)
+            full_content = None
+            if hasattr(content, "markdown") and content.markdown:
+                full_content = content.markdown
+                logger.debug(f"Using markdown content for summarization", url=url)
+            
+            # Step 2: Fallback to plain text content
+            if not full_content:
+                full_content = content.content if hasattr(content, "content") else ""
+                logger.debug(f"Using plain text content for summarization", url=url)
+            
             title = content.title if hasattr(content, "title") else ""
 
             # Step 2: Summarize content in parallel with other URLs
@@ -353,7 +363,8 @@ def register_actions():
                     "default": 5,
                 },
             },
-            "required": ["queries"],
+            # Azure/OpenRouter require all properties to be in required array
+            "required": ["queries", "max_results"],
         },
         handler=web_search_handler,
     )
