@@ -193,12 +193,19 @@ async def _run_researcher_agent_impl(
         stream.emit_agent_todo(agent_id, todos_dict)
 
     # Create research plan with structured output
+    # Extract user query from task if present (it should be there per supervisor instructions)
+    task_guidance = current_task.note if hasattr(current_task, 'note') and current_task.note else ""
+    task_objective = current_task.objective if hasattr(current_task, 'objective') else ""
+    
     plan_prompt = f"""You are {role} with expertise in {expertise}.
 
 Current task: {current_task.title}
 Objective: {current_task.objective}
+Guidance: {task_guidance}
 Expected output: {current_task.expected_output}
-Sources needed: {', '.join(current_task.sources_needed)}
+Sources needed: {', '.join(current_task.sources_needed) if hasattr(current_task, 'sources_needed') and current_task.sources_needed else 'Various reliable sources'}
+
+**CRITICAL**: The task objective and guidance above contain all the context you need. If the task mentions a user query (e.g., "The user asked: ..."), that is the specific topic you must research. Focus your research plan on exactly what is described in the task.
 
 Create a detailed research plan for completing this task.
 """
@@ -225,25 +232,10 @@ Create a detailed research plan for completing this task.
     notes = []
     agent_history = []
 
-    # Get original user query and context from state
-    original_query = state.get("query", "")
+    # Get user language from state (needed for response language)
     user_language = state.get("user_language", "English")
-    deep_search_result_raw = state.get("deep_search_result", "")
-    if isinstance(deep_search_result_raw, dict):
-        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
-    else:
-        deep_search_result = deep_search_result_raw or ""
-    
-    # Extract user clarification answers from chat history
-    clarification_context = ""
-    chat_history = state.get("chat_history", [])
-    if chat_history:
-        for i, msg in enumerate(chat_history):
-            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
-                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
-                    user_answer = chat_history[i + 1].get("content", "")
-                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n"
-                    break
+    # NOTE: We don't extract original_query, deep_search_result, or clarification_context here
+    # because researchers should NOT see them - they only see the task description
 
     system_prompt = f"""You are {role}.
 
@@ -260,15 +252,18 @@ Character: {character}
 
 Current task: {current_task.title}
 Objective: {current_task.objective}
-Guidance: {current_task.note if hasattr(current_task, 'note') else 'No specific guidance provided'}
+Guidance: {current_task.note if hasattr(current_task, 'note') and current_task.note else 'No specific guidance provided'}
+
+**CRITICAL: READ THE TASK OBJECTIVE AND GUIDANCE CAREFULLY!**
+- The task objective and guidance contain the user's original query and what you need to research
+- If the task mentions "The user asked: ...", that is the specific topic you must focus on
+- Do NOT research generic topics - research exactly what is described in the task!
+- The task description is self-contained and contains all context you need
 
 Research plan:
 Goal: {plan.current_goal}
 Next steps: {', '.join(plan.next_steps)}
 Strategy: {plan.search_strategy}
-
-**NOTE: You do NOT have access to the original user query or chat history.**
-**Your task description above contains all the context you need to complete this research.**
 
 **CRITICAL: When you find information, provide DETAILED, COMPREHENSIVE summaries with full context, not just links.**
 - Include specific facts, data, and insights in your summaries

@@ -44,16 +44,17 @@ class AgentTodo(BaseModel):
     model_config = ConfigDict(
         # Force all fields to be in required array for Azure/OpenRouter compatibility
         json_schema_extra={
-            "required": ["reasoning", "title", "objective", "expected_output", "sources_needed", "priority"]
+            "required": ["reasoning", "title", "objective", "expected_output", "sources_needed", "priority", "guidance"]
         }
     )
 
     reasoning: str = Field(description="Why this task is important")
     title: str = Field(description="Task title", min_length=5)
-    objective: str = Field(description="What should be achieved")
+    objective: str = Field(description="What should be achieved. MUST include the original user query if provided in context.")
     expected_output: str = Field(description="Expected result format")
     sources_needed: list[str] = Field(description="Types of sources to find", default_factory=list)
     priority: Literal["high", "medium", "low"] = Field(default="medium", description="Task priority")
+    guidance: str = Field(description="Specific guidance on how to approach this task. MUST include the original user query and clarification answers if provided.", default="")
 
 
 class AgentCharacteristic(BaseModel):

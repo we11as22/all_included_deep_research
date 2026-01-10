@@ -721,7 +721,7 @@ class SupervisorToolsRegistry:
                     },
                     "objective": {
                         "type": "string",
-                        "description": "What the agent should achieve. MUST be COMPREHENSIVE and include: full context about the user's query, specific aspect to research, why this is important, and any background information needed. The agent has NO access to dialogue context!"
+                        "description": "What the agent should achieve. MUST be COMPREHENSIVE and include: THE ORIGINAL USER QUERY (quote it exactly), specific aspect to research related to that query, why this is important for answering the user's query, and any background information needed. The agent has NO access to dialogue context! Example: 'The user asked: [original query]. Research [specific aspect] because [why it matters for answering the query].'"
                     },
                     "expected_output": {
                         "type": "string",
@@ -735,7 +735,7 @@ class SupervisorToolsRegistry:
                     },
                     "guidance": {
                         "type": "string",
-                        "description": "Specific guidance on how to approach this task. MUST include: context about the original user query, what specific information to find, how to verify findings in multiple sources, and what aspects to investigate deeply."
+                        "description": "Specific guidance on how to approach this task. MUST include: THE ORIGINAL USER QUERY (quote it exactly: 'The user asked: [query]'), what specific information to find related to that query, how to verify findings in multiple sources, and what aspects to investigate deeply. Make it clear how this task helps answer the user's specific question."
                     }
                 },
                 # Azure/OpenRouter require all properties to be in required array
@@ -958,11 +958,19 @@ async def run_supervisor_agent(
     user_language = _detect_user_language(query)
     
     # Get deep_search_result for context (from initial deep search before multi-agent system)
+    # CRITICAL: This contains important background information that must be used to guide research
     deep_search_result_raw = state.get("deep_search_result", "")
     if isinstance(deep_search_result_raw, dict):
         deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
     else:
         deep_search_result = deep_search_result_raw or ""
+    
+    # Log if deep_search_result is missing (this should not happen in normal flow)
+    if not deep_search_result:
+        logger.warning("Supervisor: deep_search_result is empty or missing from state", 
+                      state_keys=list(state.keys()) if isinstance(state, dict) else "not a dict")
+    else:
+        logger.info("Supervisor: deep_search_result available", length=len(deep_search_result))
     
     # Get memory services
     agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
@@ -1049,6 +1057,7 @@ async def run_supervisor_agent(
                findings_preview=findings_summary[:500] if findings_summary else "No findings")
     
     # Get clarification context if available - extract from chat_history
+    # CRITICAL: Always try to extract clarification answers - they are essential for proper research direction
     clarification_context = state.get("clarification_context", "")
     if not clarification_context:
         # Extract user clarification answers from chat_history
@@ -1058,7 +1067,9 @@ async def run_supervisor_agent(
                 if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
                     if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
                         user_answer = chat_history[i + 1].get("content", "")
-                        clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\nThese answers refine the research scope and priorities. Use them when reviewing findings and writing the report."
+                        if user_answer and user_answer.strip():
+                            clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\n**MANDATORY**: These answers refine the research scope and priorities. You MUST use them when creating agent todos, evaluating findings, and writing the report. They specify exactly what the user wants."
+                            logger.info("Extracted user clarification answers for supervisor", answer_preview=user_answer[:200])
                         break
         if not clarification_context:
             clarification_context = ""
@@ -1102,16 +1113,23 @@ Your role:
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
 
-**INITIAL DEEP SEARCH CONTEXT:**
-{deep_search_result[:2000] if deep_search_result else "No initial deep search context available."}
-{clarification_context if clarification_context else ""}
+**INITIAL DEEP SEARCH CONTEXT (CRITICAL - USE THIS TO GUIDE RESEARCH):**
+{deep_search_result[:2000] if deep_search_result else "⚠️ WARNING: No initial deep search context available. This may indicate an issue with the deep search step."}
+{clarification_context if clarification_context else "\n⚠️ NOTE: No user clarification answers found. Proceed with the original query as-is."}
 
-**CRITICAL CONTEXT USAGE:**
-- **ALWAYS refer to the ORIGINAL USER QUERY above** - this is what the user actually asked for
-- Use the initial deep search context to understand the topic and guide research direction
-- **MANDATORY**: User's clarification answers (if provided) MUST be used when creating agent todos and evaluating findings
-- Ensure all agent tasks and research findings directly relate to the ORIGINAL USER QUERY
-- If research is going off-topic, redirect agents back to the original query
+**CRITICAL CONTEXT USAGE - MANDATORY:**
+- **THE ORIGINAL USER QUERY IS: "{query}"** - THIS IS WHAT THE USER ACTUALLY ASKED FOR
+- **EVERY task you create MUST be directly related to this specific query**
+- **MANDATORY**: When creating agent todos, you MUST:
+  1. Include the original user query in the task objective or guidance: "The user asked: '{query}'. Research [specific aspect]..."
+  2. Explain how this task helps answer the user's query
+  3. Reference the specific topic from the user's query in the task description
+- **MANDATORY**: Use the initial deep search context and user's clarification answers (if provided above) when creating agent todos and evaluating findings
+- **FORBIDDEN**: Do NOT create generic tasks unrelated to the user's query (e.g., "History of technology" when user asked about "Soviet carrier aviation")
+- **EXAMPLE**: User query: "расскажи про историю советской палубной авиации"
+  - Good task: "Research the history of Soviet carrier aviation. The user asked about 'история советской палубной авиации'. Investigate the development of Soviet aircraft carriers, their aircraft, and key historical milestones."
+  - Bad task: "Research history of technology" (too generic, not related to user query)
+- If research is going off-topic, redirect agents back to the original query using the deep search context as reference
 
 CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
 - Each agent should research DIFFERENT aspects/aspects of the topic
@@ -1166,6 +1184,7 @@ Available tools:
 - write_draft_report: Write/append to draft research report (draft_report.md) - this is where you assemble the final report
 - review_agent_progress: Check specific agent's progress and todos
 - create_agent_todo: Assign new task to an agent (use this to force deeper research AND diversify coverage!)
+  **MANDATORY**: Every task MUST include the original user query "{query}" in the objective or guidance so the agent understands what they're researching!
 - update_agent_todo: Update existing agent todo (OPTIMAL for refining tasks, changing priority, updating guidance, or modifying objectives)
 - make_final_decision: Decide to continue/replan/finish
 
@@ -1180,18 +1199,21 @@ CRITICAL WORKFLOW:
 4. Add only KEY INSIGHTS to main.md (not all items - items stay in items/ directory) - ONLY essential shared information
 5. Check each agent's progress - ensure they cover DIFFERENT aspects
 6. **CRITICAL**: 
+   - **MANDATORY**: Before creating ANY task, check: "Does this task directly relate to the user's query '{query}'?" If not, DON'T create it!
+   - **MANDATORY**: Every task MUST include the original user query in objective or guidance: "The user asked: '{query}'. Research [aspect]..."
    - **ACTIVELY PROMOTE DEEP RESEARCH** - constantly create additional tasks for deeper investigation
    - If findings are basic, create MULTIPLE todos forcing deeper research with specific, detailed instructions
    - **PROACTIVELY assign follow-up tasks** to verify findings in multiple sources and explore related aspects
    - If agents overlap, redirect them to DIFFERENT angles to build complete picture
    - Ensure comprehensive coverage: history, technical, expert views, applications, trends, comparisons, impact, challenges
-   - **After agents complete tasks, review findings and create ADDITIONAL tasks** to:
+   - **After agents complete tasks, review findings and create ADDITIONAL tasks**:
      * Verify important claims in multiple independent sources
      * Investigate deeper aspects that emerged from initial research
      * Explore different angles and perspectives on the same topic
      * Find case studies, real-world examples, and practical applications
    - **OPTIMAL**: Use update_agent_todo to refine existing tasks when agents need more specific instructions or when research direction changes
    - **STRATEGY**: Break complex topics into multiple deep-dive tasks - don't stop at surface-level findings
+   - **FORBIDDEN**: Do NOT create generic tasks like "History of technology" when user asked about "Soviet carrier aviation" - always relate to the specific query!
 7. **MANDATORY: You MUST call at least ONE tool on EVERY iteration** - never return empty tool_calls!
    - If you need to review findings: call read_draft_report, read_main_document, or review_agent_progress
    - **After reviewing agent findings, you MUST call write_draft_report** to synthesize their findings
@@ -1236,21 +1258,8 @@ Be thorough but efficient. Use structured reasoning. FORCE agents to dig deeper 
     if supervisor_notes:
         notes_section = f"Your previous notes:\n{supervisor_notes}\n\n"
     
-    # Extract user clarification answers from chat history if available
-    clarification_context = ""
-    chat_history = state.get("chat_history", [])
-    if chat_history:
-        # Look for user messages after clarification questions
-        for i, msg in enumerate(chat_history):
-            if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
-                # Check if next message is from user (user answered)
-                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
-                    user_answer = chat_history[i + 1].get("content", "")
-                    clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - USE THESE TO GUIDE RESEARCH):**\n{user_answer}\n\n**MANDATORY**: Use these answers to guide research direction, create relevant agent todos, and ensure research addresses what the user actually asked for.\n"
-                    logger.info("Found user clarification answers in chat history", answer_preview=user_answer[:200])
-                    break
-    
     # Initialize conversation
+    # NOTE: query, deep_search_result and clarification_context are already in system prompt - don't duplicate in user message
     agent_history = []
     agent_history.append({
         "role": "user",
@@ -1261,21 +1270,26 @@ Current findings from agents (last 10, summarized):
 
 **IMPORTANT**: These findings are from your research agents. You MUST synthesize them into draft_report.md!
 
-{notes_section}{clarification_context}
+{notes_section}
 
 CRITICAL INSTRUCTIONS:
-1. **DIVERSIFY COVERAGE**: Ensure each agent researches DIFFERENT aspects of the topic
+1. **MANDATORY - ALL TASKS MUST RELATE TO USER QUERY**: Every task you create MUST be directly related to the user's query: "{query}". Include the user's query in task descriptions so agents understand what they're researching. Example: "The user asked: '{query}'. Research [specific aspect]..."
+2. **MANDATORY - USE DEEP SEARCH CONTEXT**: The deep search context in the system prompt above contains important background information. Reference it when creating tasks and evaluating findings.
+3. **MANDATORY - USE CLARIFICATION ANSWERS**: If user clarification answers are provided in the system prompt above, you MUST use them when creating tasks. They specify exactly what the user wants.
+4. **DIVERSIFY COVERAGE**: Ensure each agent researches DIFFERENT aspects of the topic FROM THE USER'S QUERY "{query}"
    - Check if agents are researching overlapping areas - if so, redirect them to different angles
    - Goal: Build complete picture from diverse perspectives (history, technical, expert views, applications, trends, comparisons, impact, challenges)
    - Avoid duplicate research - each agent should contribute unique insights
 
 2. **FORCE DEEPER RESEARCH**: If any agent provided only basic/general information, you MUST create a todo forcing them to dig deeper
    - When creating todos, specify EXACTLY what deep research is needed: technical specs, expert analysis, case studies, etc.
+   - **MANDATORY**: Include the user's query "{query}" in every task: "The user asked: '{query}'. Research [specific aspect]..."
    - Do NOT accept surface-level findings - push agents to find specific details, data, and expert insights
 
 3. **ASSEMBLE COMPLETE PICTURE**: From diverse agent findings, synthesize a comprehensive understanding
    - Each agent's unique angle contributes to the full picture
    - Ensure all major aspects are covered before finishing
+   - **REMEMBER**: All research must relate to the user's query: "{query}"
 
 4. **USE YOUR PERSONAL FILE**: Write your observations and thoughts to supervisor file, not to main.md
    - main.md is for essential shared information only

@@ -894,7 +894,18 @@ Research topics:
 {chr(10).join([f"- {t.get('topic')}: {t.get('description')}" for t in research_topics])}
 
 CRITICAL: Each agent must research DIFFERENT aspects to build a complete picture!
-**IMPORTANT: Use the original user query, deep search context, and user clarification answers above to create relevant agent characteristics and tasks that directly address what the user asked for.**
+**MANDATORY: Use the original user query "{query}", deep search context, and user clarification answers above to create relevant agent characteristics and tasks that directly address what the user asked for.**
+
+**CRITICAL: TASK CREATION REQUIREMENTS - MANDATORY:**
+- **EVERY task MUST include the original user query "{query}" in the objective**
+- **EVERY task MUST be SPECIFIC to the user's query - not generic!**
+- **MANDATORY format**: Start each task objective with "The user asked: '{query}'. Research [specific aspect related to query]..."
+- **MANDATORY**: Include user's clarification answers (if provided) in task descriptions
+- **FORBIDDEN**: Do NOT create generic tasks like "Identify and clarify the specific event" - be SPECIFIC!
+- **EXAMPLE**: If user asked "расскажи про хронологию боёв за курскую область на СВО" and wants "технический аспект точная хронология и инфа об участвовавших подразделениях", create tasks like:
+  * "The user asked: 'расскажи про хронологию боёв за курскую область на СВО'. Research the precise chronological timeline of battles for Kursk Oblast in SMO, including exact dates, locations, and participating military units."
+  * NOT: "Identify and clarify the specific event or operation" (too generic!)
+- **MANDATORY**: Each task must be self-contained - the agent will NOT see the original query, only the task description!
 
 For each agent, create:
 1. A unique role (e.g., "Senior Aviation Historian", "Economic Policy Analyst", "Technical Specifications Expert", "Case Study Researcher")
@@ -915,6 +926,7 @@ DIVERSITY REQUIREMENT:
 - Each agent should contribute unique insights to build comprehensive understanding
 - From diverse agent findings, the supervisor will assemble a COMPLETE picture
 - Examples: one agent focuses on history, another on technical specs, another on expert views, another on applications, etc.
+- **BUT**: All angles must relate to the user's query "{query}"!
 """
 
     try:
@@ -960,7 +972,7 @@ DIVERSITY REQUIREMENT:
                     expected_output=todo.expected_output,
                     sources_needed=todo.sources_needed,
                     status="pending",
-                    note=""
+                    note=todo.guidance if hasattr(todo, 'guidance') and todo.guidance else ""
                 )
                 for todo in agent_char.initial_todos
             ]
