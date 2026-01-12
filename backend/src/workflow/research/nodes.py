@@ -299,6 +299,17 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
             logger.warning("Missing dependencies for deep search, skipping")
             return {"deep_search_result": {"type": "override", "value": None}}
 
+        # CRITICAL: Log max_tokens to verify it's correct
+        max_tokens_value = None
+        if hasattr(llm, "max_tokens"):
+            max_tokens_value = llm.max_tokens
+        logger.info(
+            "Creating SearchService for deep search",
+            llm_type=type(llm).__name__,
+            max_tokens=max_tokens_value,
+            has_max_tokens=hasattr(llm, "max_tokens"),
+        )
+
         # Create search service
         search_service = SearchService(
             classifier_llm=llm,
@@ -446,30 +457,24 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
                    result_length=len(deep_search_result) if deep_search_result else 0,
                    result_preview=deep_search_result[:200] if deep_search_result else "")
     
-    # Extract original user message (first user message before deep search/clarification)
-    original_user_message = ""
-    if chat_history:
-        for msg in chat_history:
-            if msg.get("role") == "user":
-                # Check if this is before any deep search or clarification
-                msg_idx = chat_history.index(msg)
-                has_deep_search_or_clarification_before = False
-                for prev_msg in chat_history[:msg_idx]:
-                    if prev_msg.get("role") == "assistant":
-                        content = prev_msg.get("content", "").lower()
-                        if ("deep search" in content or "clarification" in content or "🔍" in content or "clarify" in content or 
-                            "initial deep search context" in content or "deep search completed" in content):
-                            has_deep_search_or_clarification_before = True
-                            break
-                if not has_deep_search_or_clarification_before:
-                    original_user_message = msg.get("content", "")
-                    break
+    # CRITICAL: Use query from state - it already contains the correct original query
+    # The query in state is set in chat_stream.py with proper logic to find the first user message
+    # in the current deep research session (before any deep search/clarification markers)
+    # This ensures we always use the correct original query, not a clarification answer or message from other modes
     
-    # Use original user message if found, otherwise use query from state
-    user_message_for_context = original_user_message if original_user_message else query
-    logger.info("Original user message extracted", 
-               has_original=bool(original_user_message),
-               message_preview=user_message_for_context[:100])
+    # Verify that query is not empty and log it for debugging
+    if not query:
+        logger.error("CRITICAL: query is empty in state! Cannot generate clarification questions.")
+        return {"clarification_needed": False}
+    
+    user_message_for_context = query
+    logger.info(
+        "Using query from state for clarification questions",
+        query_preview=user_message_for_context[:100],
+        query_length=len(user_message_for_context),
+        note="This query is the original user message from the start of current deep research session (set in chat_stream.py)",
+        state_query=query[:100] if query else "EMPTY"
+    )
     
     # Use full deep search result (not summary) so LLM sees everything
     deep_search_context = f"\n\n**DEEP SEARCH RESULT:**\n{deep_search_result}" if deep_search_result else ""
@@ -477,17 +482,29 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     
     prompt = f"""Generate clarifying questions about the research topic and approach.
 
-**ORIGINAL USER MESSAGE:**
+**ORIGINAL USER MESSAGE (from the start of current deep research session):**
 {user_message_for_context}
 {deep_search_context}
 
-You MUST always generate 2-3 clarifying questions about:
-1. The specific aspect or focus of the research (what exactly should be researched)
-2. The depth and scope of the research (how detailed should it be)
-3. The type of information needed (technical details, historical context, comparisons, etc.)
+**CRITICAL REQUIREMENTS:**
+1. The message above is the ORIGINAL user query that started this deep research session
+2. Generate clarifying questions STRICTLY about THIS specific query and topic
+3. Questions MUST be directly related to the original query - do NOT generate questions about unrelated topics
+4. If the deep search context mentions specific aspects, generate questions about THOSE aspects within the context of the original query
+5. Do NOT generate questions about topics that are NOT mentioned in the original query or deep search context
 
-These questions help guide the research direction and ensure comprehensive coverage.
-Even if the query seems clear, ask questions to refine the research approach.
+**MANDATORY**: Your questions MUST be about the SPECIFIC TOPIC from the original query: "{user_message_for_context}"
+
+You MUST always generate 2-3 clarifying questions about:
+1. The specific aspect or focus of the research related to the original query (what exactly should be researched about THIS topic)
+2. The depth and scope of the research (how detailed should it be for THIS topic)
+3. The type of information needed for THIS topic (technical details, historical context, comparisons, etc.)
+
+**FORBIDDEN**: Do NOT generate questions about topics that are NOT in the original query!
+**FORBIDDEN**: Do NOT misinterpret the query - if the user asked about "оформление работников", do NOT ask about "ИП" (individual entrepreneurs) unless it's clearly related!
+
+These questions help guide the research direction and ensure comprehensive coverage of THE ORIGINAL TOPIC.
+Even if the query seems clear, ask questions to refine the research approach FOR THIS SPECIFIC TOPIC.
 
 **CRITICAL: LANGUAGE REQUIREMENT**
 - You MUST write all questions in the SAME LANGUAGE as the original user message above
@@ -505,7 +522,15 @@ Format questions with:
 """
     
     try:
-        system_prompt = "You are a research planning expert. You MUST always generate clarifying questions to help improve research quality. CRITICAL: Write all questions in the SAME LANGUAGE as the user's original message - match their language exactly."
+        system_prompt = """You are a research planning expert. You MUST always generate clarifying questions to help improve research quality. 
+
+CRITICAL REQUIREMENTS:
+1. Write all questions in the SAME LANGUAGE as the user's original message - match their language exactly
+2. Generate questions STRICTLY about the SPECIFIC TOPIC from the original user message
+3. Do NOT generate questions about topics that are NOT mentioned in the original query or deep search context
+4. If the original query is about "оформление работников", do NOT ask about "ИП" (individual entrepreneurs) unless it's clearly related to employee registration
+5. If the original query is about a specific topic, all questions MUST be about aspects of THAT topic, not unrelated topics
+6. Questions should help refine the research approach FOR THE ORIGINAL TOPIC, not introduce new topics"""
         clarification = await llm.with_structured_output(ClarificationNeeds).ainvoke([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
@@ -515,7 +540,9 @@ Format questions with:
             "Clarification analysis",
             needs_clarification=clarification.needs_clarification,
             questions_count=len(clarification.questions),
-            can_proceed=clarification.can_proceed_without
+            can_proceed=clarification.can_proceed_without,
+            original_query=user_message_for_context[:100],
+            questions_preview=[q.question[:100] if hasattr(q, 'question') else str(q)[:100] for q in clarification.questions[:3]] if clarification.questions else []
         )
         
         # ALWAYS send questions if they exist, regardless of needs_clarification flag
@@ -900,8 +927,13 @@ CRITICAL: Each agent must research DIFFERENT aspects to build a complete picture
 - **EVERY task MUST include the original user query "{query}" in the objective**
 - **EVERY task MUST be SPECIFIC to the user's query - not generic!**
 - **MANDATORY format**: Start each task objective with "The user asked: '{query}'. Research [specific aspect related to query]..."
-- **MANDATORY**: Include user's clarification answers (if provided) in task descriptions
+- **CRITICAL: Clarification interpretation**: If clarification answers are provided, interpret them IN THE CONTEXT of the original query
+  * Clarification specifies WHAT ASPECT of the original topic to focus on, NOT a new topic
+  * Example: Query "оформление работников", Clarification "все режимы" → means "режимы оформления работников", NOT "режимы" in general
+  * Example: Query "обучение qwen", Clarification "технические тонкости" → means "технические тонкости обучения qwen", NOT "технические тонкости" in general
+- **MANDATORY**: Include user's clarification answers (if provided) in task descriptions, but ALWAYS in context of original query
 - **FORBIDDEN**: Do NOT create generic tasks like "Identify and clarify the specific event" - be SPECIFIC!
+- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic!
 - **EXAMPLE**: If user asked "расскажи про хронологию боёв за курскую область на СВО" and wants "технический аспект точная хронология и инфа об участвовавших подразделениях", create tasks like:
   * "The user asked: 'расскажи про хронологию боёв за курскую область на СВО'. Research the precise chronological timeline of battles for Kursk Oblast in SMO, including exact dates, locations, and participating military units."
   * NOT: "Identify and clarify the specific event or operation" (too generic!)
@@ -926,7 +958,8 @@ DIVERSITY REQUIREMENT:
 - Each agent should contribute unique insights to build comprehensive understanding
 - From diverse agent findings, the supervisor will assemble a COMPLETE picture
 - Examples: one agent focuses on history, another on technical specs, another on expert views, another on applications, etc.
-- **BUT**: All angles must relate to the user's query "{query}"!
+- **BUT**: All angles must relate to the user's query "{query}" - do NOT research unrelated topics!
+- **CRITICAL**: If clarification was provided, interpret it IN CONTEXT of the original query - clarification specifies aspects of the original topic, NOT a new topic!{query}"!
 """
 
     try:

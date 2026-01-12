@@ -240,9 +240,21 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
                     if stream:
                         stream.emit_status(f"Summarizing: {title[:40]}...", step="summarize")
 
+                    # CRITICAL: Log max_tokens to verify it's correct
+                    max_tokens_value = None
+                    if hasattr(llm, "max_tokens"):
+                        max_tokens_value = llm.max_tokens
+                    logger.debug(
+                        "Scraping and summarizing URL",
+                        url=url,
+                        content_length=len(full_content),
+                        llm_max_tokens=max_tokens_value,
+                        summary_target_tokens=4096,
+                    )
+
                     summary = await summarize_text_llm(
                         full_content,
-                        max_tokens=800,  # Comprehensive summary
+                        max_tokens=4096,  # Comprehensive summary (increased) - this is target summary length, not LLM max_tokens
                         llm=llm
                     )
                     logger.debug(f"Content summarized: {url}", summary_length=len(summary))

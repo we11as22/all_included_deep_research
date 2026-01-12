@@ -938,6 +938,11 @@ async def run_supervisor_agent(
         Decision dict with should_continue, replanning_needed, etc.
     """
     query = state.get("query", "")
+    # CRITICAL: Log query to ensure it's the original query, not clarification answer
+    logger.info("Supervisor agent starting", 
+               query=query[:100] if query else None,
+               query_length=len(query) if query else 0,
+               has_clarification_context=bool(state.get("clarification_context", "")))
     findings = state.get("findings", state.get("agent_findings", []))
     agent_characteristics = state.get("agent_characteristics", {})
     research_plan = state.get("research_plan", {})
@@ -968,9 +973,16 @@ async def run_supervisor_agent(
     # Log if deep_search_result is missing (this should not happen in normal flow)
     if not deep_search_result:
         logger.warning("Supervisor: deep_search_result is empty or missing from state", 
-                      state_keys=list(state.keys()) if isinstance(state, dict) else "not a dict")
+                      state_keys=list(state.keys()) if isinstance(state, dict) else "not a dict",
+                      has_deep_search_result="deep_search_result" in state,
+                      deep_search_result_type=type(deep_search_result_raw).__name__ if deep_search_result_raw else "none")
     else:
-        logger.info("Supervisor: deep_search_result available", length=len(deep_search_result))
+        logger.info("Supervisor: deep_search_result available", 
+                   length=len(deep_search_result),
+                   preview=deep_search_result[:200] if deep_search_result else None)
+    
+    # CRITICAL: Log all context data to verify correctness (clarification_context will be set below)
+    # This log will be updated after clarification_context is extracted
     
     # Get memory services
     agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
@@ -1068,11 +1080,17 @@ async def run_supervisor_agent(
                     if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
                         user_answer = chat_history[i + 1].get("content", "")
                         if user_answer and user_answer.strip():
-                            clarification_context = f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{user_answer}\n\n**MANDATORY**: These answers refine the research scope and priorities. You MUST use them when creating agent todos, evaluating findings, and writing the report. They specify exactly what the user wants."
-                            logger.info("Extracted user clarification answers for supervisor", answer_preview=user_answer[:200])
+                            clarification_context = f"\n\n**USER CLARIFICATION (ADDITIONAL CONTEXT - NOT A REPLACEMENT FOR ORIGINAL QUERY):**\n{user_answer}\n\n**CRITICAL INTERPRETATION RULES**:\n- The ORIGINAL USER QUERY above is still the PRIMARY topic to research: \"{query}\"\n- This clarification provides additional context about what aspects/depth the user wants to focus on WITHIN the original query topic\n- **MANDATORY**: Clarification MUST be interpreted IN THE CONTEXT of the original query\n- **CRITICAL**: If clarification mentions words that could have multiple meanings, they ALWAYS refer to those words IN THE CONTEXT of the original query\n- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic\n- Example: If original query is \"оформление работников\" and clarification says \"все режимы\", this means \"режимы оформления работников\", NOT \"режимы\" in general\n- Use this clarification to understand what depth/angle to focus on, but ALWAYS within the context of the original query topic"
+                            logger.info("Extracted user clarification answers for supervisor", 
+                                      answer_preview=user_answer[:200],
+                                      clarification_index=i,
+                                      answer_index=i+1,
+                                      original_query=query[:100] if query else None,
+                                      note="Clarification must be interpreted IN CONTEXT of original query")
                         break
         if not clarification_context:
             clarification_context = ""
+            logger.info("No clarification context found in chat_history", chat_history_length=len(chat_history) if chat_history else 0)
     
     # Format chat history to show actual messages from chat
     # For deep_research, use only 2 messages as they can be very long
@@ -1093,6 +1111,20 @@ async def run_supervisor_agent(
         chat_history_text = "\n".join(history_lines) + "\n\n"
     else:
         chat_history_text = "**Previous messages in this chat:** None (this is the first message).\n\n"
+    
+    # Prepare clarification context fallback message (avoid backslash in f-string expression)
+    clarification_fallback = "\n⚠️ NOTE: No user clarification answers found. Proceed with the original query as-is."
+    
+    # CRITICAL: Final log of all context data before creating prompt
+    logger.info("Supervisor final context data", 
+               query=query[:100] if query else None,
+               query_length=len(query) if query else 0,
+               deep_search_result_length=len(deep_search_result) if deep_search_result else 0,
+               deep_search_result_preview=deep_search_result[:200] if deep_search_result else None,
+               has_clarification_context=bool(clarification_context),
+               clarification_context_length=len(clarification_context) if clarification_context else 0,
+               clarification_preview=clarification_context[:200] if clarification_context else None,
+               chat_history_length=len(chat_history) if chat_history else 0)
     
     # Create supervisor prompt
     system_prompt = f"""You are the research supervisor coordinating a team of researcher agents.
@@ -1115,20 +1147,36 @@ Iteration: {iteration + 1}
 
 **INITIAL DEEP SEARCH CONTEXT (CRITICAL - USE THIS TO GUIDE RESEARCH):**
 {deep_search_result[:2000] if deep_search_result else "⚠️ WARNING: No initial deep search context available. This may indicate an issue with the deep search step."}
-{clarification_context if clarification_context else "\n⚠️ NOTE: No user clarification answers found. Proceed with the original query as-is."}
+{clarification_context if clarification_context else clarification_fallback}
 
 **CRITICAL CONTEXT USAGE - MANDATORY:**
-- **THE ORIGINAL USER QUERY IS: "{query}"** - THIS IS WHAT THE USER ACTUALLY ASKED FOR
-- **EVERY task you create MUST be directly related to this specific query**
+- **THE ORIGINAL USER QUERY IS: "{query}"** - THIS IS THE PRIMARY TOPIC YOU MUST RESEARCH
+- **EVERY task you create MUST be directly related to this specific query and topic**
+- **CRITICAL**: The clarification (if provided above) is ONLY additional context about what aspects/depth the user wants - it does NOT replace the original query!
+- **CRITICAL**: Clarification answers MUST be interpreted IN THE CONTEXT of the original query - they are NOT a new query!
+  * If user asked about "оформление работников" and clarification says "мне надо подробно про вообще все режимы", this means "режимы оформления работников", NOT "режимы" in general (political regimes, technical regimes, etc.)
+  * If user asked about "обучение моделей qwen" and clarification says "технические тонкости", this means "технические тонкости обучения моделей qwen", NOT "технические тонкости" in general
+  * ALWAYS combine clarification with original query: clarification specifies WHAT ASPECT of the original topic to focus on
 - **MANDATORY**: When creating agent todos, you MUST:
-  1. Include the original user query in the task objective or guidance: "The user asked: '{query}'. Research [specific aspect]..."
-  2. Explain how this task helps answer the user's query
-  3. Reference the specific topic from the user's query in the task description
-- **MANDATORY**: Use the initial deep search context and user's clarification answers (if provided above) when creating agent todos and evaluating findings
+  1. Research the SPECIFIC TOPIC from the original query: "{query}"
+  2. Include the original user query in the task objective or guidance: "The user asked: '{query}'. Research [specific aspect of THIS topic]..."
+  3. If clarification was provided, interpret it IN CONTEXT: "The user asked: '{query}' and wants [clarification interpreted in context of query]. Research [specific aspect]..."
+  4. Explain how this task helps answer the user's query about THIS SPECIFIC TOPIC
+  5. Reference the specific topic from the user's query in the task description
+  6. NEVER create tasks about topics that are NOT in the original query, even if clarification mentions them!
+- **MANDATORY**: Use the initial deep search context when creating agent todos and evaluating findings
 - **FORBIDDEN**: Do NOT create generic tasks unrelated to the user's query (e.g., "History of technology" when user asked about "Soviet carrier aviation")
-- **EXAMPLE**: User query: "расскажи про историю советской палубной авиации"
+- **FORBIDDEN**: Do NOT ignore the original query and create tasks based only on clarification - clarification is ADDITIONAL context, not a replacement!
+- **FORBIDDEN**: Do NOT interpret clarification answers as a new query - they are ALWAYS clarifications about the original query topic!
+- **EXAMPLE 1**: User query: "расскажи про историю советской палубной авиации"
   - Good task: "Research the history of Soviet carrier aviation. The user asked about 'история советской палубной авиации'. Investigate the development of Soviet aircraft carriers, their aircraft, and key historical milestones."
   - Bad task: "Research history of technology" (too generic, not related to user query)
+- **EXAMPLE 2**: User query: "расскажи про обучение моделей серии qwen", Clarification: "мне надо про технические тонкости глубокие обучения вообще всех моделей подробно"
+  - Good task: "Research the training process of Qwen model series. The user asked about 'обучение моделей серии qwen' and wants deep technical details. Focus on technical details of Qwen training: optimization algorithms, loss functions, hyperparameters, training infrastructure, and technical nuances specific to Qwen models."
+  - Bad task: "Research technical details of deep learning for all models" (ignores original query about Qwen, focuses only on clarification)
+- **EXAMPLE 3**: User query: "расскажи про все возможные виды оформления работников в РФ и их тонкости", Clarification: "мне надо подробно про вообще все режимы"
+  - Good task: "Research all types of employee registration/employment arrangements in Russia. The user asked about 'виды оформления работников в РФ' and wants detailed information about all regimes/types. Investigate: permanent employment contracts, fixed-term contracts, part-time work, remote work, agency work, and all other employment arrangement types with their legal, tax, and practical nuances."
+  - Bad task: "Research types of political regimes, technical regimes, social regimes" (completely ignores original query about employee registration, interprets 'режимы' as general regimes)
 - If research is going off-topic, redirect agents back to the original query using the deep search context as reference
 
 CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
@@ -1273,9 +1321,20 @@ Current findings from agents (last 10, summarized):
 {notes_section}
 
 CRITICAL INSTRUCTIONS:
-1. **MANDATORY - ALL TASKS MUST RELATE TO USER QUERY**: Every task you create MUST be directly related to the user's query: "{query}". Include the user's query in task descriptions so agents understand what they're researching. Example: "The user asked: '{query}'. Research [specific aspect]..."
+1. **MANDATORY - ALL TASKS MUST RELATE TO USER QUERY**: Every task you create MUST be directly related to the user's PRIMARY query: "{query}". This is the MAIN TOPIC to research. Include the user's query in task descriptions so agents understand what they're researching. Example: "The user asked: '{query}'. Research [specific aspect of THIS topic]..."
 2. **MANDATORY - USE DEEP SEARCH CONTEXT**: The deep search context in the system prompt above contains important background information. Reference it when creating tasks and evaluating findings.
-3. **MANDATORY - USE CLARIFICATION ANSWERS**: If user clarification answers are provided in the system prompt above, you MUST use them when creating tasks. They specify exactly what the user wants.
+3. **CLARIFICATION IS ADDITIONAL CONTEXT ONLY - CRITICAL INTERPRETATION RULES**:
+   - If user clarification answers are provided, they are ADDITIONAL context about what depth/angle the user wants, NOT a replacement for the original query
+   - The PRIMARY topic to research is ALWAYS: "{query}"
+   - **MANDATORY**: Clarification answers MUST be interpreted IN THE CONTEXT of the original query
+   - **CRITICAL**: If clarification mentions a word that could have multiple meanings, it ALWAYS refers to that word IN THE CONTEXT of the original query
+     * Example: Query "оформление работников в РФ", Clarification "все режимы" → means "режимы оформления работников", NOT "режимы" in general (political regimes, technical regimes, etc.)
+     * Example: Query "обучение моделей qwen", Clarification "технические тонкости" → means "технические тонкости обучения qwen", NOT "технические тонкости" in general
+     * Example: Query "история советской авиации", Clarification "подробно про все типы" → means "все типы советской авиации", NOT "все типы" вообще
+   - **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS a clarification about the original query topic
+   - **FORBIDDEN**: Do NOT create tasks about topics that are NOT in the original query, even if clarification mentions words that could be interpreted as unrelated topics
+   - **MANDATORY**: When creating tasks, ALWAYS combine clarification with original query: "The user asked: '{query}' and wants [clarification interpreted in context]. Research [aspect of original query topic]..."
+   - Use clarification to understand what aspects to focus on, but ALWAYS within the context of the original query topic
 4. **DIVERSIFY COVERAGE**: Ensure each agent researches DIFFERENT aspects of the topic FROM THE USER'S QUERY "{query}"
    - Check if agents are researching overlapping areas - if so, redirect them to different angles
    - Goal: Build complete picture from diverse perspectives (history, technical, expert views, applications, trends, comparisons, impact, challenges)

@@ -224,6 +224,21 @@ CRITICAL: citations must be a list of URL strings, e.g. ["https://example.com", 
 
         # Use structured output
         structured_llm = llm.with_structured_output(CitedAnswer, method="function_calling")
+        
+        # CRITICAL: Log max_tokens to verify it's correct
+        max_tokens_value = None
+        if hasattr(llm, "max_tokens"):
+            max_tokens_value = llm.max_tokens
+        elif hasattr(structured_llm, "max_tokens"):
+            max_tokens_value = structured_llm.max_tokens
+        
+        logger.info(
+            "Writer agent calling LLM",
+            mode=mode,
+            sources_count=len(unique_sources),
+            prompt_length=len(user_prompt),
+            max_tokens=max_tokens_value,
+        )
 
         result = await structured_llm.ainvoke([
             SystemMessage(content=system_prompt),

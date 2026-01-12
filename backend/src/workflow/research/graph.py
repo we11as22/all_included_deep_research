@@ -269,8 +269,6 @@ async def run_research_graph(
     Returns:
         Final state dict
     """
-    logger.info("Starting research graph execution", query=query[:100], mode=mode)
-
     # Create graph
     graph = create_research_graph()
 
@@ -287,6 +285,12 @@ async def run_research_graph(
                     is_continuation = True
                     logger.info("Detected continuation - user answered clarification, will resume from checkpoint")
                     break
+    
+    logger.info("Starting research graph execution", 
+               query=query[:100] if query else None, 
+               mode=mode,
+               query_length=len(query) if query else 0,
+               is_continuation=is_continuation)
     
     # Create initial state first
     initial_state = create_initial_state(
@@ -356,11 +360,14 @@ async def run_research_graph(
                             if key not in NON_SERIALIZABLE_FIELDS and key not in ["stream", "llm", "search_provider", "scraper", "settings"]:
                                 initial_state[key] = value
                         # Always update chat_history and query with latest
+                        # CRITICAL: Preserve original query from initial request, not from checkpoint!
                         initial_state["chat_history"] = chat_history
                         initial_state["query"] = query
                         logger.info("Checkpoint state merged", 
                                    deep_search_result_exists="deep_search_result" in initial_state,
-                                   clarification_needed=initial_state.get("clarification_needed", False))
+                                   clarification_needed=initial_state.get("clarification_needed", False),
+                                   query=query[:100] if query else None,
+                                   checkpoint_query=checkpoint_state.get("query", "")[:100] if checkpoint_state.get("query") else None)
         except Exception as e:
             logger.warning("Failed to get checkpoint state, will use initial state", error=str(e), exc_info=True)
     
@@ -389,9 +396,13 @@ async def run_research_graph(
                        deep_search_result_type=type(filtered_state.get("deep_search_result")).__name__ if "deep_search_result" in filtered_state else "none")
             # Only update chat_history and query - LangGraph will load the rest from checkpoint
             # BUT: CRITICAL - Preserve deep_search_result if it exists in filtered_state (from checkpoint merge)
+            # CRITICAL: Always use the original query from the request, not from checkpoint!
+            logger.info("Setting query for continuation", 
+                       query=query[:100] if query else None,
+                       query_source="original_request")
             update_state = {
                 "chat_history": chat_history,
-                "query": query,
+                "query": query,  # CRITICAL: This is the ORIGINAL query, not clarification answer!
             }
             # CRITICAL: If deep_search_result exists in filtered_state (from checkpoint), preserve it
             # This ensures deep search is not re-run when continuing after clarification

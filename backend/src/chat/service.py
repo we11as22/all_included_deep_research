@@ -809,13 +809,33 @@ class ChatSearchService:
         )
 
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
-        logger.debug(
+        
+        # CRITICAL: Log max_tokens to verify it's correct
+        max_tokens_value = None
+        if hasattr(self.chat_llm, "max_tokens"):
+            max_tokens_value = self.chat_llm.max_tokens
+        elif hasattr(structured_llm, "max_tokens"):
+            max_tokens_value = structured_llm.max_tokens
+        
+        # CRITICAL: Check if max_tokens is too low
+        if max_tokens_value and max_tokens_value < 4096:
+            logger.warning(
+                "max_tokens is very low for answer synthesis",
+                max_tokens=max_tokens_value,
+                config_value=self.settings.chat_model_max_tokens,
+                mode=mode,
+                prompt_length=len(user_prompt),
+            )
+        
+        logger.info(
             "Calling LLM for answer synthesis",
             prompt_length=len(user_prompt),
             system_prompt_length=len(system_prompt),
             sources_count=len(sources),
             scraped_count=len(scraped),
             mode=mode,
+            max_tokens=max_tokens_value,
+            chat_model_max_tokens_config=self.settings.chat_model_max_tokens,
         )
         answer = await self._invoke_structured_answer(
             structured_llm,
@@ -930,7 +950,21 @@ class ChatSearchService:
 
         for attempt in range(1, retries + 1):
             try:
-                logger.debug("Calling structured LLM", context=context, attempt=attempt, retries=retries)
+                # CRITICAL: Log max_tokens before calling
+                max_tokens_before = None
+                if hasattr(structured_llm, "max_tokens"):
+                    max_tokens_before = structured_llm.max_tokens
+                elif hasattr(structured_llm, "llm") and hasattr(structured_llm.llm, "max_tokens"):
+                    max_tokens_before = structured_llm.llm.max_tokens
+                
+                logger.debug(
+                    "Calling structured LLM",
+                    context=context,
+                    attempt=attempt,
+                    retries=retries,
+                    max_tokens=max_tokens_before,
+                    messages_count=len(messages),
+                )
                 response = await structured_llm.ainvoke(messages)
                 
                 # CRITICAL: Log full response details before coercion

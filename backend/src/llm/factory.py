@@ -73,18 +73,49 @@ def create_chat_model(
                     headers=list(headers.keys()),
                 )
 
-        logger.debug(
+        logger.info(
             "creating_openai_model",
             model=model_name,
+            max_tokens=max_tokens,
+            temperature=temperature,
             base_url=settings.openai_base_url or "default (api.openai.com)",
         )
         llm = ChatOpenAI(**llm_kwargs)
+        
+        # CRITICAL: Verify max_tokens was set correctly
+        if hasattr(llm, "max_tokens"):
+            actual_max_tokens = llm.max_tokens
+            if actual_max_tokens != max_tokens:
+                logger.warning(
+                    "max_tokens mismatch",
+                    expected=max_tokens,
+                    actual=actual_max_tokens,
+                    model=model_name,
+                )
+            else:
+                logger.debug("max_tokens verified", max_tokens=actual_max_tokens, model=model_name)
         
         # Apply structured output if requested
         if structured_output:
             try:
                 # Use function_calling method for better OpenAI compatibility
                 llm = llm.with_structured_output(structured_output, method="function_calling")
+                # CRITICAL: Verify max_tokens is preserved after with_structured_output
+                if hasattr(llm, "max_tokens"):
+                    actual_max_tokens = llm.max_tokens
+                    if actual_max_tokens != max_tokens:
+                        logger.warning(
+                            "max_tokens changed after with_structured_output",
+                            original=max_tokens,
+                            after=actual_max_tokens,
+                            schema=structured_output.__name__,
+                        )
+                    else:
+                        logger.debug(
+                            "max_tokens preserved after with_structured_output",
+                            max_tokens=actual_max_tokens,
+                            schema=structured_output.__name__,
+                        )
             except TypeError:
                 # Fallback if method parameter not supported
                 llm = llm.with_structured_output(structured_output)

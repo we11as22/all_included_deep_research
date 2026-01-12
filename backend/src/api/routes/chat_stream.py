@@ -96,37 +96,244 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                         "content": msg.content
                     })
                 
-                # Find original query - first user message before any clarification
-                for msg in chat_history:
-                    if msg.get("role") == "user":
-                        # Check if this is before any clarification
-                        msg_idx = chat_history.index(msg)
-                        has_clarification_before = False
-                        for prev_msg in chat_history[:msg_idx]:
-                            if prev_msg.get("role") == "assistant":
-                                content = prev_msg.get("content", "").lower()
-                                if "clarification" in content or "🔍" in content or "clarify" in content:
-                                    has_clarification_before = True
+                # Find original query for CURRENT deep research session
+                # This is the first user message in the current deep research session, before clarification
+                # We need to find where the current deep research session started
+                # Look for the last assistant message with clarification or deep search, then find first user message before it
+                
+                # First, determine if this is a deep research request
+                raw_mode = request.model or "search"
+                normalized = raw_mode.lower().replace("-", "_")
+                is_deep_research = normalized in {"quality", "deep_research", "research"}
+                
+                if is_deep_research:
+                    # Find the start of current deep research session
+                    # Look backwards from the end to find last clarification or deep search message
+                    # This helps identify the boundary of the current deep research session
+                    last_clarification_or_deep_search_idx = -1
+                    for i in range(len(chat_history) - 1, -1, -1):
+                        msg = chat_history[i]
+                        if msg.get("role") == "assistant":
+                            content = msg.get("content", "").lower()
+                            # Look for markers that indicate deep research session
+                            if ("clarification" in content or "🔍" in content or "clarify" in content or 
+                                "deep search" in content or "initial deep search" in content or
+                                "research report" in content or "final report" in content):
+                                last_clarification_or_deep_search_idx = i
+                                logger.info("Found last deep research marker message", 
+                                          message_index=i, 
+                                          content_preview=content[:100])
+                                break
+                    
+                    # Now find first user message BEFORE this marker
+                    # This is the original query for current deep research session
+                    # CRITICAL: This works even if there were other modes between deep research sessions
+                    if last_clarification_or_deep_search_idx >= 0:
+                        # Look for first user message before the marker
+                        # This will be the query that started the current deep research session
+                        # CRITICAL: Skip any user messages that come AFTER the marker (these are clarification answers)
+                        for i in range(last_clarification_or_deep_search_idx - 1, -1, -1):
+                            msg = chat_history[i]
+                            if msg.get("role") == "user":
+                                original_query = msg.get("content", "")
+                                logger.info("Found original query for current deep research session", 
+                                          original_query=original_query[:100] if original_query else None,
+                                          message_index=i,
+                                          before_marker_at=last_clarification_or_deep_search_idx)
+                                break
+                    else:
+                        # No deep research markers found - this might be first deep research message in chat
+                        # Or the first deep research message after other modes
+                        # Find last user message (should be the query for current session)
+                        # BUT: Check if last user message might be a clarification answer
+                        # If chat_history has assistant messages, check if last one is clarification
+                        found_clarification_before = False
+                        for i in range(len(chat_history) - 1, -1, -1):
+                            msg = chat_history[i]
+                            if msg.get("role") == "assistant":
+                                content = msg.get("content", "").lower()
+                                if ("clarification" in content or "🔍" in content or "clarify" in content):
+                                    found_clarification_before = True
+                                    # Look for user message before this clarification
+                                    for j in range(i - 1, -1, -1):
+                                        prev_msg = chat_history[j]
+                                        if prev_msg.get("role") == "user":
+                                            original_query = prev_msg.get("content", "")
+                                            logger.info("Found original query before clarification (no marker found, but found clarification pattern)", 
+                                                      original_query=original_query[:100] if original_query else None,
+                                                      message_index=j)
+                                            break
+                                    if original_query:
+                                        break
+                        
+                        if not original_query:
+                            # No clarification found - use last user message
+                            for i in range(len(chat_history) - 1, -1, -1):
+                                msg = chat_history[i]
+                                if msg.get("role") == "user":
+                                    original_query = msg.get("content", "")
+                                    logger.info("Found original query (no deep research markers found, using last user message)", 
+                                              original_query=original_query[:100] if original_query else None,
+                                              message_index=i)
                                     break
-                        if not has_clarification_before:
+                else:
+                    # Not deep research - just use first user message
+                    for msg in chat_history:
+                        if msg.get("role") == "user":
                             original_query = msg.get("content", "")
+                            logger.info("Found original query (not deep research, first user message)", 
+                                      original_query=original_query[:100] if original_query else None)
                             break
                 
-                logger.info("Loaded chat history from database", chat_id=request.chat_id, messages_count=len(chat_history), original_query=original_query[:100] if original_query else None)
+                logger.info("Loaded chat history from database", 
+                          chat_id=request.chat_id, 
+                          messages_count=len(chat_history), 
+                          original_query=original_query[:100] if original_query else None,
+                          is_deep_research=is_deep_research)
         except Exception as e:
             logger.warning("Failed to load chat history from database", chat_id=request.chat_id, error=str(e))
             # Fallback to request messages
             chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
-            # Original query is first user message
+            # Determine mode first
+            raw_mode = request.model or "search"
+            normalized = raw_mode.lower().replace("-", "_")
+            is_deep_research = normalized in {"quality", "deep_research", "research"}
+            # For fallback, use first user message (should be the query)
+            # CRITICAL: In fallback, request.messages might only contain clarification answer
+            # So we use first user message, but log a warning
             original_query = user_messages[0].content if user_messages else None
+            logger.warning("Using fallback: first user message as original query (chat_history from DB failed)", 
+                      original_query=original_query[:100] if original_query else None,
+                      is_deep_research=is_deep_research,
+                      user_messages_count=len(user_messages))
     else:
         # Use messages from request
         chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
-        # Original query is first user message
-        original_query = user_messages[0].content if user_messages else None
+        # Determine mode first
+        raw_mode = request.model or "search"
+        normalized = raw_mode.lower().replace("-", "_")
+        is_deep_research = normalized in {"quality", "deep_research", "research"}
+        
+        if is_deep_research and len(chat_history) > 1:
+            # Find original query for current deep research session
+            # Look backwards from the end to find last deep research marker message
+            last_deep_research_marker_idx = -1
+            for i in range(len(chat_history) - 1, -1, -1):
+                msg = chat_history[i]
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "").lower()
+                    # Look for markers that indicate deep research session
+                    if ("clarification" in content or "🔍" in content or "clarify" in content or 
+                        "deep search" in content or "initial deep search" in content or
+                        "research report" in content or "final report" in content):
+                        last_deep_research_marker_idx = i
+                        break
+            
+            # Find first user message BEFORE this marker
+            # This will be the query that started the current deep research session
+            if last_deep_research_marker_idx >= 0:
+                for i in range(last_deep_research_marker_idx - 1, -1, -1):
+                    msg = chat_history[i]
+                    if msg.get("role") == "user":
+                        original_query = msg.get("content", "")
+                        logger.info("Found original query for current deep research session (from request)", 
+                                  original_query=original_query[:100] if original_query else None,
+                                  message_index=i,
+                                  before_marker_at=last_deep_research_marker_idx)
+                        break
+            
+            if not original_query:
+                # No deep research markers found or not found before it
+                # CRITICAL: Don't use user_messages from request - they might be clarification answers!
+                # Instead, search in chat_history for the first user message
+                if len(chat_history) > 0:
+                    for msg in chat_history:
+                        if msg.get("role") == "user":
+                            original_query = msg.get("content", "")
+                            logger.warning("No markers found, using first user message from chat_history", 
+                                         original_query=original_query[:100] if original_query else None)
+                            break
+                # Fallback to user_messages only if chat_history is empty
+                if not original_query:
+                    original_query = user_messages[0].content if user_messages else None
+                    logger.warning("Using first user message from request (chat_history empty)", 
+                                 original_query=original_query[:100] if original_query else None)
+        else:
+            # Not deep research or too short
+            # CRITICAL: Use chat_history, not request.messages
+            if len(chat_history) > 0:
+                for msg in chat_history:
+                    if msg.get("role") == "user":
+                        original_query = msg.get("content", "")
+                        logger.info("Not deep research, using first user message from chat_history", 
+                                  original_query=original_query[:100] if original_query else None)
+                        break
+            # Fallback to user_messages only if chat_history is empty
+            if not original_query:
+                original_query = user_messages[0].content if user_messages else None
     
-    # Use original query if found, otherwise use last user message
-    query = original_query if original_query else user_messages[-1].content
+    # CRITICAL: Always use original query if found, otherwise use first user message
+    # Never use last user message as it might be a clarification answer!
+    # CRITICAL: For deep_research, original_query MUST come from chat_history, NOT from request.messages
+    # because request.messages may only contain the clarification answer
+    query = None
+    if original_query:
+        query = original_query
+        logger.info("Using original query", query=query[:100], mode=mode if 'mode' in locals() else "unknown")
+    elif is_deep_research and user_messages:
+        # For deep_research, NEVER use request.messages - they may only contain clarification answer
+        # Always search in chat_history for the original query
+        if len(chat_history) >= 2:
+            # Look for clarification pattern: assistant with clarification, then user message
+            for i in range(len(chat_history) - 1, -1, -1):
+                msg = chat_history[i]
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "").lower()
+                    if ("clarification" in content or "🔍" in content or "clarify" in content):
+                        # Found clarification - the query should be BEFORE this
+                        # Look for user message before clarification
+                        for j in range(i - 1, -1, -1):
+                            prev_msg = chat_history[j]
+                            if prev_msg.get("role") == "user":
+                                query = prev_msg.get("content", "")
+                                logger.info("Found query before clarification in chat_history", 
+                                           query=query[:100], 
+                                           clarification_at_index=i,
+                                           query_at_index=j)
+                                break
+                        if query:
+                            break
+        
+        # If still not found, use first user message from chat_history
+        if not query and len(chat_history) > 0:
+            for msg in chat_history:
+                if msg.get("role") == "user":
+                    query = msg.get("content", "")
+                    logger.warning("Using first user message from chat_history (no clarification pattern found)", 
+                                 query=query[:100])
+                    break
+        
+        # Last resort: use first user message from request (should not happen if chat_history is loaded)
+        if not query and user_messages:
+            query = user_messages[0].content
+            logger.error("CRITICAL: Using first user message from request - chat_history may be empty or incomplete!", 
+                       query=query[:100],
+                       chat_history_length=len(chat_history))
+    elif user_messages:
+        # For non-deep-research modes, try chat_history first
+        if len(chat_history) > 0:
+            for msg in chat_history:
+                if msg.get("role") == "user":
+                    query = msg.get("content", "")
+                    logger.info("Using first user message from chat_history", query=query[:100])
+                    break
+        # Fallback to request messages
+        if not query:
+            query = user_messages[0].content  # Use FIRST user message, not last!
+            logger.warning("Original query not found, using first user message from request", query=query[:100])
+    else:
+        query = ""
+        logger.error("No user messages found - cannot determine query!")
     
     raw_mode = request.model or "search"
     normalized = raw_mode.lower().replace("-", "_")

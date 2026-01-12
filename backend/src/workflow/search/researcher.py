@@ -236,6 +236,18 @@ async def research_agent(
         "quality": 25
     }.get(mode, 6)  # Default to 6 if mode is unknown
     
+    # CRITICAL: Log max_tokens to verify it's correct
+    max_tokens_value = None
+    if hasattr(llm, "max_tokens"):
+        max_tokens_value = llm.max_tokens
+    logger.info(
+        "Starting research agent",
+        mode=mode,
+        max_iterations=max_iterations,
+        llm_max_tokens=max_tokens_value,
+        has_max_tokens=hasattr(llm, "max_tokens"),
+    )
+    
     # CRITICAL: Additional safety check - ensure max_iterations is reasonable
     if max_iterations > 50:
         logger.warning(f"max_iterations is too high ({max_iterations}), capping at 50 to prevent infinite loops", mode=mode)
