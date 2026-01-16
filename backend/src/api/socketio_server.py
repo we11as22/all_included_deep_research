@@ -84,7 +84,55 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "settings": settings,
         }
 
-        session_id = str(uuid4())
+        # CRITICAL: Handle session cancellation when mode changes from deep_research to other modes
+        # If user switches mode (e.g., from deep_research to chat), cancel the active research session
+        if mode not in ['deep_research', 'quality'] and chat_id:
+            from src.workflow.research.session.manager import SessionManager
+            session_factory = getattr(app_state, "session_factory", None)
+            if session_factory:
+                session_manager = SessionManager(session_factory)
+                try:
+                    active_session = await session_manager.get_active_session(chat_id)
+                    if active_session:
+                        await session_manager.update_status(active_session.id, "cancelled")
+                        logger.info("🚫 Cancelled active deep_research session due to mode change",
+                                   chat_id=chat_id,
+                                   old_session_id=active_session.id,
+                                   new_mode=mode)
+                except Exception as e:
+                    logger.warning("Failed to cancel active session", error=str(e))
+
+        # CRITICAL: Use SessionManager for deep_research mode to track sessions across messages
+        session_id = None
+        original_query = None
+        is_new_session = False
+        research_session = None  # Store session for later use
+
+        if mode in ['deep_research', 'quality'] and chat_id:
+            logger.info("🔥 SocketIO: Using SessionManager for deep_research",
+                       mode=mode,
+                       chat_id=chat_id)
+            from src.workflow.research.session.manager import SessionManager
+
+            session_factory = getattr(app_state, "session_factory", None)
+            if session_factory:
+                session_manager = SessionManager(session_factory)
+                research_session, is_new_session = await session_manager.get_or_create_session(
+                    chat_id=chat_id,
+                    query=message,
+                    mode=mode
+                )
+                session_id = research_session.id
+                original_query = research_session.original_query
+                logger.info("✅ SocketIO: SessionManager result",
+                           session_id=session_id,
+                           is_new_session=is_new_session,
+                           session_status=research_session.status,
+                           original_query=original_query[:100])
+
+        # Fallback: create new session_id for other modes
+        if not session_id:
+            session_id = str(uuid4())
 
         # Create streaming generator
         stream_generator = SocketIOStreamingGenerator(
@@ -106,8 +154,13 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
         stream_generator.emit_init(mode)
 
         # Create background task for processing
+        # CRITICAL: Capture research_session from outer scope for use in process_chat
+        captured_research_session = research_session
+        
         async def process_chat():
             session_agent_dir: Path | None = None
+            # Use captured session as initial value, will be refreshed after graph execution
+            current_research_session = captured_research_session
             try:
                 # Load chat history if chat_id provided
                 chat_history = []
@@ -166,6 +219,7 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                     # Full research workflow using LangGraph
                     from src.workflow.research import run_research_graph
                     from src.config.modes import ResearchMode
+                    from src.workflow.research.session.manager import SessionManager
 
                     memory_root = Path(app_state.memory_manager.memory_dir)
                     agent_memory_service, agent_file_service, session_agent_dir = create_agent_session_services(
@@ -183,8 +237,19 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         "max_concurrent": research_mode.get_max_concurrent(),
                     }
 
+                    # CRITICAL: Use original_query from SessionManager, not current message!
+                    research_query = original_query if original_query else message
+                    logger.info("🔥 SocketIO: Starting deep_research",
+                               session_id=session_id,
+                               is_new_session=is_new_session,
+                               query=research_query[:100])
+
+                    # Get SessionManager instance
+                    session_factory = getattr(app_state, "session_factory", None)
+                    session_manager = SessionManager(session_factory) if session_factory else None
+                    
                     final_state = await run_research_graph(
-                        query=message,
+                        query=research_query,
                         chat_history=chat_history,
                         mode="quality",
                         llm=app_state.research_llm,
@@ -194,20 +259,42 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         session_id=session_id,
                         mode_config=mode_config,
                         settings=app_state.settings,
+                        session_manager=session_manager,
+                        session_factory=session_factory,
                     )
 
+                    # CRITICAL: Refresh session status from DB after graph execution
+                    # This ensures we have the latest status (may have changed during graph execution)
+                    # Use session status from DB to determine what to do - this is the proper way
+                    if session_manager and session_id:
+                        try:
+                            current_research_session = await session_manager.get_session(session_id)
+                            logger.info("Refreshed session status from DB after graph execution",
+                                       session_id=session_id,
+                                       status=current_research_session.status if current_research_session else None)
+                        except Exception as e:
+                            logger.warning("Failed to refresh session status", error=str(e))
+                            # Fallback to captured session if refresh fails
+                            if not current_research_session:
+                                current_research_session = captured_research_session
+                    
+                    # Use session status from DB to determine what to do
+                    session_status_from_db = current_research_session.status if current_research_session else None
+                    
                     # Check if graph stopped waiting for user clarification
                     if isinstance(final_state, dict):
                         clarification_needed = final_state.get("clarification_needed", False)
                         clarification_waiting = final_state.get("clarification_waiting", False)
                         should_stop = final_state.get("should_stop", False)
 
-                        if clarification_needed or clarification_waiting or should_stop:
+                        # If session is waiting for clarification and user hasn't answered, stop
+                        if (clarification_needed or clarification_waiting or should_stop) and session_status_from_db == "waiting_clarification":
                             stream_generator.emit_status("Waiting for your clarification answers...", step="clarification")
                             await asyncio.sleep(0.1)
                             await stream_generator.emit_done()
                             return
 
+                    # Extract final_report
                     final_report_raw = None
                     try:
                         final_report_raw = (
@@ -218,6 +305,52 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                     except Exception:
                         final_report_raw = ""
 
+                    # CRITICAL: If no final_report, check session status from DB
+                    # This is the proper way - use session state to determine continuation
+                    if not final_report_raw:
+                        # If this is a new session, research is just starting - this is normal
+                        # Don't emit error - let research proceed (deep search, clarification, etc.)
+                        if is_new_session:
+                            logger.info("New session - research is starting, no final_report yet is normal",
+                                       session_id=session_id,
+                                       session_status=session_status_from_db)
+                            # Research is just starting - don't emit error, let it proceed
+                            # The graph will emit results via stream as they become available
+                            await stream_generator.emit_done()
+                            return
+                        
+                        # If session is in "researching" status, research is still in progress
+                        # Don't emit empty report - let research continue
+                        if session_status_from_db == "researching":
+                            logger.info("Session status is 'researching' - research is in progress, not emitting empty report",
+                                       session_id=session_id,
+                                       is_new_session=is_new_session)
+                            # Research is still running - don't emit done, let it continue
+                            # The graph will emit results via stream as they become available
+                            await stream_generator.emit_done()
+                            return
+                        
+                        # If session is in "waiting_clarification", user needs to answer
+                        # But if we got here and it's not a new session, user might have just answered
+                        if session_status_from_db == "waiting_clarification":
+                            # Check if user answered (graph should have updated status to "researching" if answered)
+                            # If still "waiting_clarification", user hasn't answered yet - this is normal
+                            logger.info("Session is waiting for clarification - this is normal, not emitting error",
+                                       session_id=session_id)
+                            # Don't emit error - clarification questions should be shown to user
+                            await stream_generator.emit_done()
+                            return
+                        
+                        # If session is in "active" status and no final_report, research may be starting
+                        # This is normal for new sessions or early in research process
+                        if session_status_from_db == "active":
+                            logger.info("Session status is 'active' - research may be starting, not emitting error",
+                                       session_id=session_id,
+                                       is_new_session=is_new_session)
+                            # Don't emit error - research may be in early stages
+                            await stream_generator.emit_done()
+                            return
+
                     if isinstance(final_report_raw, dict) and "value" in final_report_raw:
                         final_report = final_report_raw["value"]
                     elif isinstance(final_report_raw, dict) and "content" in final_report_raw:
@@ -227,15 +360,132 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                     else:
                         final_report = str(final_report_raw) if final_report_raw else ""
 
-                    if final_report:
+                    # CRITICAL: Check for draft_report first - it's the structured research result with chapters
+                    # Draft report is the primary result, final_report is generated from it
+                    draft_report_available = False
+                    draft_report_content = None
+                    agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                    if agent_memory_service:
+                        try:
+                            draft_report_content = await agent_memory_service.file_manager.read_file("draft_report.md")
+                            if len(draft_report_content) > 500:
+                                draft_report_available = True
+                                logger.info("Draft report available as research result",
+                                           draft_length=len(draft_report_content),
+                                           note="Draft report contains structured chapters and is the research result")
+                        except Exception as e:
+                            logger.warning("Could not read draft_report", error=str(e))
+                    
+                    # Priority: draft_report (structured chapters) > final_report (generated) > fallback
+                    if draft_report_available and draft_report_content:
+                        # CRITICAL: Draft report is the structured research result - send it as final result
+                        logger.info("Sending draft_report as final research result (structured chapters)",
+                                   draft_length=len(draft_report_content),
+                                   session_status=session_status_from_db)
+                        stream_generator.emit_status("Finalizing report...", step="report")
+                        for chunk in _chunk_text(draft_report_content, size=200):
+                            stream_generator.emit_report_chunk(chunk)
+                            await asyncio.sleep(0.02)
+                        stream_generator.emit_final_report(draft_report_content)
+                        _store_session_report(app_state, session_id, draft_report_content, message, mode)
+                    elif final_report:
+                        # Fallback to generated final_report if draft_report not available
+                        logger.info("Using generated final_report (draft_report not available)",
+                                   final_report_length=len(final_report))
                         stream_generator.emit_status("Finalizing report...", step="report")
                         for chunk in _chunk_text(final_report, size=200):
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(final_report)
                         _store_session_report(app_state, session_id, final_report, message, mode)
+                    elif session_status_from_db == "completed":
+                        # CRITICAL: If research completed but no final_report, use draft_report as result
+                        # Draft report is the structured research result with chapters
+                        logger.info("Research completed - using draft_report as final result",
+                                   session_id=session_id,
+                                   note="Draft report contains structured chapters and is the research result")
+                        agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                        if agent_memory_service:
+                            try:
+                                draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+                                if len(draft_report) > 500:
+                                    logger.info("Sending draft_report as final research result",
+                                               draft_length=len(draft_report),
+                                               note="Draft report is the structured research result with chapters")
+                                    stream_generator.emit_status("Finalizing report...", step="report")
+                                    for chunk in _chunk_text(draft_report, size=200):
+                                        stream_generator.emit_report_chunk(chunk)
+                                        await asyncio.sleep(0.02)
+                                    stream_generator.emit_final_report(draft_report)
+                                    _store_session_report(app_state, session_id, draft_report, message, mode)
+                                else:
+                                    logger.warning("Draft report too short, trying fallback",
+                                                 draft_length=len(draft_report))
+                                    # Fallback to findings if draft_report is too short
+                                    if isinstance(final_state, dict):
+                                        findings = final_state.get("findings", final_state.get("agent_findings", []))
+                                        if findings:
+                                            findings_text = "\n\n".join([
+                                                f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
+                                                for f in findings
+                                            ])
+                                            fallback_report = f"# Research Report: {research_query}\n\n## Findings\n\n{findings_text}"
+                                            stream_generator.emit_final_report(fallback_report)
+                                            _store_session_report(app_state, session_id, fallback_report, message, mode)
+                            except Exception as e:
+                                logger.warning("Could not read draft_report", error=str(e))
                     else:
-                        stream_generator.emit_error("No report generated")
+                        # No final_report - check if this is expected (research starting, waiting for clarification, etc.)
+                        # Only emit error if research actually completed but no report was generated
+                        
+                        # Check if research completed (session status should be "completed" if research finished)
+                        if session_status_from_db == "completed":
+                            # Research completed but no final_report - try fallback
+                            logger.warning("Research completed but no final_report, trying fallback sources",
+                                         session_id=session_id)
+                            fallback_report = None
+                            agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                            if agent_memory_service:
+                                try:
+                                    draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+                                    if len(draft_report) > 500:
+                                        fallback_report = draft_report
+                                        logger.info("Using draft_report.md as fallback report", length=len(draft_report))
+                                except Exception as e:
+                                    logger.warning("Could not read draft_report", error=str(e))
+                            
+                            if not fallback_report and isinstance(final_state, dict):
+                                findings = final_state.get("findings", final_state.get("agent_findings", []))
+                                if findings:
+                                    findings_text = "\n\n".join([
+                                        f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
+                                        for f in findings
+                                    ])
+                                    fallback_report = f"# Research Report: {research_query}\n\n## Findings\n\n{findings_text}"
+                                    logger.info("Using findings as fallback report", findings_count=len(findings))
+                            
+                            if fallback_report:
+                                stream_generator.emit_status("Finalizing report...", step="report")
+                                for chunk in _chunk_text(fallback_report, size=200):
+                                    stream_generator.emit_report_chunk(chunk)
+                                    await asyncio.sleep(0.02)
+                                stream_generator.emit_final_report(fallback_report)
+                                _store_session_report(app_state, session_id, fallback_report, message, mode)
+                            else:
+                                # Research completed but no report available - this is an error
+                                logger.error("Research completed but no final_report and no fallback available",
+                                           session_id=session_id,
+                                           session_status=session_status_from_db)
+                                stream_generator.emit_error("No report generated and no fallback available")
+                        else:
+                            # Research is not completed yet - this is normal, don't emit error
+                            # Status is "active", "waiting_clarification", or "researching" - research is in progress
+                            logger.info("No final_report but research is in progress - this is normal, not emitting error",
+                                       session_id=session_id,
+                                       session_status=session_status_from_db,
+                                       is_new_session=is_new_session)
+                            # Don't emit error - research is still running or waiting for user input
+                            # The graph will emit results via stream as they become available
                 else:
                     await stream_generator.emit_error(f"Unknown mode: {mode}")
 

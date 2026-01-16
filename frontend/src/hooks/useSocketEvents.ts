@@ -111,12 +111,22 @@ export function useSocketEvents() {
           break;
 
         case 'source_found':
-          useChatStore.getState().updateProgress(messageId, {
-            sources: [
-              ...(useChatStore.getState().progressByMessage[messageId]?.sources || []),
-              { url: data.url, title: data.title },
-            ].slice(-60), // Keep last 60
-          }, chatId);
+          const currentSources = useChatStore.getState().progressByMessage[messageId]?.sources || [];
+          // Deduplicate sources by URL to prevent duplicates
+          const sourceKey = `${data.url || ''}|${data.title || ''}`;
+          const isDuplicate = currentSources.some(
+            (s: any) => `${s.url || ''}|${s.title || ''}` === sourceKey
+          );
+          if (!isDuplicate && (data.url || data.title)) {
+            // CRITICAL: No limit on sources - show all sources found during research
+            // Previous limit of 60 was causing sources counter to stop at 60
+            useChatStore.getState().updateProgress(messageId, {
+              sources: [
+                ...currentSources,
+                { url: data.url, title: data.title, researcher_id: data.researcher_id },
+              ],
+            }, chatId);
+          }
           break;
 
         case 'finding':
@@ -177,9 +187,20 @@ export function useSocketEvents() {
               window.dispatchEvent(new CustomEvent('chat-list-refresh'));
             }
 
+            // CRITICAL: Mark as complete but KEEP progress panel visible
+            // Progress panel should remain visible after completion to show final state and download button
             useChatStore.getState().updateProgress(messageId, {
               isComplete: true,
+              status: 'Complete',
+              step: 'complete',
             }, chatId);
+            
+            // CRITICAL: Ensure progress panel message ID is set so panel remains visible
+            const store = useChatStore.getState();
+            if (!store.progressPanelMessageId || store.progressPanelMessageId !== messageId) {
+              store.setProgressPanelMessageId(messageId);
+            }
+            
             finalizeAgentTodos(messageId, chatId);
           }
           break;

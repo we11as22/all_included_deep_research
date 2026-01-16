@@ -116,7 +116,10 @@ async def _run_researcher_agent_impl(
 
     # Load agent file
     agent_file = await agent_file_service.read_agent_file(agent_id)
-    character = agent_file.get("character", "")
+    # CRITICAL: Only truncate character if extremely long (over 2000 chars) - don't break normal usage
+    raw_character = agent_file.get("character", "")
+    max_character_length = 2000  # Only truncate if extremely long
+    character = raw_character[:max_character_length] + "..." if len(raw_character) > max_character_length else raw_character
     preferences = agent_file.get("preferences", "")
     todos = agent_file.get("todos", [])
     
@@ -125,7 +128,10 @@ async def _run_researcher_agent_impl(
     all_notes = agent_file.get("notes", [])
     # Notes are already limited to 20 in read_agent_file, but we limit further for context
     recent_notes = all_notes[-10:] if len(all_notes) > 10 else all_notes
-    notes_context = "\n".join([f"- {note}" for note in recent_notes]) if recent_notes else "No previous notes."
+    # CRITICAL: Only truncate notes if they're extremely long (over 1000 chars) - don't break normal usage
+    max_note_length = 1000  # Only truncate if extremely long
+    truncated_notes = [note[:max_note_length] + "..." if len(note) > max_note_length else note for note in recent_notes]
+    notes_context = "\n".join([f"- {note}" for note in truncated_notes]) if truncated_notes else "No previous notes."
     
     # Log note count for debugging
     if all_notes:
@@ -171,7 +177,10 @@ async def _run_researcher_agent_impl(
             current_task.title,
             status="in_progress"
         )
-        logger.info(f"Agent {agent_id} starting task", task=current_task.title)
+        logger.info(f"Agent {agent_id} starting task", 
+                   task=current_task.title,
+                   pending_tasks=len(pending_tasks),
+                   note="Agent working in parallel with other agents")
 
         # Reload to get updated todos
         agent_file = await agent_file_service.read_agent_file(agent_id)
@@ -207,19 +216,65 @@ Sources needed: {', '.join(current_task.sources_needed) if hasattr(current_task,
 
 **CRITICAL**: The task objective and guidance above contain all the context you need. If the task mentions a user query (e.g., "The user asked: ..."), that is the specific topic you must research. Focus your research plan on exactly what is described in the task.
 
-Create a detailed research plan for completing this task.
+**MANDATORY: Keep your plan BRIEF and CONCISE.**
+- reasoning: 1-2 sentences maximum
+- current_goal: 1 sentence maximum (DO NOT repeat the full task objective, just state the goal)
+- next_steps: 1-3 short action items (1-5 words each)
+- expected_findings: 1 sentence maximum
+- search_strategy: 1 sentence maximum
+- fallback_if_stuck: 1 sentence maximum
+
+Create a BRIEF, actionable research plan for completing this task.
 """
 
     try:
-        plan = await llm.with_structured_output(AgentPlan).ainvoke([
-            {"role": "system", "content": f"You are a research planning expert."},
-            {"role": "user", "content": plan_prompt}
-        ])
-        logger.info(f"Agent {agent_id} created plan", goal=plan.current_goal)
+        # Use structured output - it handles JSON parsing automatically
+        # CRITICAL: The issue is LLM generating 131k tokens in RESPONSE, not in input
+        # We need to limit the RESPONSE tokens, not truncate input
+        try:
+            # Try to bind max_tokens if LLM supports it
+            llm_for_plan = llm
+            if hasattr(llm, "bind") or hasattr(llm, "with_config"):
+                try:
+                    if hasattr(llm, "with_config"):
+                        llm_for_plan = llm.with_config({"max_tokens": 500})  # Limit response to 500 tokens
+                    elif hasattr(llm, "bind"):
+                        llm_for_plan = llm.bind(max_tokens=500)
+                except:
+                    pass  # If binding fails, use original LLM
+            
+            plan = await llm_for_plan.with_structured_output(
+                AgentPlan,
+                method="json_schema"  # Use JSON schema mode for better token control
+            ).ainvoke([
+                {"role": "system", "content": f"You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. CRITICAL: Your response must be under 500 tokens total."},
+                {"role": "user", "content": plan_prompt}
+            ])
+        except Exception as e:
+            logger.warning(f"Plan creation with max_tokens failed, using fallback", error=str(e))
+            # Fallback without max_tokens
+            plan = await llm.with_structured_output(
+                AgentPlan,
+                method="json_schema"
+            ).ainvoke([
+                {"role": "system", "content": f"You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured."},
+                {"role": "user", "content": plan_prompt}
+            ])
+        logger.info(f"Agent {agent_id} created plan", goal=plan.current_goal[:100] if plan.current_goal else "N/A")
     except Exception as e:
-        logger.error(f"Agent {agent_id} plan creation failed", error=str(e))
+        error_msg = str(e)
+        # Structured output should handle JSON parsing, but if it fails, log details
+        # This usually happens if LLM response is malformed or too long
+        if "Expecting value" in error_msg or "JSON" in error_msg or "parse" in error_msg.lower():
+            logger.error(f"Agent {agent_id} plan creation failed - structured output parsing error", 
+                        error=error_msg[:300],
+                        error_type=type(e).__name__,
+                        note="Structured output failed to parse LLM response (may be too long or malformed), using fallback plan")
+        else:
+            logger.error(f"Agent {agent_id} plan creation failed", error=error_msg[:300], error_type=type(e).__name__)
+        # Fallback plan - structured output failed, use simple plan
         plan = AgentPlan(
-            reasoning="Fallback plan due to error",
+            reasoning="Fallback plan due to structured output error",
             current_goal=current_task.objective,
             next_steps=["Search for sources", "Analyze findings"],
             expected_findings="Research results",
@@ -720,17 +775,72 @@ Assess your progress and whether you need to adjust your approach.
 
                     # Replan if needed
                     if reflection.should_replan and reflection.new_direction:
+                        # CRITICAL: Log actual lengths to understand what's being passed
+                        goal_length = len(plan.current_goal) if plan.current_goal else 0
+                        direction_length = len(reflection.new_direction) if reflection.new_direction else 0
+                        logger.info(f"Agent {agent_id} starting replan", 
+                                   previous_goal_length=goal_length,
+                                   new_direction_length=direction_length,
+                                   previous_goal_preview=plan.current_goal[:150] if plan.current_goal else "N/A",
+                                   new_direction_preview=reflection.new_direction[:150] if reflection.new_direction else "N/A")
+                        
+                        # CRITICAL: Only truncate if REALLY long (over 500 chars) - don't break normal usage
+                        # The real issue is LLM generating 131k tokens in RESPONSE, not in input
+                        # So we need to limit the RESPONSE, not the input
+                        max_goal_length = 500  # Only truncate if extremely long
+                        max_direction_length = 500
+                        truncated_goal = plan.current_goal[:max_goal_length] + "..." if plan.current_goal and len(plan.current_goal) > max_goal_length else (plan.current_goal or "")
+                        truncated_direction = reflection.new_direction[:max_direction_length] + "..." if reflection.new_direction and len(reflection.new_direction) > max_direction_length else (reflection.new_direction or "")
+                        
                         replan_prompt = f"""Your current approach needs adjustment.
 
-Previous plan: {plan.current_goal}
-New direction: {reflection.new_direction}
+Previous plan goal: {truncated_goal}
+New direction: {truncated_direction}
 
-Create an updated research plan incorporating this new direction.
+Create an updated research plan incorporating this new direction. Keep it concise and actionable.
+
+**MANDATORY: Keep your plan BRIEF and CONCISE.**
+- reasoning: 1-2 sentences maximum
+- current_goal: 1 sentence maximum (DO NOT repeat the full previous goal, just state the new goal)
+- next_steps: 1-3 short action items (1-5 words each)
+- expected_findings: 1 sentence maximum
+- search_strategy: 1 sentence maximum
+- fallback_if_stuck: 1 sentence maximum
 """
-                        plan = await llm.with_structured_output(AgentPlan).ainvoke([
-                            {"role": "system", "content": "You are a research planning expert."},
-                            {"role": "user", "content": replan_prompt}
-                        ])
+                        
+                        # CRITICAL: The issue is LLM generating 131k tokens in RESPONSE
+                        # We need to add max_tokens limit to the LLM call itself, not truncate input
+                        # Check if LLM supports max_tokens parameter
+                        try:
+                            # Try to bind max_tokens if LLM supports it
+                            llm_for_replan = llm
+                            if hasattr(llm, "bind") or hasattr(llm, "with_config"):
+                                # Some LLMs support max_tokens via bind/with_config
+                                try:
+                                    if hasattr(llm, "with_config"):
+                                        llm_for_replan = llm.with_config({"max_tokens": 500})  # Limit response to 500 tokens
+                                    elif hasattr(llm, "bind"):
+                                        llm_for_replan = llm.bind(max_tokens=500)
+                                except:
+                                    pass  # If binding fails, use original LLM
+                            
+                            plan = await llm_for_replan.with_structured_output(
+                                AgentPlan,
+                                method="json_schema"
+                            ).ainvoke([
+                                {"role": "system", "content": "You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. DO NOT repeat previous plan details - just create a new brief plan. CRITICAL: Your response must be under 500 tokens total."},
+                                {"role": "user", "content": replan_prompt}
+                            ])
+                        except Exception as e:
+                            logger.warning(f"Replan with max_tokens failed, using fallback", error=str(e))
+                            # Fallback without max_tokens
+                            plan = await llm.with_structured_output(
+                                AgentPlan,
+                                method="json_schema"
+                            ).ainvoke([
+                                {"role": "system", "content": "You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. DO NOT repeat previous plan details - just create a new brief plan."},
+                                {"role": "user", "content": replan_prompt}
+                            ])
                         logger.info(f"Agent {agent_id} replanned", new_goal=plan.current_goal)
 
                         # Update agent history with new direction
@@ -869,8 +979,9 @@ Create an updated research plan incorporating this new direction.
     useful_sources = filtered_sources[:30] if filtered_sources else sources[:10]
     
     # Create finding - ONLY real information, NO metadata spam
+    # CRITICAL: Include agent_id so supervisor queue can identify which agent completed
     finding = {
-        "agent_id": agent_id,
+        "agent_id": agent_id,  # CRITICAL: Must be included for supervisor queue processing
         "topic": current_task.title,
         "summary": summary,  # Only real findings, no metadata
         "key_findings": key_findings,  # Only real findings, filtered
@@ -882,30 +993,41 @@ Create an updated research plan incorporating this new direction.
         "key_findings_count": len(key_findings)
     }
 
-    # Mark task as done
-    await agent_file_service.update_agent_todo(
+    # Mark task as done FIRST, before emitting
+    # CRITICAL: Agent can always mark its own task as done, even if supervisor tried to change status
+    # The protection in update_agent_todo allows status change to "done" for in_progress tasks
+    update_result = await agent_file_service.update_agent_todo(
         agent_id,
         current_task.title,
         status="done",
         note=f"Completed with {len(sources)} sources"
     )
+    if not update_result:
+        logger.warning(f"Agent {agent_id} failed to mark task as done - task may have been modified", task=current_task.title)
+    else:
+        logger.info(f"Agent {agent_id} marked task as done", task=current_task.title)
 
-    # Reload todos
+    # Reload todos to get updated status
     agent_file = await agent_file_service.read_agent_file(agent_id)
     todos = agent_file.get("todos", [])
 
-    # Emit completion
+    # Emit updated todos with correct status
     if stream:
         todos_dict = [
             {
                 "title": t.title,
-                "status": t.status,
+                "status": t.status,  # Should be "done" for completed task
                 "note": t.note,
                 "url": t.url
             }
             for t in todos
         ]
         stream.emit_agent_todo(agent_id, todos_dict)
+        logger.info(f"Agent {agent_id} todos emitted to frontend", 
+                   todos_count=len(todos_dict),
+                   done_count=sum(1 for t in todos if t.status == "done"),
+                   pending_count=sum(1 for t in todos if t.status == "pending"),
+                   in_progress_count=sum(1 for t in todos if t.status == "in_progress"))
 
         # Final note
         final_note = AgentNote(
@@ -930,15 +1052,24 @@ Create an updated research plan incorporating this new direction.
             "summary": summary[:200]
         })
 
-    logger.info(f"Agent {agent_id} completed task", task=current_task.title, sources=len(sources))
+    logger.info(f"Agent {agent_id} completed task", 
+               task=current_task.title, 
+               sources=len(sources),
+               note="Task completed, queuing for supervisor review")
 
-    # Signal supervisor queue
+    # Signal supervisor queue - agents queue results asynchronously
     if supervisor_queue:
         await supervisor_queue.agent_completed_task(
             agent_id=agent_id,
             task_title=current_task.title,
             result=finding
         )
-        logger.info(f"Agent {agent_id} queued for supervisor review")
+        queue_size = supervisor_queue.size()
+        logger.info(f"Agent {agent_id} queued for supervisor review", 
+                   task=current_task.title,
+                   queue_size=queue_size,
+                   note="Result added to supervisor queue, will be processed after cycle")
+    else:
+        logger.warning(f"Agent {agent_id} completed task but no supervisor_queue available", task=current_task.title)
 
     return finding

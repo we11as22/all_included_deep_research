@@ -43,8 +43,9 @@ class AgentTodo(BaseModel):
     
     model_config = ConfigDict(
         # Force all fields to be in required array for Azure/OpenRouter compatibility
+        # NOTE: Fields with default values should NOT be in required array for proper structured output
         json_schema_extra={
-            "required": ["reasoning", "title", "objective", "expected_output", "sources_needed", "priority", "guidance"]
+            "required": ["reasoning", "title", "objective", "expected_output"]
         }
     )
 
@@ -65,7 +66,7 @@ class AgentCharacteristic(BaseModel):
     role: str = Field(description="Agent role (e.g., 'Senior Aviation Expert')")
     expertise: str = Field(description="Domain expertise")
     personality: str = Field(description="Research personality and approach")
-    initial_todos: list[AgentTodo] = Field(description="Initial task list", min_length=1, max_length=5)
+    initial_todos: list[AgentTodo] = Field(description="Initial task list - MUST have 2-3 tasks per agent for comprehensive research", min_length=2, max_length=5)
 
 
 class AgentCharacteristics(BaseModel):
@@ -233,7 +234,7 @@ class ClarifyingQuestion(BaseModel):
 
 class ClarificationNeeds(BaseModel):
     """Assessment of whether clarification is needed."""
-    
+
     model_config = ConfigDict(
         # Force all fields to be in required array for Azure/OpenRouter compatibility
         json_schema_extra={
@@ -244,8 +245,37 @@ class ClarificationNeeds(BaseModel):
     reasoning: str = Field(description="Analysis of query clarity")
     needs_clarification: bool = Field(description="Whether user input is needed")
     questions: list[ClarifyingQuestion] = Field(
-        description="Questions to ask user",
+        description="Questions to ask user - MUST always return at least 2-3 questions, never empty list",
         default_factory=list,
+        min_length=2,
         max_length=3
     )
     can_proceed_without: bool = Field(description="Whether research can proceed with assumptions")
+
+
+# ==================== Findings Compression ====================
+
+class CompressedFindings(BaseModel):
+    """Compressed and structured research findings."""
+
+    reasoning: str = Field(description="Analysis of findings and compression strategy")
+    key_insights: list[str] = Field(
+        description="Most important insights from all findings",
+        min_length=3,
+        max_length=15
+    )
+    themes: list[str] = Field(
+        description="Main themes identified across findings",
+        min_length=1,
+        max_length=8
+    )
+    summary: str = Field(
+        description="Comprehensive summary of all findings (500-1000 words)"
+    )
+    source_count: int = Field(
+        description="Total number of unique sources",
+        ge=0
+    )
+    confidence: Literal["low", "medium", "high"] = Field(
+        description="Confidence in findings completeness"
+    )

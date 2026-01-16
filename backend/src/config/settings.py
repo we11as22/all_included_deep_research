@@ -77,7 +77,7 @@ class Settings(BaseSettings):
     chunk_overlap: int = Field(default=200, description="Chunk overlap")
 
     # Deep Research Multi-Agent Settings
-    deep_research_num_agents: int = Field(default=4, description="Number of researcher agents for Deep Research mode")
+    deep_research_num_agents: int = Field(default=3, description="Number of researcher agents for Deep Research mode")
     deep_research_enable_clarifying_questions: bool = Field(default=True, description="Enable clarifying questions in Deep Research mode")
     deep_research_run_deep_search_first: bool = Field(default=True, description="Run deep search before spawning agents in Deep Research mode")
 
@@ -174,10 +174,10 @@ class Settings(BaseSettings):
     quality_max_concurrent: int = Field(default=3, description="Quality mode max concurrent researchers")  # Old value: 4
     
     # Deep Research Limits (centralized configuration)
-    deep_research_max_supervisor_calls: int = Field(default=6, description="Max supervisor calls in deep research")  # Old value: 10
+    deep_research_max_supervisor_calls: int = Field(default=12, description="Max supervisor calls in deep research")  # Increased from 6 to allow more thorough research coordination
     deep_research_agent_max_steps: int = Field(default=10, description="Max steps per agent task in deep research")  # Increased for deeper research
-    deep_research_supervisor_max_iterations: int = Field(default=10, description="Max ReAct iterations for supervisor agent")  # Old value: 15 (was increased from 10)
-    deep_research_default_max_iterations: int = Field(default=15, description="Default max iterations for deep research cycles")  # Old value: 25
+    deep_research_supervisor_max_iterations: int = Field(default=7, description="Max ReAct iterations per ONE supervisor call (not total) - keep low to force frequent agent-supervisor cycles")  # Low value = supervisor works quickly and returns to agents
+    deep_research_default_max_iterations: int = Field(default=20, description="Default max iterations for deep research cycles")  # Increased from 15 for more comprehensive research
 
     # Advanced Settings
     memory_context_limit: int = Field(default=6, description="Max memory snippets for chat prompts")

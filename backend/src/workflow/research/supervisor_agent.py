@@ -160,12 +160,36 @@ async def write_main_document_handler(args: Dict[str, Any], context: Dict[str, A
         # Read current content
         current = await agent_memory_service.read_main_file()
         
-        # Create structured update with key insights only
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        update = f"\n\n---\n\n## {section_title} - {timestamp}\n\n{content}\n"
-        
-        # Append to document
-        updated = current + update
+        # CRITICAL: If updating Research Plan section, replace it instead of appending
+        if section_title == "Research Plan" or section_title.lower() == "research plan":
+            import re
+            # Replace existing Research Plan section if it exists
+            pattern = r"## Research Plan.*?(?=\n## |\Z)"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            new_plan_section = f"""## Research Plan
+
+**Updated:** {timestamp}
+
+{content}
+
+---
+**Note:** This research plan can be updated by the supervisor as research progresses.
+"""
+            if re.search(pattern, current, re.DOTALL):
+                # Replace existing section
+                updated = re.sub(pattern, new_plan_section.strip(), current, flags=re.DOTALL)
+                logger.info("Research Plan section updated in main.md")
+            else:
+                # Append new section if not found
+                updated = current + "\n\n" + new_plan_section
+                logger.info("Research Plan section added to main.md")
+        else:
+            # Create structured update with key insights only
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            update = f"\n\n---\n\n## {section_title} - {timestamp}\n\n{content}\n"
+            
+            # Append to document
+            updated = current + update
         
         # Limit main.md size - if too large, summarize older sections
         if len(updated) > 50000:  # ~50KB limit for main.md
@@ -196,60 +220,283 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
     """
     Write/update draft research report (draft_report.md).
     
+    CRITICAL: Draft report is structured by chapters (one chapter = one finding).
+    Each finding from an agent becomes a new chapter in the draft report.
+    Supervisor adds chapters iteratively as findings arrive.
+    
     This is the supervisor's working document where the final report is assembled.
-    This file will be used to generate the final report for the user.
+    
+    Context available:
+    - query: Original user query
+    - deep_search_result: Initial deep search result
+    - clarification_context: User clarification answers
+    - chapter_summaries: Summaries of existing chapters (to avoid repetition)
     """
     agent_memory_service = context.get("agent_memory_service")
+    session_id = context.get("session_id")
+    session_factory = context.get("session_factory")
+    query = context.get("query", "")
+    deep_search_result = context.get("deep_search_result", "")
+    clarification_context = context.get("clarification_context", "")
+    chapter_summaries = context.get("chapter_summaries", [])
     
     if not agent_memory_service:
         return {"error": "Memory service not available"}
     
     try:
         content = args.get("content", "")
-        section_title = args.get("section_title", "Update")
+        # Support both chapter_title and section_title (for backward compatibility)
+        chapter_title = args.get("chapter_title") or args.get("section_title", "Chapter")
+        finding_data = args.get("finding", None)  # Optional: full finding data for chapter summary
+        
+        # CRITICAL: Log context for debugging
+        logger.info("write_draft_report called - context available",
+                   chapter_title=chapter_title,
+                   query_preview=query[:100] if query else "None",
+                   deep_search_length=len(deep_search_result) if deep_search_result else 0,
+                   deep_search_preview=deep_search_result[:200] if deep_search_result else "None",
+                   clarification_length=len(clarification_context) if clarification_context else 0,
+                   clarification_preview=clarification_context[:200] if clarification_context else "None",
+                   existing_chapters=len(chapter_summaries),
+                   chapter_summaries_preview=[ch.get("chapter_title", "Unknown") for ch in chapter_summaries[-5:]],
+                   note="Supervisor has access to: query, deep_search, clarification, existing chapters - use this to write adapted chapter")
+        
+        # CRITICAL: Build context summary for supervisor to see when writing chapter
+        # This will be included in the tool response so supervisor knows what context is available
+        context_summary = {
+            "query": query,
+            "deep_search_preview": deep_search_result[:500] if deep_search_result else "",
+            "clarification_preview": clarification_context[:300] if clarification_context else "",
+            "existing_chapters_count": len(chapter_summaries),
+            "existing_chapters_summaries": [
+                {
+                    "chapter_number": ch.get("chapter_number"),
+                    "chapter_title": ch.get("chapter_title"),
+                    "topic": ch.get("topic"),
+                    "summary_preview": ch.get("summary", "")[:200]
+                }
+                for ch in chapter_summaries[-5:]  # Last 5 chapters
+            ]
+        }
         
         # Read current draft report
         draft_file = "draft_report.md"
         try:
             current = await agent_memory_service.file_manager.read_file(draft_file)
         except FileNotFoundError:
-            # Create initial draft report
+            # Create initial draft report with structure for chapters
+            query = context.get('query', 'Unknown')
             current = f"""# Research Report Draft
 
-**Query:** {context.get('query', 'Unknown')}
+**Query:** {query}
 **Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Status:** In Progress
 
 ## Overview
 
-This is the working draft of the research report. The supervisor agent writes findings here as research progresses.
+This is the working draft of the research report. Each chapter represents findings from one agent task.
 
 ---
 """
         
-        # Create structured update
-        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        update = f"\n\n---\n\n## {section_title} - {timestamp}\n\n{content}\n"
+        # Create new chapter (not just a section update)
+        # CRITICAL: Simple structure - just chapter title and content, no metadata
+        chapter_number = current.count("## Chapter") + 1  # Count existing chapters
         
-        # Append to draft
-        updated = current + update
+        # Extract sources from finding_data if available, add at end of chapter
+        sources_section = ""
+        if finding_data and finding_data.get("sources"):
+            sources = finding_data.get("sources", [])
+            sources_list = []
+            for source in sources[:30]:  # Limit to 30 sources per chapter
+                title = source.get("title", "Unknown")
+                url = source.get("url", "")
+                if url:
+                    sources_list.append(f"- [{title}]({url})")
+                else:
+                    sources_list.append(f"- {title}")
+            if sources_list:
+                sources_section = f"\n\n## Sources\n\n" + "\n".join(sources_list) + "\n"
+        
+        # Format chapter with clean structure - no metadata, just title, content, and sources
+        chapter = f"""
+
+---
+
+## Chapter {chapter_number}: {chapter_title}
+
+{content}{sources_section}
+
+"""
+        
+        # Append chapter to draft
+        updated = current + chapter
         await agent_memory_service.file_manager.write_file(draft_file, updated)
         
-        logger.info("Draft report updated", section=section_title, content_length=len(content), total_length=len(updated))
+        # CRITICAL: Store chapter summary in session_metadata for fallback synthesis
+        if finding_data and session_id and session_factory:
+            try:
+                from src.workflow.research.session.manager import SessionManager
+                session_manager = SessionManager(session_factory)
+                
+                # Get current session metadata
+                session_data = await session_manager.get_session(session_id)
+                current_metadata = session_data.get("session_metadata", {}) if session_data else {}
+                
+                # Initialize chapter_summaries if not exists
+                if "chapter_summaries" not in current_metadata:
+                    current_metadata["chapter_summaries"] = []
+                
+                # Create chapter summary (full, not heavily truncated)
+                chapter_summary = {
+                    "chapter_number": chapter_number,
+                    "chapter_title": chapter_title,
+                    "timestamp": timestamp,
+                    "agent_id": finding_data.get("agent_id", "unknown") if finding_data else "unknown",
+                    "topic": finding_data.get("topic", chapter_title) if finding_data else chapter_title,
+                    "summary": finding_data.get("summary", content[:500]) if finding_data else content[:500],
+                    "key_findings": finding_data.get("key_findings", [])[:10] if finding_data else [],  # First 10 key findings
+                    "sources_count": len(finding_data.get("sources", [])) if finding_data else 0,
+                    "content_preview": content[:1000]  # First 1000 chars of content
+                }
+                
+                current_metadata["chapter_summaries"].append(chapter_summary)
+                
+                # Update session metadata
+                from sqlalchemy import update
+                from src.database.schema import ResearchSessionModel
+                async with session_factory() as session:
+                    await session.execute(
+                        update(ResearchSessionModel)
+                        .where(ResearchSessionModel.id == session_id)
+                        .values(session_metadata=current_metadata, updated_at=datetime.now())
+                    )
+                    await session.commit()
+                
+                logger.info("Chapter summary stored in session metadata",
+                           chapter_number=chapter_number,
+                           summaries_count=len(current_metadata["chapter_summaries"]))
+            except Exception as e:
+                logger.warning("Failed to store chapter summary in session metadata", error=str(e))
         
+        logger.info("Draft report chapter added", 
+                   chapter_number=chapter_number,
+                   chapter_title=chapter_title,
+                   content_length=len(content),
+                   total_length=len(updated),
+                   context_used={
+                       "query": bool(query),
+                       "deep_search": bool(deep_search_result),
+                       "clarification": bool(clarification_context),
+                       "existing_chapters": len(chapter_summaries)
+                   })
+        
+        # Return success with context info for supervisor
         return {
             "success": True,
             "new_length": len(updated),
-            "section": section_title
+            "chapter_number": chapter_number,
+            "chapter_title": chapter_title,
+            "context_available": {
+                "query": query[:100] if query else "",
+                "has_deep_search": bool(deep_search_result),
+                "has_clarification": bool(clarification_context),
+                "existing_chapters": len(chapter_summaries)
+            }
         }
     except Exception as e:
-        logger.error("Failed to write draft report", error=str(e))
+        logger.error("Failed to write draft report chapter", error=str(e))
+        return {"error": str(e)}
+
+
+async def update_synthesized_report_handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict:
+    """
+    Update the SYNTHESIZED REPORT section of draft_report.md.
+
+    This is the main tool for supervisor to write structured report based on RAW findings.
+    Replaces/updates the "SUPERVISOR SYNTHESIZED REPORT" section.
+    """
+    agent_memory_service = context.get("agent_memory_service")
+
+    if not agent_memory_service:
+        return {"error": "Memory service not available"}
+
+    try:
+        synthesized_content = args.get("content", "")
+        mark_raw_as_processed = args.get("mark_raw_as_processed", False)
+        processed_cycle = args.get("processed_cycle", None)  # Which RAW FINDINGS cycle was processed
+
+        draft_file = "draft_report.md"
+        try:
+            current = await agent_memory_service.file_manager.read_file(draft_file)
+        except FileNotFoundError:
+            return {"error": "Draft report not found. Cannot update synthesized section."}
+
+        # Find the SUPERVISOR SYNTHESIZED REPORT section
+        synth_marker = "## 📝 SUPERVISOR SYNTHESIZED REPORT"
+        raw_marker = "## 🔍 RAW FINDINGS"
+
+        if synth_marker not in current:
+            return {"error": "SUPERVISOR SYNTHESIZED REPORT section not found in draft"}
+
+        # Split into parts
+        parts = current.split(synth_marker)
+        before_synth = parts[0] + synth_marker
+        after_synth = parts[1]
+
+        # Find where synthesized section ends (at first RAW FINDINGS marker)
+        if raw_marker in after_synth:
+            synth_section_end = after_synth.index(raw_marker)
+            after_raw = after_synth[synth_section_end:]
+        else:
+            # No RAW FINDINGS yet
+            after_raw = ""
+
+        # Build new synthesized section
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_synth_section = f"""
+
+**Last Updated:** {timestamp}
+
+{synthesized_content}
+
+---
+"""
+
+        # Handle marking RAW findings as processed
+        if mark_raw_as_processed and processed_cycle is not None:
+            # Mark specific cycle as processed
+            cycle_marker = f"## 🔍 RAW FINDINGS - Cycle {processed_cycle}"
+            if cycle_marker in after_raw:
+                # Replace status line
+                after_raw = after_raw.replace(
+                    "**Status:** Awaiting supervisor synthesis",
+                    f"**Status:** ✅ Processed by supervisor at {timestamp}"
+                )
+
+        # Reconstruct draft
+        updated = before_synth + new_synth_section + after_raw
+        await agent_memory_service.file_manager.write_file(draft_file, updated)
+
+        logger.info("Synthesized report section updated",
+                   content_length=len(synthesized_content),
+                   marked_processed=mark_raw_as_processed,
+                   cycle=processed_cycle)
+
+        return {
+            "success": True,
+            "content_length": len(synthesized_content),
+            "marked_cycle_processed": processed_cycle if mark_raw_as_processed else None
+        }
+    except Exception as e:
+        logger.error("Failed to update synthesized report", error=str(e), exc_info=True)
         return {"error": str(e)}
 
 
 async def read_draft_report_handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict:
     """Read draft research report."""
     agent_memory_service = context.get("agent_memory_service")
-    
+
     if not agent_memory_service:
         return {"error": "Memory service not available"}
     
@@ -373,18 +620,71 @@ async def write_supervisor_note_handler(args: Dict[str, Any], context: Dict[str,
 
 
 async def create_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any]) -> Dict:
-    """Create new todo for an agent."""
+    """Create new todo for an agent. If agent doesn't exist, create it with basic characteristics."""
     agent_file_service = context.get("agent_file_service")
     
     if not agent_file_service:
         return {"error": "File service not available"}
     
+    # CRITICAL: Check supervisor call limit - TODO operations are limited
+    # Findings processing (write_draft_report, update_synthesized_report) is NOT limited
+    state = context.get("state", {})
+    supervisor_call_count = state.get("supervisor_call_count", 0)
+    settings = context.get("settings")
+    if not settings:
+        from src.config.settings import get_settings
+        settings = get_settings()
+    max_supervisor_calls = settings.deep_research_max_supervisor_calls
+    
+    if supervisor_call_count >= max_supervisor_calls:
+        logger.warning(f"Supervisor TODO limit reached ({supervisor_call_count}/{max_supervisor_calls}) - cannot create new todos, but findings processing continues",
+                      supervisor_calls=supervisor_call_count, max_calls=max_supervisor_calls)
+        return {
+            "error": f"Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}). Cannot create new todos, but findings processing (write_draft_report, update_synthesized_report) continues.",
+            "supervisor_calls": supervisor_call_count,
+            "max_calls": max_supervisor_calls,
+            "note": "Findings processing is not limited - supervisor can still process findings and write to draft_report"
+        }
+    
     try:
         agent_id = args.get("agent_id")
         
-        # Read current agent file
+        # CRITICAL: Check maximum agent count from settings
+        max_agents = getattr(settings, "deep_research_num_agents", 3)
+        
+        # Extract agent number from agent_id (e.g., "agent_4" -> 4)
+        try:
+            agent_num = int(agent_id.replace("agent_", "")) if "agent_" in agent_id else None
+        except:
+            agent_num = None
+        
+        # CRITICAL: Prevent creating agents beyond the limit
+        if agent_num and agent_num > max_agents:
+            logger.warning(f"Attempted to create agent {agent_id} but limit is {max_agents} agents. Use existing agents (agent_1 to agent_{max_agents}) instead.",
+                          agent_id=agent_id, max_agents=max_agents)
+            return {
+                "error": f"Cannot create agent {agent_id}. Maximum {max_agents} agents allowed. Use existing agents (agent_1 to agent_{max_agents}) or update_agent_todo to modify existing tasks.",
+                "max_agents": max_agents,
+                "suggestion": f"Use update_agent_todo to modify tasks for existing agents (agent_1 to agent_{max_agents})"
+            }
+        
+        # Read current agent file (returns empty structure if agent doesn't exist)
         agent_file = await agent_file_service.read_agent_file(agent_id)
         current_todos = agent_file.get("todos", [])
+        character = agent_file.get("character", "")
+        preferences = agent_file.get("preferences", "")
+        
+        # If agent doesn't exist (no character), create basic characteristics
+        is_new_agent = not character
+        if is_new_agent:
+            # Extract agent number from agent_id (e.g., "agent_2" -> "2")
+            agent_num_str = agent_id.replace("agent_", "") if "agent_" in agent_id else "?"
+            character = f"""**Role**: Research Agent {agent_num_str}
+**Expertise**: General research and analysis
+**Personality**: Thorough, analytical, detail-oriented
+"""
+            preferences = "Focus on comprehensive research coverage and accuracy."
+            logger.info(f"Creating new agent {agent_id} with basic characteristics")
         
         # Create new todo
         new_todo = AgentTodoItem(
@@ -404,17 +704,37 @@ async def create_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         await agent_file_service.write_agent_file(
             agent_id=agent_id,
             todos=current_todos,
-            character=agent_file.get("character", ""),
-            preferences=agent_file.get("preferences", "")
+            character=character,
+            preferences=preferences
         )
         
-        logger.info("Created agent todo", agent_id=agent_id, title=new_todo.title)
+        logger.info("Created agent todo", agent_id=agent_id, title=new_todo.title, is_new_agent=is_new_agent, total_todos=len(current_todos))
+        
+        # CRITICAL: Emit updated todos to frontend so user sees new tasks immediately
+        stream = context.get("stream")
+        if stream and current_todos:
+            todos_dict = [
+                {
+                    "title": t.title,
+                    "status": t.status,
+                    "objective": t.objective,
+                    "expected_output": t.expected_output,
+                    "note": t.note,
+                    "url": t.url if hasattr(t, "url") else None
+                }
+                for t in current_todos
+            ]
+            stream.emit_agent_todo(agent_id, todos_dict)
+            logger.info(f"Agent {agent_id} todos emitted to frontend after supervisor created new task", 
+                       todos_count=len(todos_dict),
+                       new_task=new_todo.title)
         
         return {
             "success": True,
             "agent_id": agent_id,
             "todo_title": new_todo.title,
-            "total_todos": len(current_todos)
+            "total_todos": len(current_todos),
+            "is_new_agent": is_new_agent
         }
     except Exception as e:
         logger.error("Failed to create agent todo", error=str(e))
@@ -428,6 +748,26 @@ async def update_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
     if not agent_file_service:
         return {"error": "File service not available"}
     
+    # CRITICAL: Check supervisor call limit - TODO operations are limited
+    # Findings processing (write_draft_report, update_synthesized_report) is NOT limited
+    state = context.get("state", {})
+    supervisor_call_count = state.get("supervisor_call_count", 0)
+    settings = context.get("settings")
+    if not settings:
+        from src.config.settings import get_settings
+        settings = get_settings()
+    max_supervisor_calls = settings.deep_research_max_supervisor_calls
+    
+    if supervisor_call_count >= max_supervisor_calls:
+        logger.warning(f"Supervisor TODO limit reached ({supervisor_call_count}/{max_supervisor_calls}) - cannot update todos, but findings processing continues",
+                      supervisor_calls=supervisor_call_count, max_calls=max_supervisor_calls)
+        return {
+            "error": f"Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}). Cannot update todos, but findings processing (write_draft_report, update_synthesized_report) continues.",
+            "supervisor_calls": supervisor_call_count,
+            "max_calls": max_supervisor_calls,
+            "note": "Findings processing is not limited - supervisor can still process findings and write to draft_report"
+        }
+    
     try:
         agent_id = args.get("agent_id")
         todo_title = args.get("todo_title")
@@ -440,9 +780,32 @@ async def update_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         updated = False
         for todo in current_todos:
             if todo.title == todo_title:
-                # Update fields if provided (ignore empty strings from defaults)
+                # CRITICAL: Protect done tasks - they are immutable once completed
+                # No one can modify or delete done tasks - they are permanent record
+                if todo.status == "done":
+                    logger.warning(f"Supervisor attempted to modify done task '{todo_title}' for agent {agent_id}. Done tasks are immutable and cannot be changed.",
+                                 agent_id=agent_id, todo_title=todo_title, note="Done tasks are permanent records")
+                    return {
+                        "error": f"Cannot modify done task '{todo_title}' for agent {agent_id}. Done tasks are immutable and cannot be changed.",
+                        "note": "Done tasks are permanent records of completed work"
+                    }
+                
+                # CRITICAL: Protect in_progress tasks from status changes by supervisor
+                # Supervisor should not change status of tasks that agents are currently working on
+                # This prevents race conditions where supervisor changes status while agent is working
                 if "status" in args and args.get("status"):
-                    todo.status = args["status"]
+                    new_status = args["status"]
+                    # CRITICAL: Do not allow supervisor to change status of in_progress tasks
+                    # (except to done, which agent will do itself, or if explicitly needed)
+                    if todo.status == "in_progress" and new_status != "done":
+                        logger.warning(f"Supervisor attempted to change status of in_progress task '{todo_title}' for agent {agent_id} from in_progress to {new_status}. Ignoring status change to prevent race condition.",
+                                     agent_id=agent_id, todo_title=todo_title, current_status=todo.status, attempted_status=new_status)
+                        # Don't update status, but allow other fields to be updated
+                    else:
+                        todo.status = new_status
+                
+                # Allow updating other fields even for in_progress tasks
+                # (objective, guidance can be refined while agent works, but agent uses cached current_task)
                 if "objective" in args and args.get("objective"):
                     todo.objective = args["objective"]
                 if "expected_output" in args and args.get("expected_output"):
@@ -468,6 +831,25 @@ async def update_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         )
         
         logger.info("Updated agent todo", agent_id=agent_id, todo_title=todo_title)
+        
+        # CRITICAL: Emit updated todos to frontend so user sees task updates immediately
+        stream = context.get("stream")
+        if stream and current_todos:
+            todos_dict = [
+                {
+                    "title": t.title,
+                    "status": t.status,
+                    "objective": t.objective,
+                    "expected_output": t.expected_output,
+                    "note": t.note,
+                    "url": t.url if hasattr(t, "url") else None
+                }
+                for t in current_todos
+            ]
+            stream.emit_agent_todo(agent_id, todos_dict)
+            logger.info(f"Agent {agent_id} todos emitted to frontend after supervisor updated task", 
+                       todos_count=len(todos_dict),
+                       updated_task=todo_title)
         
         return {
             "success": True,
@@ -599,17 +981,18 @@ class SupervisorToolsRegistry:
             "description": "Write KEY INSIGHTS ONLY to the main research document. "
                           "CRITICAL: Only add key findings and progress updates here, NOT all items. "
                           "Items are stored in items/ directory. Main.md is for supervisor's key insights only. "
-                          "Content will be added as a new section with timestamp.",
+                          "Content will be added as a new section with timestamp. "
+                          "You can also update the Research Plan section by using section_title='Research Plan'.",
             "args_schema": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "Key insights to add (markdown format) - only important findings, not all details"
+                        "description": "Key insights to add (markdown format) - only important findings, not all details. If section_title is 'Research Plan', this will replace the Research Plan section."
                     },
                     "section_title": {
                         "type": "string",
-                        "description": "Title for this section (e.g., 'Key Findings', 'Progress Update')"
+                        "description": "Title for this section (e.g., 'Key Findings', 'Progress Update', 'Research Plan'). Use 'Research Plan' to update the research plan."
                     }
                 },
                 "required": ["content", "section_title"]
@@ -618,24 +1001,42 @@ class SupervisorToolsRegistry:
         },
         "write_draft_report": {
             "name": "write_draft_report",
-            "description": "Write/append content to the draft research report (draft_report.md). "
-                          "This is your working document where you assemble the final report. "
-                          "Write comprehensive findings, analysis, and synthesis here. "
+            "description": "Add a new CHAPTER to the draft research report (draft_report.md) based on a finding from an agent. "
+                          "CRITICAL: Draft report is structured by chapters - each chapter = one finding from one agent task. "
+                          "When an agent completes a task and you receive their finding, you MUST add it as a new chapter. "
+                          "Write COMPREHENSIVE content based on the finding - include ALL details, facts, data, and evidence from the finding. "
                           "This file will be used to generate the final report for the user. "
-                          "Content will be added as a new section with timestamp.",
+                          "**CRITICAL**: Write DETAILED content based on the finding - include specific facts, dates, numbers, technical details from the finding. "
+                          "DO NOT write brief summaries - write FULL, DETAILED chapter with extensive information from the finding. "
+                          "Each chapter should be substantial (500-1500 words) and cover the finding comprehensively. "
+                          "**CONTEXT FOR WRITING**: When you call this tool, you have access to: "
+                          "1) Original user query (to understand the research goal), "
+                          "2) Deep search result (initial context from deep search), "
+                          "3) Clarification answers (user's additional requirements), "
+                          "4) Summaries of existing chapters (to avoid repetition). "
+                          "Use this context to adapt the finding content, avoiding repetition while ensuring NO information is lost. "
+                          "Write the chapter as an adapted version of the finding that fits the overall research context.",
             "args_schema": {
                 "type": "object",
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "Content to add to draft report (markdown format)"
+                        "description": "Chapter content based on the finding (markdown format, comprehensive and detailed)"
+                    },
+                    "chapter_title": {
+                        "type": "string",
+                        "description": "Title for this chapter based on the finding topic (e.g., 'Historical Analysis of Topic X', 'Technical Specifications of Y'). REQUIRED."
                     },
                     "section_title": {
                         "type": "string",
-                        "description": "Title for this section (e.g., 'Historical Analysis', 'Technical Specifications')"
+                        "description": "Alias for chapter_title (for backward compatibility). Use chapter_title instead."
+                    },
+                    "finding": {
+                        "type": "object",
+                        "description": "Full finding data from the agent (optional, but recommended for chapter summary storage)"
                     }
                 },
-                "required": ["content", "section_title"]
+                "required": ["content"]
             },
             "handler": write_draft_report_handler
         },
@@ -656,6 +1057,37 @@ class SupervisorToolsRegistry:
                 "required": ["max_length"]
             },
             "handler": read_draft_report_handler
+        },
+        "update_synthesized_report": {
+            "name": "update_synthesized_report",
+            "description": "**PRIMARY TOOL** for writing the structured research report. "
+                          "Updates the 'SUPERVISOR SYNTHESIZED REPORT' section with your analysis and synthesis of RAW findings. "
+                          "This REPLACES the synthesized section (not append). "
+                          "Use this after reading RAW FINDINGS to write structured report sections. "
+                          "Can mark RAW findings as processed after synthesis.",
+            "args_schema": {
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "Your synthesized report content (markdown format). Should be COMPREHENSIVE and DETAILED with sections like Introduction, Key Findings, Analysis, etc. "
+                                      "**CRITICAL**: Include ALL details, facts, dates, numbers, technical specifications, and comprehensive analysis. "
+                                      "DO NOT write brief summaries - write FULL, DETAILED sections with extensive information (aim for 1000-3000+ words total). "
+                                      "Include ALL information from RAW FINDINGS - don't skip or summarize too much."
+                    },
+                    "mark_raw_as_processed": {
+                        "type": "boolean",
+                        "description": "Whether to mark RAW findings as processed (default: false)",
+                        "default": False
+                    },
+                    "processed_cycle": {
+                        "type": "integer",
+                        "description": "Which RAW FINDINGS cycle was synthesized (e.g., 1, 2, 3). Required if mark_raw_as_processed is true."
+                    }
+                },
+                "required": ["content"]
+            },
+            "handler": update_synthesized_report_handler
         },
         "read_supervisor_file": {
             "name": "read_supervisor_file",
@@ -947,6 +1379,28 @@ async def run_supervisor_agent(
     agent_characteristics = state.get("agent_characteristics", {})
     research_plan = state.get("research_plan", {})
     iteration = state.get("iteration", 0)
+
+    # CRITICAL: Check supervisor call count from state
+    # IMPORTANT: Supervisor call limit applies ONLY to TODO operations (create_agent_todo, update_agent_todo)
+    # Findings processing (write_draft_report, update_synthesized_report) is NOT limited and ALWAYS available
+    supervisor_call_count = state.get("supervisor_call_count", 0)
+    from src.config.settings import get_settings
+    settings = get_settings()
+    
+    # Get max agents for supervisor prompt
+    max_agents = getattr(settings, "deep_research_num_agents", 3)
+    max_supervisor_calls = settings.deep_research_max_supervisor_calls
+    
+    # Check if TODO operations are limited
+    todo_operations_limited = supervisor_call_count >= max_supervisor_calls
+    
+    # CRITICAL: Check if this is a forced finalization call (bypasses limit)
+    force_finalization = state.get("_force_supervisor_finalization", False)
+    if force_finalization:
+        logger.info(f"MANDATORY finalization call - bypassing limit (call {supervisor_call_count + 1}, limit {max_supervisor_calls})",
+                   note="This is a special call when all tasks are completed")
+    else:
+        logger.info(f"Supervisor call {supervisor_call_count + 1}/{max_supervisor_calls}")
     
     # Detect user language from query
     def _detect_user_language(text: str) -> str:
@@ -965,10 +1419,23 @@ async def run_supervisor_agent(
     # Get deep_search_result for context (from initial deep search before multi-agent system)
     # CRITICAL: This contains important background information that must be used to guide research
     deep_search_result_raw = state.get("deep_search_result", "")
+    deep_search_result = ""
+    
+    # Handle multiple formats: dict with "type": "override" and "value", plain dict, or string
     if isinstance(deep_search_result_raw, dict):
-        deep_search_result = deep_search_result_raw.get("value", "") if isinstance(deep_search_result_raw, dict) else ""
+        # Check for LangGraph override format: {"type": "override", "value": "..."}
+        if "type" in deep_search_result_raw and deep_search_result_raw.get("type") == "override":
+            deep_search_result = deep_search_result_raw.get("value", "")
+        # Check for plain dict with "value" key
+        elif "value" in deep_search_result_raw:
+            deep_search_result = deep_search_result_raw.get("value", "")
+        else:
+            # Try to convert dict to string
+            deep_search_result = str(deep_search_result_raw)
+    elif isinstance(deep_search_result_raw, str):
+        deep_search_result = deep_search_result_raw
     else:
-        deep_search_result = deep_search_result_raw or ""
+        deep_search_result = str(deep_search_result_raw) if deep_search_result_raw else ""
     
     # Log if deep_search_result is missing (this should not happen in normal flow)
     if not deep_search_result:
@@ -1066,22 +1533,60 @@ async def run_supervisor_agent(
     logger.info("Supervisor received findings", 
                total_findings=len(findings),
                summary_length=len(findings_summary),
-               findings_preview=findings_summary[:500] if findings_summary else "No findings")
+               findings_preview=findings_summary[:500] if findings_summary else "No findings",
+               note="Supervisor should add each finding as a new chapter in draft_report using write_draft_report")
+    
+    # CRITICAL: Add findings to context for supervisor - supervisor needs to see ALL findings to add them as chapters
+    # Format findings for supervisor prompt
+    findings_for_supervisor = []
+    for f in findings:
+        findings_for_supervisor.append({
+            "agent_id": f.get("agent_id", "unknown"),
+            "topic": f.get("topic", "Unknown"),
+            "summary": f.get("summary", ""),
+            "key_findings": f.get("key_findings", [])[:10],  # First 10 for prompt
+            "sources_count": len(f.get("sources", [])),
+            "confidence": f.get("confidence", "unknown"),
+            "full_finding": f  # Full finding for chapter creation
+        })
     
     # Get clarification context if available - extract from chat_history
-    # CRITICAL: Always try to extract clarification answers - they are essential for proper research direction
+    # CRITICAL: Always try to extract clarification questions AND answers - they are essential for proper research direction
     clarification_context = state.get("clarification_context", "")
+    clarification_questions_text = ""
     if not clarification_context:
-        # Extract user clarification answers from chat_history
+        # Extract clarification questions and user answers from chat_history
         chat_history = state.get("chat_history", [])
         if chat_history:
             for i, msg in enumerate(chat_history):
                 if msg.get("role") == "assistant" and ("clarification" in msg.get("content", "").lower() or "🔍" in msg.get("content", "")):
+                    # Extract the questions themselves from assistant message
+                    assistant_content = msg.get("content", "")
+                    if "Clarification Needed" in assistant_content or "🔍" in assistant_content:
+                        # Extract questions section (everything from "## 🔍 Clarification Needed" to "---" or end)
+                        questions_start = assistant_content.find("## 🔍 Clarification Needed")
+                        if questions_start != -1:
+                            # Find the end of questions section (before user answers or at "---")
+                            questions_end = assistant_content.find("\n---\n", questions_start)
+                            if questions_end == -1:
+                                questions_end = assistant_content.find("\n\n*Note:", questions_start)
+                            if questions_end == -1:
+                                questions_end = len(assistant_content)
+                            
+                            clarification_questions_text = assistant_content[questions_start:questions_end].strip()
+                            logger.info("Extracted clarification questions for supervisor", 
+                                      questions_preview=clarification_questions_text[:300],
+                                      clarification_index=i)
+                    
+                    # Extract user answers
                     if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
                         user_answer = chat_history[i + 1].get("content", "")
                         if user_answer and user_answer.strip():
-                            clarification_context = f"\n\n**USER CLARIFICATION (ADDITIONAL CONTEXT - NOT A REPLACEMENT FOR ORIGINAL QUERY):**\n{user_answer}\n\n**CRITICAL INTERPRETATION RULES**:\n- The ORIGINAL USER QUERY above is still the PRIMARY topic to research: \"{query}\"\n- This clarification provides additional context about what aspects/depth the user wants to focus on WITHIN the original query topic\n- **MANDATORY**: Clarification MUST be interpreted IN THE CONTEXT of the original query\n- **CRITICAL**: If clarification mentions words that could have multiple meanings, they ALWAYS refer to those words IN THE CONTEXT of the original query\n- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic\n- Example: If original query is \"оформление работников\" and clarification says \"все режимы\", this means \"режимы оформления работников\", NOT \"режимы\" in general\n- Use this clarification to understand what depth/angle to focus on, but ALWAYS within the context of the original query topic"
-                            logger.info("Extracted user clarification answers for supervisor", 
+                            # Build comprehensive clarification context with both questions and answers
+                            questions_section = f"\n\n**CLARIFICATION QUESTIONS ASKED:**\n{clarification_questions_text}\n" if clarification_questions_text else ""
+                            clarification_context = f"{questions_section}\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n\n**CRITICAL INTERPRETATION RULES**:\n- The ORIGINAL USER QUERY above is still the PRIMARY topic to research: \"{query}\"\n- This clarification provides additional context about what aspects/depth the user wants to focus on WITHIN the original query topic\n- **MANDATORY**: Clarification MUST be interpreted IN THE CONTEXT of the original query\n- **CRITICAL**: If clarification mentions words that could have multiple meanings, they ALWAYS refer to those words IN THE CONTEXT of the original query\n- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic\n- Example: If original query is \"оформление работников\" and clarification says \"все режимы\", this means \"режимы оформления работников\", NOT \"режимы\" in general\n- Use this clarification to understand what depth/angle to focus on, but ALWAYS within the context of the original query topic"
+                            logger.info("Extracted user clarification questions and answers for supervisor", 
+                                      questions_preview=clarification_questions_text[:200] if clarification_questions_text else "None",
                                       answer_preview=user_answer[:200],
                                       clarification_index=i,
                                       answer_index=i+1,
@@ -1144,6 +1649,11 @@ Your role:
 {chat_history_text}**ORIGINAL USER QUERY:** {query}
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
+
+**CRITICAL: SUPERVISOR CALL LIMIT STATUS:**
+{"⚠️ TODO OPERATIONS LIMITED: Supervisor call limit reached (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You CANNOT create or update agent todos (create_agent_todo, update_agent_todo will fail). However, you MUST STILL process findings and write to draft_report (write_draft_report, update_synthesized_report work normally)." if todo_operations_limited else "✅ TODO OPERATIONS AVAILABLE: Supervisor call count (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You can create and update agent todos."}
+
+{"**MANDATORY WHEN TODO LIMIT REACHED**: Even though you cannot create/update todos, you MUST process ALL findings and write them to draft_report. Use write_draft_report for each finding and update_synthesized_report to synthesize them. Findings processing is NEVER limited!" if todo_operations_limited else ""}
 
 **INITIAL DEEP SEARCH CONTEXT (CRITICAL - USE THIS TO GUIDE RESEARCH):**
 {deep_search_result[:2000] if deep_search_result else "⚠️ WARNING: No initial deep search context available. This may indicate an issue with the deep search step."}
@@ -1212,6 +1722,16 @@ CRITICAL: Your agents must go DEEP, not just surface-level!
 - **ACTIVELY PROMOTE DEEP DIVE RESEARCH** - constantly create additional tasks for agents to dig deeper into different aspects
 - If an agent only provides basic/general information, create MULTIPLE todos forcing them to dig into SPECIFIC details from different angles
 - **PROACTIVELY assign follow-up tasks** to explore deeper questions, verify findings, and investigate related aspects
+- **CRITICAL: DISTRIBUTE TASKS EVENLY** - When assigning new tasks, ensure ALL agents get similar workload:
+  * If one agent has many todos and others have few, prioritize assigning to agents with FEWER tasks
+  * Check cada agent's current workload BEFORE creating new todos
+  * Aim for balanced distribution: each agent should have 2-4 active tasks maximum
+  * Example: If agent_1 has 5 tasks and agent_2 has 1 task, assign new tasks to agent_2 first
+  * This ensures parallel execution and faster completion
+- **CRITICAL: DO NOT CREATE NEW AGENTS** - You have exactly {max_agents} agents (agent_1, agent_2, agent_3). DO NOT create agent_4, agent_5, etc.!
+  * If you need to assign more tasks, use existing agents (agent_1, agent_2, agent_3)
+  * Use update_agent_todo to refine existing tasks instead of creating new ones
+  * Only use create_agent_todo for existing agents (agent_1, agent_2, agent_3) - never for agent_4+
 - Examples of deep research: technical specifications, expert analysis, case studies, historical context, advanced features, industry trends, comparative analysis, critical perspectives
 - Examples of shallow research: basic definitions, general overviews, simple facts
 - When creating todos, explicitly instruct agents to find: technical details, expert opinions, real-world examples, advanced features, specific data, multiple sources for verification
@@ -1228,22 +1748,49 @@ Available tools:
 - write_supervisor_note: Write note to YOUR personal file - use this for your thoughts, observations, and notes
 - read_main_document: Read current main research document (key insights only, not all items) - SHARED with all agents
 - write_main_document: Add KEY INSIGHTS ONLY to main document (not all items - items stay in items/ directory) - ONLY essential shared info
-- read_draft_report: Read the draft research report (draft_report.md) - your working document for final report
-- write_draft_report: Write/append to draft research report (draft_report.md) - this is where you assemble the final report
+  **You can update the Research Plan section** by using section_title="Research Plan" - this will replace the existing Research Plan section with your updated version
+- read_draft_report: Read draft_report.md to see current draft report with chapters (each chapter = one finding from one agent task)
+- write_draft_report: **PRIMARY TOOL** - Add a new CHAPTER to draft_report.md based on a finding from an agent. 
+  * CRITICAL: Draft report is structured by chapters - each chapter = one finding from one agent task
+  * When you receive a finding from an agent (in the findings list below), you MUST add it as a new chapter
+  * Write comprehensive, detailed content (500-1500 words) based on the finding
+  * Include ALL details, facts, data, and evidence from the finding
+  * Use chapter_title based on the finding topic
+  * Pass the full finding data in the "finding" parameter for chapter summary storage
 - review_agent_progress: Check specific agent's progress and todos
-- create_agent_todo: Assign new task to an agent (use this to force deeper research AND diversify coverage!)
+- create_agent_todo: Assign new task to an agent (use this ONLY if agent has fewer than 2-3 tasks)
   **MANDATORY**: Every task MUST include the original user query "{query}" in the objective or guidance so the agent understands what they're researching!
+  **CRITICAL**: DO NOT create tasks for agent_4, agent_5, etc. - you have exactly {max_agents} agents (agent_1 to agent_{max_agents})!
+  **PREFER**: If agent already has tasks, use update_agent_todo to refine them instead of creating new ones
+  {"⚠️ **LIMITED**: This tool is DISABLED because supervisor call limit reached (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You can only process findings now." if todo_operations_limited else ""}
 - update_agent_todo: Update existing agent todo (OPTIMAL for refining tasks, changing priority, updating guidance, or modifying objectives)
+  **PREFER THIS** over create_agent_todo when agents already have tasks - refine existing tasks instead of creating new ones
+  **CRITICAL**: You CANNOT change status of tasks that are "in_progress" - agents are currently working on them. Only update objective, guidance, priority, or reasoning for in_progress tasks. Status changes are ignored for in_progress tasks to prevent race conditions.
+  **CRITICAL**: You CANNOT modify or delete tasks that are "done" - they are immutable permanent records. Done tasks cannot be changed, updated, or removed. They are permanent history of completed work.
+  {"⚠️ **LIMITED**: This tool is DISABLED because supervisor call limit reached (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You can only process findings now." if todo_operations_limited else ""}
 - make_final_decision: Decide to continue/replan/finish
 
-CRITICAL WORKFLOW:
-1. Review agent findings - identify if they're too shallow OR if they overlap with other agents
-2. **Write YOUR notes to supervisor file** - use write_supervisor_note for your personal observations and thoughts
-3. **CRITICAL: Write comprehensive findings to draft_report.md** - this is your working document for the final report
-   - **YOU MUST write to draft_report.md after reviewing agent findings**
-   - Include: synthesis of agent findings, key discoveries, analysis, conclusions
-   - This file will be used to generate the final report - it MUST be comprehensive!
-   - If you don't write to draft_report.md, the final report will be empty!
+CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
+
+**Understanding draft_report.md structure:**
+- **Draft report is structured by chapters** - each chapter = one finding from one agent task
+- **Each finding becomes a new chapter** when you add it using write_draft_report
+- **Chapters are added iteratively** as findings arrive from agents
+- **Draft report is a working draft** - it accumulates chapters as research progresses
+
+**Your workflow each iteration:**
+1. **Review findings** - Check the findings list below to see what agents have completed
+2. **Read draft_report** - Call read_draft_report to see which findings are already added as chapters
+3. **For each NEW finding** (not yet added to draft_report as a chapter):
+   - **Call write_draft_report** to add it as a new chapter
+   - Use chapter_title based on the finding topic (e.g., "Technical Analysis of X", "Historical Context of Y")
+   - Write comprehensive content (500-1500 words) based on ALL information from the finding
+   - Include: summary, key findings, sources, analysis, and synthesis
+   - Pass the full finding data in the "finding" parameter for chapter summary storage
+   - **CRITICAL**: Each finding MUST become a separate chapter - do NOT combine multiple findings into one chapter
+4. **Write YOUR notes** - use write_supervisor_note for personal observations
+5. **CRITICAL: Add ALL findings as chapters** - if you don't add findings as chapters, information will be lost!
+6. **After adding chapters**, review agent progress and create new todos if needed
 4. Add only KEY INSIGHTS to main.md (not all items - items stay in items/ directory) - ONLY essential shared information
 5. Check each agent's progress - ensure they cover DIFFERENT aspects
 6. **CRITICAL**: 
@@ -1252,6 +1799,11 @@ CRITICAL WORKFLOW:
    - **ACTIVELY PROMOTE DEEP RESEARCH** - constantly create additional tasks for deeper investigation
    - If findings are basic, create MULTIPLE todos forcing deeper research with specific, detailed instructions
    - **PROACTIVELY assign follow-up tasks** to verify findings in multiple sources and explore related aspects
+   - **DISTRIBUTE WORKLOAD EVENLY** - Before assigning new tasks, check each agent's current workload (pending + in_progress todos):
+     * Use review_agent_progress to see each agent's todo list and workload
+     * Prioritize assigning to agents with FEWER tasks (aim for 2-4 tasks per agent)
+     * If agent_1 has 6 tasks and agent_2 has 2 tasks, assign new tasks to agent_2
+     * This ensures parallel execution and prevents bottlenecks
    - If agents overlap, redirect them to DIFFERENT angles to build complete picture
    - Ensure comprehensive coverage: history, technical, expert views, applications, trends, comparisons, impact, challenges
    - **After agents complete tasks, review findings and create ADDITIONAL tasks**:
@@ -1260,31 +1812,43 @@ CRITICAL WORKFLOW:
      * Explore different angles and perspectives on the same topic
      * Find case studies, real-world examples, and practical applications
    - **OPTIMAL**: Use update_agent_todo to refine existing tasks when agents need more specific instructions or when research direction changes
+   - **CRITICAL: PREFER UPDATE OVER CREATE** - If an agent already has pending tasks, use update_agent_todo to refine them instead of creating new ones
+   - **CRITICAL: DONE TASKS ARE IMMUTABLE** - Tasks with status "done" cannot be modified, updated, or deleted. They are permanent records. Do not attempt to change done tasks.
    - **STRATEGY**: Break complex topics into multiple deep-dive tasks - don't stop at surface-level findings
    - **FORBIDDEN**: Do NOT create generic tasks like "History of technology" when user asked about "Soviet carrier aviation" - always relate to the specific query!
+   - **FORBIDDEN**: Do NOT create agent_4, agent_5, etc. - you have exactly {max_agents} agents (agent_1 to agent_{max_agents}). Use existing agents!
 7. **MANDATORY: You MUST call at least ONE tool on EVERY iteration** - never return empty tool_calls!
-   - If you need to review findings: call read_draft_report, read_main_document, or review_agent_progress
-   - **After reviewing agent findings, you MUST call write_draft_report** to synthesize their findings
-   - If you need to update documents: call write_draft_report, write_main_document, or write_supervisor_note
-   - If you need to assign NEW tasks: call create_agent_todo
-   - If you need to REFINE/UPDATE existing tasks: call update_agent_todo (OPTIMAL for modifying objectives, guidance, priority, or status)
+   - If you need to review: call read_draft_report (see RAW findings), read_main_document, or review_agent_progress
+   - **After reviewing RAW FINDINGS, you MUST call update_synthesized_report** to synthesize them into structured report
+   - If you need to update documents: call update_synthesized_report (primary), write_main_document, or write_supervisor_note
+   - **CRITICAL: Findings processing is ALWAYS available** - write_draft_report and update_synthesized_report work even if TODO limit reached
+   {"   - ⚠️ **TODO OPERATIONS LIMITED**: create_agent_todo and update_agent_todo are DISABLED (limit " + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + " reached). Focus on processing findings instead." if todo_operations_limited else "   - If you need to assign NEW tasks: call create_agent_todo"}
+   {"   - ⚠️ **TODO OPERATIONS LIMITED**: You cannot update todos. Focus on processing findings and writing to draft_report." if todo_operations_limited else "   - If you need to REFINE/UPDATE existing tasks: call update_agent_todo (OPTIMAL for modifying objectives, guidance, priority, or status)"}
    - If you're ready to finish: call make_final_decision (this is the ONLY way to finish!)
-   - **CRITICAL**: Before calling make_final_decision with "finish", ensure you've written comprehensive findings to draft_report.md!
+   - **CRITICAL**: Before calling make_final_decision with "finish", ensure you've synthesized all RAW findings using update_synthesized_report!
 8. **Make final decision** - CRITICAL: You MUST call make_final_decision tool on EVERY review cycle!
    - This is MANDATORY - you cannot skip this tool!
-   - **BEFORE deciding "finish"**: You MUST ensure draft_report.md contains comprehensive research
-   - Read draft_report to check if it's complete and covers all aspects
-   - If draft_report is empty or incomplete, write comprehensive findings to it FIRST, then decide "finish"
-   - "finish" ONLY when: research is comprehensive AND draft_report.md is properly filled
+   - **BEFORE deciding "finish"**: Check draft_report.md - have you synthesized ALL RAW FINDINGS?
+   - Read draft_report to see if RAW FINDINGS sections are still marked "Awaiting supervisor synthesis"
+   - If ANY RAW FINDINGS are unprocessed, synthesize them using update_synthesized_report FIRST
+   - "finish" ONLY when: ALL RAW findings synthesized AND SYNTHESIZED REPORT section is comprehensive
    - "continue" if more research is needed (agents have new todos to complete)
    - "replan" if research direction needs to change
    - **YOU MUST CALL THIS TOOL** - it's the only way to finish or continue research!
-9. **When finishing**: The draft_report.md will be used to generate the final report for the user - ENSURE IT'S COMPLETE!
+   - **CRITICAL: If ALL agents have completed their tasks (no pending/in_progress tasks), you MUST:**
+     * Synthesize ALL RAW FINDINGS using update_synthesized_report
+     * Call make_final_decision with decision="finish" to complete research
+     * DO NOT create new tasks if all agents are done - finalize the report!
+9. **When finishing**: The SYNTHESIZED REPORT section becomes the final report - NOT the RAW findings!
+   - User sees your synthesis, not raw agent outputs
+   - Ensure your synthesized report is comprehensive, well-structured, and answers the query
 
 MEMORY MANAGEMENT:
 - **YOUR personal file (supervisor.md)**: Use for your notes, observations, thoughts - this is YOUR workspace
 - **main.md**: ONLY essential shared information that ALL agents need to know - keep it minimal!
-- **draft_report.md**: Your working document for assembling the final report
+- **draft_report.md**: Two-level system:
+  * **📝 SUPERVISOR SYNTHESIZED REPORT**: Your structured report (use update_synthesized_report)
+  * **🔍 RAW FINDINGS**: Automatically added by agents after tasks (read and synthesize these)
 - **items/**: Agent notes stay here - don't duplicate in main.md
 
 Be thorough but efficient. Use structured reasoning. FORCE agents to dig deeper AND ensure diverse coverage!
@@ -1306,17 +1870,135 @@ Be thorough but efficient. Use structured reasoning. FORCE agents to dig deeper 
     if supervisor_notes:
         notes_section = f"Your previous notes:\n{supervisor_notes}\n\n"
     
+    # CRITICAL: Check if all agents have no tasks - if so, FORCE supervisor to finalize
+    all_agents_have_no_tasks = False
+    force_finalization = state.get("_force_supervisor_finalization", False)
+    
+    if agent_file_service:
+        try:
+            agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
+            all_agent_ids = []
+            for file_path in agent_files:
+                agent_id = file_path.replace("agents/", "").replace(".md", "")
+                if agent_id.startswith("agent_") and agent_id != "supervisor":
+                    all_agent_ids.append(agent_id)
+            
+            all_agents_have_no_tasks = True
+            for agent_id in all_agent_ids:
+                agent_file = await agent_file_service.read_agent_file(agent_id)
+                todos = agent_file.get("todos", [])
+                pending_tasks = [t for t in todos if t.status == "pending"]
+                in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+                if pending_tasks or in_progress_tasks:
+                    all_agents_have_no_tasks = False
+                    break
+            
+            if all_agents_have_no_tasks:
+                logger.info("MANDATORY: All agents have no tasks - supervisor MUST finalize report",
+                           agents_checked=len(all_agent_ids),
+                           note="Supervisor will be instructed to synthesize all findings and finish")
+                force_finalization = True  # Set flag even if not in state
+        except Exception as e:
+            logger.warning("Could not check agent tasks status", error=str(e))
+    
     # Initialize conversation
     # NOTE: query, deep_search_result and clarification_context are already in system prompt - don't duplicate in user message
     agent_history = []
-    agent_history.append({
-        "role": "user",
-        "content": f"""Review the latest research findings and coordinate next steps.
+    
+    # CRITICAL: If all tasks done OR forced finalization, force supervisor to finalize
+    if all_agents_have_no_tasks or force_finalization:
+        user_message = f"""**MANDATORY: ALL AGENTS HAVE COMPLETED THEIR TASKS - YOU MUST FINALIZE THE REPORT NOW!**
+
+**CRITICAL INSTRUCTIONS - YOU MUST FOLLOW THESE STEPS IN ORDER:**
+1. **FIRST**: Call read_draft_report to see ALL chapters and findings
+2. **SECOND**: Extract all unique chapters from draft_report (ignore duplicate chapters and "New Findings" sections)
+3. **THIRD**: Create a clean, structured final report with:
+   - All unique chapters in order (Chapter 1, Chapter 2, etc.)
+   - Each chapter should be comprehensive and well-written
+   - Remove any duplicate chapters or "New Findings" sections
+   - Collect ALL sources from all chapters at the end
+4. **FOURTH**: Use update_synthesized_report to write the clean, structured report
+5. **FIFTH**: Call make_final_decision with decision="finish" to complete research
+
+**THIS IS A MANDATORY FINALIZATION CALL - YOU MUST COMPLETE THE REPORT NOW!**
+
+**IMPORTANT**: The draft_report may contain duplicate chapters or "New Findings" sections - you MUST clean it up and create a proper structure with:
+- Unique chapters only (no duplicates)
+- Clean chapter structure (Chapter 1, Chapter 2, etc.)
+- All sources collected at the end
+- No "New Findings" sections or raw findings data
+
+Current findings from agents (last 10, summarized):
+{findings_summary if findings_summary else "No findings yet - check draft_report.md for chapters."}
+
+**YOU MUST:**
+- Read draft_report.md to see all chapters
+- Clean up duplicates and create proper structure
+- Synthesize into clean report using update_synthesized_report
+- Call make_final_decision with decision="finish" to complete research
+- DO NOT create new tasks - all agents are done!
+"""
+    else:
+        # Get chapter summaries for context (existing chapters in draft_report)
+        chapter_summaries = []
+        chapter_summaries_text = ""
+        session_id_for_context = state.get("session_id")
+        if session_id_for_context and stream:
+            try:
+                session_factory = stream.app_state.get("session_factory")
+                if session_factory:
+                    from src.workflow.research.session.manager import SessionManager
+                    session_manager = SessionManager(session_factory)
+                    session_data = await session_manager.get_session(session_id_for_context)
+                    if session_data:
+                        metadata = session_data.get("session_metadata", {})
+                        chapter_summaries = metadata.get("chapter_summaries", [])
+                        if chapter_summaries:
+                            # Format chapter summaries for prompt
+                            summaries_parts = []
+                            for ch in chapter_summaries[-10:]:  # Last 10 chapters
+                                summaries_parts.append(
+                                    f"Chapter {ch.get('chapter_number', '?')}: {ch.get('chapter_title', 'Unknown')} "
+                                    f"(Topic: {ch.get('topic', 'Unknown')}, Summary: {ch.get('summary', '')[:150]}...)"
+                                )
+                            chapter_summaries_text = "\n".join(summaries_parts)
+                            logger.info("Retrieved chapter summaries for supervisor prompt",
+                                       chapters_count=len(chapter_summaries))
+            except Exception as e:
+                logger.warning("Failed to get chapter summaries for prompt", error=str(e))
+        
+        user_message = f"""Review the latest research findings and coordinate next steps.
 
 Current findings from agents (last 10, summarized):
 {findings_summary if findings_summary else "No findings yet - agents are still researching."}
 
-**IMPORTANT**: These findings are from your research agents. You MUST synthesize them into draft_report.md!
+**CRITICAL: FINDINGS MUST BE ADDED AS CHAPTERS TO DRAFT REPORT!**
+- Each finding from an agent becomes a NEW CHAPTER in draft_report.md
+- Draft report is structured by chapters - one chapter = one finding
+- You MUST call write_draft_report for each NEW finding to add it as a chapter
+- Read draft_report.md first to see which findings are already added as chapters
+- For each finding NOT yet in draft_report, add it as a new chapter with comprehensive content (500-1500 words)
+- Pass the full finding data in the "finding" parameter when calling write_draft_report
+
+**CONTEXT AVAILABLE WHEN WRITING CHAPTERS** (use this when calling write_draft_report):
+1. **Original user query**: "{query}"
+2. **Deep search result**: {deep_search_result[:300] + "..." if len(deep_search_result) > 300 else deep_search_result if deep_search_result else "Not available"}
+3. **Clarification answers**: {clarification_context[:200] + "..." if len(clarification_context) > 200 else clarification_context if clarification_context else "None"}
+4. **Existing chapters** ({len(chapter_summaries)} chapters already in draft_report):
+{chapter_summaries_text if chapter_summaries_text else "No chapters yet"}
+
+**INSTRUCTIONS FOR WRITING CHAPTERS**:
+- When you call write_draft_report, you have access to the context above
+- Use the original query "{query}" to understand the research goal
+- Reference the deep search result to understand initial context
+- Consider clarification answers to understand user's specific requirements  
+- Check existing chapters to avoid repeating information already covered
+- Write the chapter as an ADAPTED version of the finding that:
+  * Fits the overall research context (query + deep search + clarification)
+  * Avoids repetition of information already in existing chapters
+  * Preserves ALL details, facts, and data from the finding (NO information loss)
+  * Integrates smoothly with the rest of the draft report
+- DO NOT just copy the finding - adapt it to the research context while keeping all information
 
 {notes_section}
 
@@ -1366,18 +2048,38 @@ CRITICAL INSTRUCTIONS:
    - Evaluate if findings are deep enough AND if they cover different aspects
    - Identify gaps, overlaps, or shallow research
 
-3. **ACTIVELY write to your memory and draft (CRITICAL):**
+3. **ACTIVELY add findings as chapters to draft report (CRITICAL):**
    - **After reviewing findings, ALWAYS call write_supervisor_note** to record:
      * Your observations about the findings
      * Gaps you've identified
      * Next steps you're planning
      * Your thinking process and reasoning
-   - **After reviewing findings, ALWAYS call write_draft_report** to:
-     * Add new findings from agents to the draft report
-     * Synthesize and analyze the findings
-     * Include key discoveries, sources, and synthesis
-     * Build the draft report progressively as research progresses
-   - **IMPORTANT:** Don't wait until the end - write to draft_report.md continuously as agents complete tasks
+   - **For each NEW finding (not yet in draft_report as a chapter), ALWAYS call write_draft_report** to:
+     * Add it as a NEW CHAPTER in draft_report.md
+     * Use chapter_title based on the finding topic
+     * Write comprehensive content (500-1500 words) based on ALL information from the finding
+     * Include: summary, key findings, sources, analysis, and synthesis
+     * Pass the full finding data in the "finding" parameter for chapter summary storage
+     * **CRITICAL**: Each finding MUST become a separate chapter - do NOT combine multiple findings into one chapter
+     * **CONTEXT AVAILABLE WHEN WRITING CHAPTER** (you have access to this when calling write_draft_report):
+       - **Original user query**: "{query}" (to understand the research goal)
+       - **Deep search result**: {deep_search_result[:500] if deep_search_result else "Not available"} (initial context from deep search)
+       - **Clarification answers**: {clarification_context[:300] if clarification_context else "None"} (user's additional requirements)
+       - **Existing chapters summaries**: {len(chapter_summaries)} chapters already in draft_report (to avoid repetition)
+     * **CRITICAL INSTRUCTIONS FOR WRITING CHAPTER**:
+       - Read the finding carefully - it contains detailed information from the agent
+       - Use the original user query "{query}" to understand what the user wants
+       - Reference the deep search result to understand the initial context
+       - Consider clarification answers to understand user's specific requirements
+       - Check existing chapters summaries to avoid repeating information already covered
+       - Write the chapter as an ADAPTED version of the finding that:
+         * Fits the overall research context (query + deep search + clarification)
+         * Avoids repetition of information already in existing chapters
+         * Preserves ALL details, facts, and data from the finding (NO information loss)
+         * Integrates smoothly with the rest of the draft report
+       - The chapter should be comprehensive (500-1500 words) and cover the finding fully
+       - DO NOT just copy the finding - adapt it to the research context while keeping all information
+   - **IMPORTANT:** Don't wait until the end - add findings as chapters continuously as agents complete tasks
    - **IMPORTANT:** Your supervisor file is YOUR thinking space - use it actively to track your reasoning
 
 4. **Manage agent tasks:**
@@ -1400,6 +2102,10 @@ CRITICAL INSTRUCTIONS:
 - The draft report should grow progressively as agents complete tasks
 - Your supervisor file should contain your ongoing thinking and observations
 """
+    
+    agent_history.append({
+        "role": "user",
+        "content": user_message
     })
     
     # Get tools as StructuredTool objects for proper binding
@@ -1408,7 +2114,8 @@ CRITICAL INSTRUCTIONS:
         "stream": stream,
         "agent_memory_service": agent_memory_service,
         "agent_file_service": agent_file_service,
-        "supervisor_queue": supervisor_queue
+        "supervisor_queue": supervisor_queue,
+        "settings": settings  # Pass settings to handlers for agent count limit
     })
     logger.debug(f"Supervisor bound {len(tools)} tools", tool_names=[t.name for t in tools])
     llm_with_tools = llm.bind_tools(tools)
@@ -1560,15 +2267,64 @@ CRITICAL INSTRUCTIONS:
                     tool_call_id = f"call_{react_iteration}_{len(action_results)}"
                 
                 try:
+                    # CRITICAL: Build comprehensive context for tool handlers
+                    # Include all necessary data for write_draft_report to see:
+                    # 1. Original user query
+                    # 2. Deep search result
+                    # 3. Clarification answers
+                    # 4. Chapter summaries (existing chapters)
+                    # Get settings for tool context (for TODO limit checking)
+                    tool_settings = settings
+                    if not tool_settings:
+                        from src.config.settings import get_settings
+                        tool_settings = get_settings()
+                    
+                    tool_context = {
+                        "agent_memory_service": agent_memory_service,
+                        "agent_file_service": agent_file_service,
+                        "state": state,
+                        "stream": stream,
+                        "query": query,  # Original user query
+                        "session_id": state.get("session_id"),
+                        "session_factory": stream.app_state.get("session_factory") if stream else None,
+                        "settings": tool_settings  # CRITICAL: Pass settings for TODO limit checking
+                    }
+                    
+                    # Add deep_search_result to context
+                    deep_search_result_raw = state.get("deep_search_result", "")
+                    if isinstance(deep_search_result_raw, dict):
+                        if "type" in deep_search_result_raw and deep_search_result_raw.get("type") == "override":
+                            tool_context["deep_search_result"] = deep_search_result_raw.get("value", "")
+                        elif "value" in deep_search_result_raw:
+                            tool_context["deep_search_result"] = deep_search_result_raw.get("value", "")
+                        else:
+                            tool_context["deep_search_result"] = str(deep_search_result_raw)
+                    else:
+                        tool_context["deep_search_result"] = deep_search_result_raw or ""
+                    
+                    # Add clarification_context to context
+                    tool_context["clarification_context"] = state.get("clarification_context", "")
+                    
+                    # Add chapter summaries to context (for write_draft_report to see existing chapters)
+                    if tool_name == "write_draft_report" and tool_context.get("session_id") and tool_context.get("session_factory"):
+                        try:
+                            from src.workflow.research.session.manager import SessionManager
+                            session_manager = SessionManager(tool_context["session_factory"])
+                            session_data = await session_manager.get_session(tool_context["session_id"])
+                            if session_data:
+                                metadata = session_data.get("session_metadata", {})
+                                chapter_summaries = metadata.get("chapter_summaries", [])
+                                tool_context["chapter_summaries"] = chapter_summaries
+                                logger.info("Added chapter summaries to context for write_draft_report",
+                                           chapters_count=len(chapter_summaries))
+                        except Exception as e:
+                            logger.warning("Failed to get chapter summaries for context", error=str(e))
+                            tool_context["chapter_summaries"] = []
+                    
                     result = await SupervisorToolsRegistry.execute(
                         tool_name,
                         tool_args,
-                        {
-                            "agent_memory_service": agent_memory_service,
-                            "agent_file_service": agent_file_service,
-                            "state": state,
-                            "stream": stream
-                        }
+                        tool_context
                     )
                     
                     action_results.append({
@@ -1579,9 +2335,9 @@ CRITICAL INSTRUCTIONS:
                     logger.info(f"Supervisor tool executed: {tool_name}", tool_call_id=tool_call_id)
                     
                     # Track usage of critical tools
-                    if tool_name == "write_draft_report":
+                    if tool_name == "write_draft_report" or tool_name == "update_synthesized_report":
                         last_draft_write = react_iteration
-                        logger.debug("Draft report written", iteration=react_iteration)
+                        logger.debug("Draft report updated", tool=tool_name, iteration=react_iteration)
                     elif tool_name == "write_supervisor_note":
                         last_memory_write = react_iteration
                         logger.debug("Supervisor memory written", iteration=react_iteration)
@@ -1629,19 +2385,39 @@ CRITICAL INSTRUCTIONS:
             # Check this BEFORE adding reminder to history
             if consecutive_empty_tool_calls >= 2:
                 logger.warning(f"Supervisor failed to call tools {consecutive_empty_tool_calls} times consecutively - forcing finish")
+                # CRITICAL: If forced finalization, ensure we finish even if supervisor fails
+                if force_finalization:
+                    final_decision["reasoning"] = f"MANDATORY finalization: All tasks completed. Supervisor failed to call tools ({consecutive_empty_tool_calls} times) - proceeding to report generation."
+                else:
+                    final_decision["reasoning"] = f"Supervisor repeatedly failed to call tools ({consecutive_empty_tool_calls} times). Research completed after {react_iteration + 1} iterations."
                 final_decision["should_continue"] = False
                 final_decision["replanning_needed"] = False
-                final_decision["reasoning"] = f"Supervisor repeatedly failed to call tools ({consecutive_empty_tool_calls} times). Research completed after {react_iteration + 1} iterations."
                 decision_made = True
                 break
             
-            # Force finish if we're near max iterations and no decision made
+            # Force decision if we're near max iterations and no decision made
+            # Check if we've reached supervisor call limit - if so, finish research
             iterations_without_decision = react_iteration + 1
-            if (iterations_without_decision >= max_iterations - 3) and not decision_made:
-                logger.warning(f"Supervisor near max iterations ({iterations_without_decision}/{max_iterations}) without decision - forcing finish")
-                final_decision["should_continue"] = False
-                final_decision["replanning_needed"] = False
-                final_decision["reasoning"] = f"Research completed after {iterations_without_decision} supervisor iterations. All agent tasks reviewed and assigned."
+            if (iterations_without_decision >= max_iterations - 2) and not decision_made:
+                # CRITICAL: If this is forced finalization, always finish regardless of limit
+                if force_finalization:
+                    logger.warning(f"MANDATORY finalization: forcing finish (call {supervisor_call_count + 1}, iterations {iterations_without_decision}/{max_iterations}) - supervisor did not call make_final_decision")
+                    final_decision["should_continue"] = False  # Finish research - proceed to report generation
+                    final_decision["replanning_needed"] = False
+                    final_decision["reasoning"] = f"MANDATORY finalization: All tasks completed. Supervisor reached max iterations without calling make_final_decision - proceeding to report generation."
+                    decision_made = True
+                    break
+                # Check supervisor call count - if at limit, finish; otherwise continue
+                elif supervisor_call_count >= max_supervisor_calls:
+                    logger.info(f"Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}) - finishing research")
+                    final_decision["should_continue"] = False  # Finish research - proceed to report generation
+                    final_decision["replanning_needed"] = False
+                    final_decision["reasoning"] = f"Supervisor completed {supervisor_call_count} calls (max: {max_supervisor_calls}) - research complete, proceeding to report generation."
+                else:
+                    logger.info(f"Supervisor near max iterations ({iterations_without_decision}/{max_iterations}) - returning control to agents (call {supervisor_call_count}/{max_supervisor_calls})")
+                    final_decision["should_continue"] = True  # Continue research - agents will work more and supervisor will be called again
+                    final_decision["replanning_needed"] = False
+                    final_decision["reasoning"] = f"Supervisor completed {iterations_without_decision} iterations - returning control to agents for continued research (call {supervisor_call_count}/{max_supervisor_calls})."
                 decision_made = True
                 break
             
@@ -1654,11 +2430,11 @@ CRITICAL INSTRUCTIONS:
             # Add reminders if supervisor hasn't worked with draft/memory recently
             reminders = []
             if iterations_since_draft_read >= 2:
-                reminders.append("You haven't read draft_report.md recently - call read_draft_report to see current state")
+                reminders.append("You haven't read draft_report.md recently - call read_draft_report to see RAW FINDINGS and current synthesis")
             if iterations_since_memory_read >= 2:
                 reminders.append("You haven't read your supervisor file recently - call read_supervisor_file to review your notes")
             if iterations_since_draft_write >= 3:
-                reminders.append("You haven't written to draft_report.md in 3+ iterations - call write_draft_report to add findings")
+                reminders.append("You haven't synthesized RAW findings in 3+ iterations - call update_synthesized_report to write structured report")
             if iterations_since_memory_write >= 3:
                 reminders.append("You haven't written to your supervisor file in 3+ iterations - call write_supervisor_note to record observations")
             
@@ -1741,12 +2517,26 @@ CRITICAL INSTRUCTIONS:
             break
     
     if not decision_made:
-        logger.warning("Supervisor reached max iterations without explicit decision, stopping research", 
-                     max_iterations=max_iterations, 
-                     agent_history_length=len(agent_history))
-        # Force finish decision
-        final_decision["should_continue"] = False
-        final_decision["reasoning"] = f"Supervisor reached max iterations ({max_iterations}) without making explicit decision. Forcing finish."
+        # CRITICAL: If this is forced finalization, always finish regardless of limit
+        if force_finalization:
+            logger.info(f"MANDATORY finalization: forcing finish (no decision made, call {supervisor_call_count + 1})",
+                       max_iterations=max_iterations,
+                       agent_history_length=len(agent_history))
+            final_decision["should_continue"] = False
+            final_decision["reasoning"] = f"MANDATORY finalization: All tasks completed. Synthesizing findings and finishing research."
+        # Check supervisor call count - if at limit, finish; otherwise continue
+        elif supervisor_call_count >= max_supervisor_calls:
+            logger.info(f"Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}) - finishing research",
+                         max_iterations=max_iterations,
+                         agent_history_length=len(agent_history))
+            final_decision["should_continue"] = False
+            final_decision["reasoning"] = f"Supervisor reached call limit ({supervisor_call_count}/{max_supervisor_calls}) - research complete."
+        else:
+            logger.info(f"Supervisor reached max iterations, continuing research (call {supervisor_call_count}/{max_supervisor_calls})",
+                         max_iterations=max_iterations,
+                         agent_history_length=len(agent_history))
+            final_decision["should_continue"] = True
+            final_decision["reasoning"] = f"Supervisor reached max iterations ({max_iterations}) for this call - returning control to agents."
     
     # CRITICAL: Before finishing, ensure draft_report.md is filled with findings
     # If supervisor didn't write draft_report, we must create it from findings
@@ -1757,7 +2547,9 @@ CRITICAL INSTRUCTIONS:
                 supervisor_file = await agent_file_service.read_agent_file("supervisor")
                 existing_notes = supervisor_file.get("notes", [])
                 final_note = f"Research completed. Decision: finish. Total findings: {len(findings)}. Draft report finalized."
-                existing_notes.append(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {final_note}")
+                # CRITICAL: Use datetime from import at top of file
+                from datetime import datetime as dt
+                existing_notes.append(f"[{dt.now().strftime('%Y-%m-%d %H:%M:%S')}] {final_note}")
                 existing_notes = existing_notes[-100:]
                 await agent_file_service.write_agent_file(
                     agent_id="supervisor",

@@ -503,3 +503,155 @@ Compress Findings → Generate Final Report → Return
 - Оптимизация запросов к LLM
 - Эффективное управление памятью
 
+---
+
+## Архитектура системы (обновлено 2026-01-12)
+
+### Multi-Chat Support
+
+Система поддерживает **множественные чаты** (как ChatGPT):
+
+- **SessionManager** управляет сессиями deep_research
+- Каждый chat_id имеет максимум **1 активную deep_research сессию**
+- При переключении между чатами сессии **сохраняются**
+- При смене режима внутри чата сессия **сбрасывается** (помечается "superseded")
+- **Resume механизм** через LangGraph checkpoints позволяет продолжить незавершенное исследование
+
+```python
+# Пример работы:
+Chat A: deep_research → clarification → switch to Chat B
+Chat B: search mode → switch back to Chat A
+Chat A: user answers clarification → research CONTINUES (resume)
+```
+
+### Session-Based Architecture
+
+**Было (проблемно):**
+- Поиск original_query через текстовые маркеры ("clarification", "🔍")
+- O(n²) сложность поиска по chat_history
+- Хрупкая логика, зависимая от текста
+
+**Стало (надежно):**
+- `original_query` сохраняется в таблице `research_sessions` сразу
+- O(1) доступ из БД через session_id
+- `session_status` (active, waiting_clarification, researching, completed) вместо текстовых маркеров
+- Стабильный session_id для checkpoint resume
+
+### Модульная структура нод
+
+**Было:**
+- nodes.py (2162 строки) - монолитный файл
+- Runtime dependencies через context variables
+
+**Стало:**
+```
+nodes/
+├── base.py              # ResearchNode base class
+├── deep_search.py       # Начальный поиск контекста
+├── clarify.py           # Уточняющие вопросы
+├── analyze.py           # Анализ запроса
+├── plan.py              # Планирование исследования
+├── spawn_agents.py      # Создание характеристик агентов
+├── execute_agents.py    # Выполнение агентов
+├── supervisor_review.py # Координация супервайзера
+├── compress.py          # Сжатие находок
+└── report.py            # Генерация финального отчета
+```
+
+### Dependency Injection
+
+**Было:**
+```python
+runtime_deps_context = contextvars.ContextVar('runtime_deps')
+state = _restore_runtime_deps(state)
+```
+
+**Стало:**
+```python
+@dataclass
+class ResearchDependencies:
+    llm: Any
+    search_provider: Any
+    session_manager: SessionManager
+    # ... другие зависимости
+
+class ResearchNode(ABC):
+    def __init__(self, deps: ResearchDependencies):
+        self.deps = deps
+```
+
+### Prompt Builders
+
+Все промпты вынесены в отдельные модули:
+
+```
+prompts/
+├── base.py              # PromptBuilder base с utilities
+├── supervisor.py        # Supervisor prompts
+├── agent.py             # Research agent prompts
+├── clarify.py           # Clarification prompts
+├── analysis.py          # Query analysis prompts
+├── planning.py          # Research planning prompts
+└── report.py            # Final report prompts
+```
+
+### Database Schema
+
+**Новые таблицы:**
+
+```sql
+CREATE TABLE research_sessions (
+    id VARCHAR(64) PRIMARY KEY,
+    chat_id VARCHAR(64) NOT NULL,  -- FK to chats
+    original_query TEXT NOT NULL,
+    mode VARCHAR(16) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    deep_search_result TEXT,
+    clarification_answers TEXT,
+    draft_report TEXT,
+    final_report TEXT
+    -- UNIQUE INDEX для 1 активной сессии на chat_id
+);
+```
+
+### Routing Logic
+
+**session_status-based routing (вместо текстовых маркеров):**
+
+```python
+def should_ask_clarification(state: ResearchState) -> str:
+    session_status = state.get("session_status", "active")
+
+    if session_status == "waiting_clarification":
+        has_user_answer = chat_history[-1].get("role") == "user"
+        return "proceed" if has_user_answer else "wait_for_user"
+
+    return "proceed"
+```
+
+### Workflow Resume
+
+```python
+# В chat_stream.py
+session, is_new = await session_manager.get_or_create_session(
+    chat_id=request.chat_id,
+    query=current_user_message,
+    mode=mode
+)
+
+# Если is_new == False, это resume
+if not is_new:
+    # LangGraph автоматически загружает checkpoint по session_id
+    logger.info("Resuming from checkpoint")
+```
+
+### Преимущества новой архитектуры
+
+✅ **Multi-chat support** - изоляция сессий по chat_id
+✅ **Session resume** - продолжение незавершенных исследований
+✅ **O(1) original_query** - из БД вместо O(n²) поиска
+✅ **Устойчивость** - session_status вместо текстовых маркеров
+✅ **Модульность** - легко найти и изменить код
+✅ **Тестируемость** - каждая нода независима
+✅ **DI pattern** - явные зависимости
+

@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.config.settings import get_settings
+from src.config.logging_config import configure_logging
 from src.chat.service import ChatSearchService
 from src.chat.search import ChatMessageSearchEngine
 from src.database.connection import create_database_engine, create_db_pool, create_session_factory
@@ -70,9 +71,12 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events.
     """
     # Startup
-    logger.info("Starting up All-Included Deep Research API...")
-
     settings = get_settings()
+
+    # Configure logging FIRST - this removes verbose tracebacks
+    configure_logging(debug_mode=settings.debug_mode)
+
+    logger.info("Starting up All-Included Deep Research API...")
     logger.info("Settings loaded", debug_mode=settings.debug_mode)
 
     # Initialize database

@@ -260,7 +260,12 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
 
       {sources.length > 0 && (
         <div className="mt-3">
-          <div className="text-xs font-semibold text-foreground">Sources</div>
+          <div className="flex items-center justify-between text-xs font-semibold text-foreground">
+            <span>Sources</span>
+            <Badge variant="secondary" className="text-[10px]">
+              {sources.length}
+            </Badge>
+          </div>
           <div className="mt-2 space-y-1">
             {sources.slice(0, 6).map((source, idx) => (
               <a

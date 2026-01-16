@@ -121,33 +121,58 @@ class MemoryChunkModel(Base):
 
 
 class ResearchSessionModel(Base):
-    """Research session tracking."""
+    """Deep research session tracking with multi-chat support.
+
+    Key features:
+    - Each session is tied to a specific chat_id
+    - Only one active session per chat_id (enforced by DB constraint)
+    - Session resume support through stable session_id
+    - Stores all deep research artifacts (deep_search, draft_report, etc.)
+    """
 
     __tablename__ = "research_sessions"
 
     id = Column(String(64), primary_key=True)
-    mode = Column(String(16), nullable=False)  # speed, balanced, quality
-    query = Column(Text, nullable=False)
-    status = Column(String(32), nullable=False)  # running, completed, failed
+    chat_id = Column(String(64), ForeignKey("chats.id", ondelete="CASCADE"), nullable=False)
+    original_query = Column(Text, nullable=False)  # Saved immediately on session creation
+    mode = Column(String(16), nullable=False)  # quality, balanced, speed
+    status = Column(String(32), nullable=False)  # active, waiting_clarification, researching, completed, superseded, cancelled, expired
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     completed_at = Column(DateTime(timezone=True))
-    final_report = Column(Text)
+
+    # Research artifacts
+    deep_search_result = Column(Text)  # Initial deep search result
+    clarification_answers = Column(Text)  # User answers to clarification questions
+    draft_report = Column(Text)  # Working draft updated by agents/supervisor
+    final_report = Column(Text)  # Final formatted report
+
     session_metadata = Column("metadata", JSONB, default=dict)
 
+    # Relationships
+    chat = relationship("ChatModel", back_populates="research_sessions")
+
     __table_args__ = (
+        Index("idx_research_sessions_chat_id", "chat_id"),
         Index("idx_research_sessions_status", "status"),
         Index("idx_research_sessions_created", "created_at"),
+        # UNIQUE partial index for one active session per chat (created in migration)
     )
 
     def to_dict(self) -> dict[str, Any]:
         """Convert model to dictionary."""
         return {
             "id": self.id,
+            "chat_id": self.chat_id,
+            "original_query": self.original_query,
             "mode": self.mode,
-            "query": self.query,
             "status": self.status,
             "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+            "deep_search_result": self.deep_search_result,
+            "clarification_answers": self.clarification_answers,
+            "draft_report": self.draft_report,
             "final_report": self.final_report,
             "metadata": self.session_metadata or {},
         }
@@ -166,6 +191,7 @@ class ChatModel(Base):
 
     # Relationships
     messages = relationship("ChatMessageModel", back_populates="chat", cascade="all, delete-orphan")
+    research_sessions = relationship("ResearchSessionModel", back_populates="chat", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("idx_chats_created", "created_at"),
@@ -184,7 +210,7 @@ class ChatModel(Base):
 
 
 class ChatMessageModel(Base):
-    """Chat message model with embedding support."""
+    """Chat message model with embedding support and research session tracking."""
 
     __tablename__ = "chat_messages"
 
@@ -197,13 +223,21 @@ class ChatMessageModel(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     message_metadata = Column("metadata", JSONB, default=dict)
 
+    # NEW: Research session tracking
+    mode = Column(String(16))  # chat, search, deep_search, deep_research, quality, balanced, speed
+    session_id = Column(String(64), ForeignKey("research_sessions.id", ondelete="SET NULL"))  # Links to deep research session
+    original_query = Column(Text)  # Denormalized for quick access
+
     # Relationships
     chat = relationship("ChatModel", back_populates="messages")
+    research_session = relationship("ResearchSessionModel", foreign_keys=[session_id])
 
     __table_args__ = (
         Index("idx_chat_messages_chat_id", "chat_id"),
         Index("idx_chat_messages_created", "created_at"),
         Index("idx_chat_messages_embedding", "embedding", postgresql_using="ivfflat"),
+        Index("idx_chat_messages_mode", "mode"),
+        Index("idx_chat_messages_session_id", "session_id"),
         # Full-text search index will be created via migration SQL
     )
 
@@ -217,4 +251,7 @@ class ChatMessageModel(Base):
             "content": self.content,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "metadata": self.message_metadata or {},
+            "mode": self.mode,
+            "session_id": self.session_id,
+            "original_query": self.original_query,
         }

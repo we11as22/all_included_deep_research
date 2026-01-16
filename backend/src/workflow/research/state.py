@@ -20,8 +20,10 @@ class ResearchState(TypedDict):
 
     # ========== Input ==========
     query: str
+    original_query: str  # Original query from session (for deep_research continuations)
     chat_history: list  # List of message dicts
     mode: str  # speed, balanced, quality
+    user_language: str  # User's language (detected from query, e.g., "Russian", "English")
 
     # ========== Analysis ==========
     query_analysis: dict[str, Any]  # QueryAnalysis structured output
@@ -74,6 +76,7 @@ class ResearchState(TypedDict):
     agent_count: int  # Actual number of agents created
     requires_deep_search: bool  # Whether deep search is needed
     clarification_needed: bool  # Whether user clarification is needed
+    clarification_just_sent: bool  # Flag to prevent immediate continuation after sending clarification
     findings: list[dict]  # Findings from execute_agents (temporary, before adding to agent_findings)
     findings_count: int  # Count of findings
     compressed_research: str  # Compressed findings before final report
@@ -84,6 +87,7 @@ class ResearchState(TypedDict):
 
     # ========== Session Info ==========
     session_id: str
+    session_status: str  # Session status from DB (active, waiting_clarification, researching, completed, etc.)
 
     # ========== Mode Config ==========
     mode_config: dict[str, Any]  # max_concurrent, max_sources, etc.
@@ -176,7 +180,7 @@ class CompressedFindings(BaseModel):
 # ==================== Helper Functions ==========
 
 
-def create_initial_state(
+async def create_initial_state(
     query: str,
     chat_history: list,
     mode: str,
@@ -184,14 +188,66 @@ def create_initial_state(
     session_id: str,
     mode_config: dict[str, Any],
     settings: Any = None,
+    session_manager: Any = None,
 ) -> ResearchState:
-    """Create initial state for research graph."""
+    """Create initial state for research graph.
+
+    Args:
+        query: Current query (might be clarification answer)
+        chat_history: Chat history
+        mode: Research mode
+        stream: Stream generator
+        session_id: Session ID for checkpointing
+        mode_config: Mode configuration
+        settings: Settings object
+        session_manager: SessionManager instance for loading session data
+
+    Returns:
+        Initial research state with original_query loaded from session
+    """
+
+    # Load original_query and session_status from session if session_manager provided
+    original_query = query  # Default to current query
+    session_status = "active"  # Default status
+    if session_manager:
+        try:
+            session = await session_manager.get_session(session_id)
+            if session:
+                original_query = session.original_query
+                session_status = session.status
+        except Exception:
+            # Fallback to current query if session loading fails
+            pass
+
+    # Detect user language from original query
+    user_language = "English"  # Default
+    try:
+        from langdetect import detect
+        detected = detect(original_query if original_query else query)
+        if detected == "ru":
+            user_language = "Russian"
+        elif detected == "en":
+            user_language = "English"
+        elif detected == "es":
+            user_language = "Spanish"
+        elif detected == "fr":
+            user_language = "French"
+        elif detected == "de":
+            user_language = "German"
+        elif detected == "zh-cn" or detected == "zh-tw":
+            user_language = "Chinese"
+        # Add more languages as needed
+    except Exception:
+        # Fallback to English if detection fails
+        pass
 
     return {
         # Input
         "query": query,
+        "original_query": original_query,
         "chat_history": chat_history,
         "mode": mode,
+        "user_language": user_language,
 
         # Analysis
         "query_analysis": {},
@@ -235,6 +291,7 @@ def create_initial_state(
 
         # Session
         "session_id": session_id,
+        "session_status": session_status,
 
         # Config
         "mode_config": mode_config,

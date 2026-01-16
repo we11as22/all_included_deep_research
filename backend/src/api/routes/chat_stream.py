@@ -71,15 +71,16 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     if not user_messages:
         raise HTTPException(status_code=400, detail="No user message found in request")
 
-    # CRITICAL: Get the ORIGINAL query (first user message before any clarification)
+    # Get current user message
+    current_user_message = user_messages[-1].content
+
     # Load chat history from database if chat_id is provided
     chat_history = []
-    original_query = None
     if request.chat_id:
         try:
             from src.database.schema import ChatMessageModel
             from sqlalchemy import select
-            
+
             session_factory = app_request.app.state.session_factory
             async with session_factory() as session:
                 result = await session.execute(
@@ -88,261 +89,30 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     .order_by(ChatMessageModel.created_at.asc())
                 )
                 db_messages = result.scalars().all()
-                
+
                 # Convert DB messages to chat history format
                 for msg in db_messages:
                     chat_history.append({
                         "role": msg.role,
                         "content": msg.content
                     })
-                
-                # Find original query for CURRENT deep research session
-                # This is the first user message in the current deep research session, before clarification
-                # We need to find where the current deep research session started
-                # Look for the last assistant message with clarification or deep search, then find first user message before it
-                
-                # First, determine if this is a deep research request
-                raw_mode = request.model or "search"
-                normalized = raw_mode.lower().replace("-", "_")
-                is_deep_research = normalized in {"quality", "deep_research", "research"}
-                
-                if is_deep_research:
-                    # Find the start of current deep research session
-                    # Look backwards from the end to find last clarification or deep search message
-                    # This helps identify the boundary of the current deep research session
-                    last_clarification_or_deep_search_idx = -1
-                    for i in range(len(chat_history) - 1, -1, -1):
-                        msg = chat_history[i]
-                        if msg.get("role") == "assistant":
-                            content = msg.get("content", "").lower()
-                            # Look for markers that indicate deep research session
-                            if ("clarification" in content or "🔍" in content or "clarify" in content or 
-                                "deep search" in content or "initial deep search" in content or
-                                "research report" in content or "final report" in content):
-                                last_clarification_or_deep_search_idx = i
-                                logger.info("Found last deep research marker message", 
-                                          message_index=i, 
-                                          content_preview=content[:100])
-                                break
-                    
-                    # Now find first user message BEFORE this marker
-                    # This is the original query for current deep research session
-                    # CRITICAL: This works even if there were other modes between deep research sessions
-                    if last_clarification_or_deep_search_idx >= 0:
-                        # Look for first user message before the marker
-                        # This will be the query that started the current deep research session
-                        # CRITICAL: Skip any user messages that come AFTER the marker (these are clarification answers)
-                        for i in range(last_clarification_or_deep_search_idx - 1, -1, -1):
-                            msg = chat_history[i]
-                            if msg.get("role") == "user":
-                                original_query = msg.get("content", "")
-                                logger.info("Found original query for current deep research session", 
-                                          original_query=original_query[:100] if original_query else None,
-                                          message_index=i,
-                                          before_marker_at=last_clarification_or_deep_search_idx)
-                                break
-                    else:
-                        # No deep research markers found - this might be first deep research message in chat
-                        # Or the first deep research message after other modes
-                        # Find last user message (should be the query for current session)
-                        # BUT: Check if last user message might be a clarification answer
-                        # If chat_history has assistant messages, check if last one is clarification
-                        found_clarification_before = False
-                        for i in range(len(chat_history) - 1, -1, -1):
-                            msg = chat_history[i]
-                            if msg.get("role") == "assistant":
-                                content = msg.get("content", "").lower()
-                                if ("clarification" in content or "🔍" in content or "clarify" in content):
-                                    found_clarification_before = True
-                                    # Look for user message before this clarification
-                                    for j in range(i - 1, -1, -1):
-                                        prev_msg = chat_history[j]
-                                        if prev_msg.get("role") == "user":
-                                            original_query = prev_msg.get("content", "")
-                                            logger.info("Found original query before clarification (no marker found, but found clarification pattern)", 
-                                                      original_query=original_query[:100] if original_query else None,
-                                                      message_index=j)
-                                            break
-                                    if original_query:
-                                        break
-                        
-                        if not original_query:
-                            # No clarification found - use last user message
-                            for i in range(len(chat_history) - 1, -1, -1):
-                                msg = chat_history[i]
-                                if msg.get("role") == "user":
-                                    original_query = msg.get("content", "")
-                                    logger.info("Found original query (no deep research markers found, using last user message)", 
-                                              original_query=original_query[:100] if original_query else None,
-                                              message_index=i)
-                                    break
-                else:
-                    # Not deep research - just use first user message
-                    for msg in chat_history:
-                        if msg.get("role") == "user":
-                            original_query = msg.get("content", "")
-                            logger.info("Found original query (not deep research, first user message)", 
-                                      original_query=original_query[:100] if original_query else None)
-                            break
-                
-                logger.info("Loaded chat history from database", 
-                          chat_id=request.chat_id, 
-                          messages_count=len(chat_history), 
-                          original_query=original_query[:100] if original_query else None,
-                          is_deep_research=is_deep_research)
+
+                logger.info("Loaded chat history from database",
+                          chat_id=request.chat_id,
+                          messages_count=len(chat_history))
         except Exception as e:
             logger.warning("Failed to load chat history from database", chat_id=request.chat_id, error=str(e))
             # Fallback to request messages
             chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
-            # Determine mode first
-            raw_mode = request.model or "search"
-            normalized = raw_mode.lower().replace("-", "_")
-            is_deep_research = normalized in {"quality", "deep_research", "research"}
-            # For fallback, use first user message (should be the query)
-            # CRITICAL: In fallback, request.messages might only contain clarification answer
-            # So we use first user message, but log a warning
-            original_query = user_messages[0].content if user_messages else None
-            logger.warning("Using fallback: first user message as original query (chat_history from DB failed)", 
-                      original_query=original_query[:100] if original_query else None,
-                      is_deep_research=is_deep_research,
-                      user_messages_count=len(user_messages))
     else:
         # Use messages from request
         chat_history = [{"role": msg.role.value, "content": msg.content} for msg in request.messages]
-        # Determine mode first
-        raw_mode = request.model or "search"
-        normalized = raw_mode.lower().replace("-", "_")
-        is_deep_research = normalized in {"quality", "deep_research", "research"}
-        
-        if is_deep_research and len(chat_history) > 1:
-            # Find original query for current deep research session
-            # Look backwards from the end to find last deep research marker message
-            last_deep_research_marker_idx = -1
-            for i in range(len(chat_history) - 1, -1, -1):
-                msg = chat_history[i]
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "").lower()
-                    # Look for markers that indicate deep research session
-                    if ("clarification" in content or "🔍" in content or "clarify" in content or 
-                        "deep search" in content or "initial deep search" in content or
-                        "research report" in content or "final report" in content):
-                        last_deep_research_marker_idx = i
-                        break
-            
-            # Find first user message BEFORE this marker
-            # This will be the query that started the current deep research session
-            if last_deep_research_marker_idx >= 0:
-                for i in range(last_deep_research_marker_idx - 1, -1, -1):
-                    msg = chat_history[i]
-                    if msg.get("role") == "user":
-                        original_query = msg.get("content", "")
-                        logger.info("Found original query for current deep research session (from request)", 
-                                  original_query=original_query[:100] if original_query else None,
-                                  message_index=i,
-                                  before_marker_at=last_deep_research_marker_idx)
-                        break
-            
-            if not original_query:
-                # No deep research markers found or not found before it
-                # CRITICAL: Don't use user_messages from request - they might be clarification answers!
-                # Instead, search in chat_history for the first user message
-                if len(chat_history) > 0:
-                    for msg in chat_history:
-                        if msg.get("role") == "user":
-                            original_query = msg.get("content", "")
-                            logger.warning("No markers found, using first user message from chat_history", 
-                                         original_query=original_query[:100] if original_query else None)
-                            break
-                # Fallback to user_messages only if chat_history is empty
-                if not original_query:
-                    original_query = user_messages[0].content if user_messages else None
-                    logger.warning("Using first user message from request (chat_history empty)", 
-                                 original_query=original_query[:100] if original_query else None)
-        else:
-            # Not deep research or too short
-            # CRITICAL: Use chat_history, not request.messages
-            if len(chat_history) > 0:
-                for msg in chat_history:
-                    if msg.get("role") == "user":
-                        original_query = msg.get("content", "")
-                        logger.info("Not deep research, using first user message from chat_history", 
-                                  original_query=original_query[:100] if original_query else None)
-                        break
-            # Fallback to user_messages only if chat_history is empty
-            if not original_query:
-                original_query = user_messages[0].content if user_messages else None
-    
-    # CRITICAL: Always use original query if found, otherwise use first user message
-    # Never use last user message as it might be a clarification answer!
-    # CRITICAL: For deep_research, original_query MUST come from chat_history, NOT from request.messages
-    # because request.messages may only contain the clarification answer
-    query = None
-    if original_query:
-        query = original_query
-        logger.info("Using original query", query=query[:100], mode=mode if 'mode' in locals() else "unknown")
-    elif is_deep_research and user_messages:
-        # For deep_research, NEVER use request.messages - they may only contain clarification answer
-        # Always search in chat_history for the original query
-        if len(chat_history) >= 2:
-            # Look for clarification pattern: assistant with clarification, then user message
-            for i in range(len(chat_history) - 1, -1, -1):
-                msg = chat_history[i]
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "").lower()
-                    if ("clarification" in content or "🔍" in content or "clarify" in content):
-                        # Found clarification - the query should be BEFORE this
-                        # Look for user message before clarification
-                        for j in range(i - 1, -1, -1):
-                            prev_msg = chat_history[j]
-                            if prev_msg.get("role") == "user":
-                                query = prev_msg.get("content", "")
-                                logger.info("Found query before clarification in chat_history", 
-                                           query=query[:100], 
-                                           clarification_at_index=i,
-                                           query_at_index=j)
-                                break
-                        if query:
-                            break
-        
-        # If still not found, use first user message from chat_history
-        if not query and len(chat_history) > 0:
-            for msg in chat_history:
-                if msg.get("role") == "user":
-                    query = msg.get("content", "")
-                    logger.warning("Using first user message from chat_history (no clarification pattern found)", 
-                                 query=query[:100])
-                    break
-        
-        # Last resort: use first user message from request (should not happen if chat_history is loaded)
-        if not query and user_messages:
-            query = user_messages[0].content
-            logger.error("CRITICAL: Using first user message from request - chat_history may be empty or incomplete!", 
-                       query=query[:100],
-                       chat_history_length=len(chat_history))
-    elif user_messages:
-        # For non-deep-research modes, try chat_history first
-        if len(chat_history) > 0:
-            for msg in chat_history:
-                if msg.get("role") == "user":
-                    query = msg.get("content", "")
-                    logger.info("Using first user message from chat_history", query=query[:100])
-                    break
-        # Fallback to request messages
-        if not query:
-            query = user_messages[0].content  # Use FIRST user message, not last!
-            logger.warning("Original query not found, using first user message from request", query=query[:100])
-    else:
-        query = ""
-        logger.error("No user messages found - cannot determine query!")
     
     raw_mode = request.model or "search"
     normalized = raw_mode.lower().replace("-", "_")
     settings = app_request.app.state.settings
-    
-    # Limit chat history length
-    if settings.chat_history_limit and len(chat_history) > settings.chat_history_limit:
-        chat_history = chat_history[-settings.chat_history_limit:]
 
+    # Determine mode
     if normalized in {"chat", "simple", "conversation"}:
         mode = "chat"
     elif normalized in {"speed"}:
@@ -360,9 +130,82 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
     else:
         mode = "deep_search"
 
-    logger.info("Chat stream request", mode=mode, query=query[:100])
+    # Session management for deep_research mode with multi-chat support
+    session_id = None
+    query = current_user_message
+    original_query = None
+    is_new_session = False
 
-    session_id = str(uuid4())
+    # CRITICAL DEBUG: Log mode and chat_id before SessionManager check
+    logger.info("🔍 DEBUG: Checking for SessionManager invocation",
+               mode=mode,
+               chat_id=request.chat_id,
+               current_message=current_user_message[:100])
+
+    # Deep research mode
+    if mode == "deep_research" and request.chat_id:
+        logger.info("🔥 ENTERING SessionManager block!", mode=mode, chat_id=request.chat_id)
+        # Use SessionManager for multi-chat session management
+        from src.workflow.research.session.manager import SessionManager
+
+        session_factory = app_request.app.state.session_factory
+        session_manager = SessionManager(session_factory)
+
+        # Get or create session for this chat
+        research_session, is_new_session = await session_manager.get_or_create_session(
+            chat_id=request.chat_id,
+            query=current_user_message,
+            mode=mode
+        )
+
+        session_id = research_session.id
+        original_query = research_session.original_query
+
+        if is_new_session:
+            logger.info("Created new deep_research session",
+                       session_id=session_id,
+                       chat_id=request.chat_id,
+                       mode=mode)
+        else:
+            logger.info("Resuming existing deep_research session",
+                       session_id=session_id,
+                       chat_id=request.chat_id,
+                       status=research_session.status)
+
+        # Use original_query from session (not current message which might be clarification answer)
+        query = original_query
+    elif mode != "deep_research" and request.chat_id:
+        # For non-deep-research modes, check if there are active deep_research sessions to supersede
+        from src.workflow.research.session.manager import SessionManager
+
+        session_factory = app_request.app.state.session_factory
+        session_manager = SessionManager(session_factory)
+
+        # Mark any active deep_research sessions as superseded
+        superseded_count = await session_manager.supersede_active_sessions(
+            chat_id=request.chat_id,
+            reason=f"User switched to {mode} mode"
+        )
+
+        if superseded_count > 0:
+            logger.info("Superseded active deep_research sessions",
+                       chat_id=request.chat_id,
+                       count=superseded_count,
+                       new_mode=mode)
+
+    # Fallback: generate session_id for non-deep-research modes
+    if not session_id:
+        session_id = str(uuid4())
+
+    # Limit chat history length
+    if settings.chat_history_limit and len(chat_history) > settings.chat_history_limit:
+        chat_history = chat_history[-settings.chat_history_limit:]
+
+    logger.info("Chat stream request",
+               mode=mode,
+               query=query[:100] if query else "",
+               session_id=session_id,
+               is_new_session=is_new_session)
     # Pass app state to stream generator - include chat_id for DB saving
     app_state = {
         "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
@@ -459,20 +302,12 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
             # Run new LangGraph research
             try:
-                # Check if this is a continuation after clarification
-                # If last assistant message has clarification and current user message exists, we're continuing
-                is_continuation = False
-                if len(chat_history) >= 2:
-                    for i in range(len(chat_history) - 1, -1, -1):
-                        msg = chat_history[i]
-                        if msg.get("role") == "assistant":
-                            content = msg.get("content", "").lower()
-                            if "clarification" in content or "🔍" in content or "clarify" in content:
-                                # Check if there's a user message after this
-                                if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
-                                    is_continuation = True
-                                    logger.info("Detected continuation after user clarification answer")
-                                break
+                # Determine if this is a continuation based on session status (not text markers!)
+                is_continuation = not is_new_session
+                if is_continuation:
+                    logger.info("Resuming deep_research session from checkpoint",
+                               session_id=session_id,
+                               status=research_session.status)
                 
                 final_state = await run_research_graph(
                     query=query,
@@ -485,6 +320,8 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     session_id=session_id,
                     mode_config=mode_config,
                     settings=settings,
+                    session_manager=session_manager,
+                    session_factory=session_factory,
                 )
                 
                 # Check if graph stopped waiting for user (clarification needed but no answer yet)
@@ -542,24 +379,48 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 
                 logger.info("Final report raw", report_type=type(final_report_raw).__name__, has_value=bool(final_report_raw))
                 
-                # If no final_report and this is a continuation, research might still be in progress
-                if not final_report_raw and is_continuation:
-                    logger.info("No final_report yet after continuation - research may still be in progress")
-                    # Check if research is actually still running by looking at state
-                    # If there are findings or agent work in progress, research is still running
-                    if isinstance(final_state, dict):
-                        findings = final_state.get("findings", final_state.get("agent_findings", []))
-                        iteration = final_state.get("iteration", 0)
-                        should_continue = final_state.get("should_continue", False)
-                        
-                        if findings or iteration > 0 or should_continue:
-                            logger.info("Research is still in progress - not emitting final report yet", 
-                                       findings_count=len(findings) if findings else 0,
-                                       iteration=iteration,
-                                       should_continue=should_continue)
-                            # Research is still running - don't emit done, let it continue
-                            # The graph will emit results via stream as they become available
-                            return
+                # CRITICAL: Use session status from DB to determine what to do
+                # This is the proper way - based on session state, not code checks
+                session_status_from_db = research_session.status if research_session else None
+                
+                # If no final_report, check session status from DB
+                if not final_report_raw:
+                    # If this is a new session (not continuation), research is just starting - this is normal
+                    # Don't emit error - let research proceed (deep search, clarification, etc.)
+                    if not is_continuation:
+                        logger.info("New session - research is starting, no final_report yet is normal",
+                                   session_id=session_id,
+                                   session_status=session_status_from_db)
+                        # Research is just starting - don't emit error, let it proceed
+                        # The graph will emit results via stream as they become available
+                        return
+                    
+                    # If session is in "researching" status, research is still in progress
+                    # Don't emit empty report - let research continue
+                    if session_status_from_db == "researching":
+                        logger.info("Session status is 'researching' - research is in progress, not emitting empty report",
+                                   session_id=session_id,
+                                   is_continuation=is_continuation)
+                        # Research is still running - don't emit done, let it continue
+                        # The graph will emit results via stream as they become available
+                        return
+                    
+                    # If session is in "waiting_clarification", user needs to answer
+                    # This is normal - clarification questions should be shown to user
+                    if session_status_from_db == "waiting_clarification":
+                        logger.info("Session is waiting for clarification - this is normal, not emitting error",
+                                   session_id=session_id)
+                        # Don't emit error - clarification questions should be shown to user
+                        return
+                    
+                    # If session is in "active" status and no final_report, research may be starting
+                    # This is normal for new sessions or early in research process
+                    if session_status_from_db == "active":
+                        logger.info("Session status is 'active' - research may be starting, not emitting error",
+                                   session_id=session_id,
+                                   is_continuation=is_continuation)
+                        # Don't emit error - research may be in early stages
+                        return
                 
                 if isinstance(final_report_raw, dict) and "value" in final_report_raw:
                     final_report = final_report_raw["value"]
@@ -585,52 +446,68 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     # Store final report in session for PDF generation
                     _store_session_report(app_request.app.state, session_id, final_report, query, mode)
                 else:
-                    logger.warning("No final report generated from research graph, creating fallback", final_state_keys=list(final_state.keys()) if isinstance(final_state, dict) else "not a dict")
-                    # Try to get draft_report, main document, or findings as fallback
-                    fallback_report = None
-                    if isinstance(final_state, dict):
-                        # Try draft_report first
-                        agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
-                        if agent_memory_service:
-                            try:
-                                draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
-                                if len(draft_report) > 500:
-                                    fallback_report = draft_report
-                                    logger.info("Using draft_report.md as fallback report", length=len(draft_report))
-                            except Exception as e:
-                                logger.warning("Could not read draft_report", error=str(e))
-                        
-                        # Try main document
-                        if not fallback_report:
-                            main_doc = final_state.get("main_document", "")
-                            if main_doc and len(main_doc) > 500:
-                                fallback_report = main_doc
-                                logger.info("Using main document as fallback report", length=len(main_doc))
-                        
-                        # Try findings
-                        if not fallback_report:
-                            findings = final_state.get("findings", final_state.get("agent_findings", []))
-                            if findings:
-                                findings_text = "\n\n".join([
-                                    f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
-                                    for f in findings
-                                ])
-                                fallback_report = f"# Research Report: {query}\n\n## Findings\n\n{findings_text}"
-                                logger.info("Using findings as fallback report", findings_count=len(findings))
+                    # No final_report - check if this is expected (research starting, waiting for clarification, etc.)
+                    # Only emit error if research actually completed but no report was generated
                     
-                    if fallback_report:
-                        logger.info("Emitting fallback report", report_length=len(fallback_report))
-                        stream_generator.emit_status("Finalizing report...", step="report")
-                        for chunk in _chunk_text(fallback_report, size=200):
-                            stream_generator.emit_report_chunk(chunk)
-                            await asyncio.sleep(0.02)
-                        stream_generator.emit_final_report(fallback_report)
-                        _store_session_report(app_request.app.state, session_id, fallback_report, query, mode)
-                        logger.info("Fallback report emitted successfully")
+                    # Check if research completed (session status should be "completed" if research finished)
+                    if session_status_from_db == "completed":
+                        # Research completed but no final_report - try fallback
+                        logger.warning("Research completed but no final_report, trying fallback sources",
+                                     session_id=session_id)
+                        fallback_report = None
+                        if isinstance(final_state, dict):
+                            # Try draft_report first
+                            agent_memory_service = stream_generator.app_state.get("agent_memory_service") if hasattr(stream_generator, "app_state") else None
+                            if agent_memory_service:
+                                try:
+                                    draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
+                                    if len(draft_report) > 500:
+                                        fallback_report = draft_report
+                                        logger.info("Using draft_report.md as fallback report", length=len(draft_report))
+                                except Exception as e:
+                                    logger.warning("Could not read draft_report", error=str(e))
+                            
+                            # Try main document
+                            if not fallback_report:
+                                main_doc = final_state.get("main_document", "")
+                                if main_doc and len(main_doc) > 500:
+                                    fallback_report = main_doc
+                                    logger.info("Using main document as fallback report", length=len(main_doc))
+                            
+                            # Try findings
+                            if not fallback_report:
+                                findings = final_state.get("findings", final_state.get("agent_findings", []))
+                                if findings:
+                                    findings_text = "\n\n".join([
+                                        f"## {f.get('topic', 'Unknown')}\n\n{f.get('summary', '')}\n\n"
+                                        for f in findings
+                                    ])
+                                    fallback_report = f"# Research Report: {query}\n\n## Findings\n\n{findings_text}"
+                                    logger.info("Using findings as fallback report", findings_count=len(findings))
+                        
+                        if fallback_report:
+                            logger.info("Emitting fallback report", report_length=len(fallback_report))
+                            stream_generator.emit_status("Finalizing report...", step="report")
+                            for chunk in _chunk_text(fallback_report, size=200):
+                                stream_generator.emit_report_chunk(chunk)
+                                await asyncio.sleep(0.02)
+                            stream_generator.emit_final_report(fallback_report)
+                            _store_session_report(app_request.app.state, session_id, fallback_report, query, mode)
+                            logger.info("Fallback report emitted successfully")
+                        else:
+                            # Research completed but no report available - this is an error
+                            error_msg = "Research completed but no final report, draft report, main document, or findings were available"
+                            logger.error(error_msg, session_id=session_id, session_status=session_status_from_db)
+                            stream_generator.emit_error(error="No report generated", details=error_msg)
                     else:
-                        error_msg = "Research completed but no final report, draft report, main document, or findings were available"
-                        logger.error(error_msg)
-                        stream_generator.emit_error(error="No report generated", details=error_msg)
+                        # Research is not completed yet - this is normal, don't emit error
+                        # Status is "active", "waiting_clarification", or "researching" - research is in progress
+                        logger.info("No final_report but research is in progress - this is normal, not emitting error",
+                                   session_id=session_id,
+                                   session_status=session_status_from_db,
+                                   is_continuation=is_continuation)
+                        # Don't emit error - research is still running or waiting for user input
+                        # The graph will emit results via stream as they become available
                     
                 logger.info("Emitting done signal")
                 stream_generator.emit_done()
@@ -862,10 +739,46 @@ async def generate_pdf(session_id: str, app_request: Request):
     report_data = session_reports[session_id]
     report = report_data["report"]
     query = report_data["query"]
-    
+
     try:
+        # Generate a concise title using LLM
+        from langchain_openai import ChatOpenAI
+        title_llm = getattr(app_request.app.state, "chat_llm", None)
+
+        pdf_title = query[:80] or "Research Report"  # Default title
+
+        if title_llm and len(report) > 100:
+            try:
+                # Extract first few paragraphs for context
+                report_preview = report[:1000]
+                title_prompt = f"""Generate a concise, descriptive title (max 60 characters) for this research report.
+
+Original query: {query}
+
+Report preview:
+{report_preview}
+
+Requirements:
+- Maximum 60 characters
+- Clear and descriptive
+- In the same language as the query
+- No quotes or special formatting
+
+Title:"""
+
+                title_response = await title_llm.ainvoke([{"role": "user", "content": title_prompt}])
+                generated_title = title_response.content.strip().strip('"').strip("'")
+
+                if generated_title and len(generated_title) <= 80:
+                    pdf_title = generated_title
+                    logger.info("Generated PDF title using LLM",
+                               original_query=query[:50],
+                               generated_title=pdf_title)
+            except Exception as e:
+                logger.warning("Failed to generate PDF title with LLM, using query", error=str(e))
+
         # Generate PDF
-        pdf_buffer = markdown_to_pdf(report, title=query[:80] or "Research Report")
+        pdf_buffer = markdown_to_pdf(report, title=pdf_title)
         
         # Return PDF as response
         return Response(

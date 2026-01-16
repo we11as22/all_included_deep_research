@@ -72,14 +72,35 @@ class AgentFileService:
         # Read existing file to preserve character/preferences if not updating
         existing = await self.read_agent_file(agent_id)
         
-        todos = todos or existing.get("todos", [])
+        # CRITICAL: Protect done tasks - never remove or modify them
+        # When writing todos, preserve all done tasks from existing file
+        existing_todos = existing.get("todos", [])
+        existing_done_todos = {t.title: t for t in existing_todos if t.status == "done"}  # Use dict for deduplication
+        
+        # Merge: keep all done tasks + new/updated todos
+        if todos:
+            # Separate done and non-done tasks from new todos
+            new_done_todos = {t.title: t for t in todos if t.status == "done"}
+            new_pending_todos = [t for t in todos if t.status != "done"]
+            
+            # CRITICAL: Merge done tasks - prefer existing (they are the source of truth)
+            # If a done task appears in both, keep the existing one (it's already persisted)
+            merged_done_todos = {**new_done_todos, **existing_done_todos}  # existing_done_todos overwrite new
+            
+            # Combine: all done tasks (merged) + new pending/in_progress todos
+            todos = list(merged_done_todos.values()) + new_pending_todos
+        else:
+            # If no new todos provided, keep existing (including done)
+            todos = existing_todos
+        
         notes = notes if notes is not None else existing.get("notes", [])
         character = character if character is not None else existing.get("character", "")
         preferences = preferences if preferences is not None else existing.get("preferences", "")
 
         content = self._format_agent_file(agent_id, todos, notes, character, preferences)
         await self.file_manager.write_file(file_path, content)
-        logger.info("Agent file written", agent_id=agent_id, file_path=file_path)
+        logger.info("Agent file written", agent_id=agent_id, file_path=file_path, 
+                   total_todos=len(todos), done_todos=len([t for t in todos if t.status == "done"]))
 
     async def delete_agent_file(self, agent_id: str) -> bool:
         """
@@ -129,8 +150,26 @@ class AgentFileService:
         updated = False
         for todo in todos:
             if todo.title == todo_title:
+                # CRITICAL: Protect done tasks - they are immutable once completed
+                # No one can modify or delete done tasks - they are permanent record
+                if todo.status == "done":
+                    logger.warning(f"Attempted to modify done task '{todo_title}' for agent {agent_id}. Done tasks are immutable and cannot be changed.",
+                                 agent_id=agent_id, todo_title=todo_title, note="Done tasks are permanent records")
+                    return False  # Don't update done tasks at all
+                
+                # CRITICAL: Protect in_progress tasks from status changes
+                # Only allow status changes to in_progress tasks if changing to done
+                # This prevents race conditions where supervisor/other agents change status while agent is working
                 if status:
-                    todo.status = status
+                    if todo.status == "in_progress" and status != "done":
+                        logger.warning(f"Attempted to change status of in_progress task '{todo_title}' for agent {agent_id} from in_progress to {status}. Ignoring status change to prevent race condition.",
+                                     agent_id=agent_id, todo_title=todo_title, current_status=todo.status, attempted_status=status)
+                        # Don't update status, but allow other fields to be updated
+                    else:
+                        todo.status = status
+                
+                # Allow updating other fields even for in_progress tasks
+                # (agent uses cached current_task, so changes to objective/guidance won't affect current work)
                 if note is not None:
                     todo.note = note
                 if reasoning is not None:
