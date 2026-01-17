@@ -70,7 +70,8 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
 
                     # Sources already included in answer by ChatService with inline citations
                     answer = result.answer
-                    for chunk in _chunk_text(answer, size=120):
+                    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                    for chunk in _chunk_text(answer, size=10000):
                         stream_generator.add_chunk_from_str(chunk)
                         await asyncio.sleep(0.02)
                     stream_generator.finish()
@@ -82,7 +83,8 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
                 final_state = await workflow.run(query, messages=chat_history)
                 final_report = final_state.get("final_report", "") if isinstance(final_state, dict) else getattr(final_state, "final_report", "")
                 if final_report:
-                    for chunk in _chunk_text(final_report, size=120):
+                    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                    for chunk in _chunk_text(final_report, size=10000):
                         stream_generator.add_chunk_from_str(chunk)
                         await asyncio.sleep(0.05)
                 stream_generator.finish()
@@ -112,7 +114,11 @@ async def create_chat_completion(request: ChatCompletionRequest, app_request: Re
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def _chunk_text(text: str, size: int = 120) -> list[str]:
+def _chunk_text(text: str, size: int = 10000) -> list[str]:
+    """
+    Split text into chunks (same as deep research - 10000 chars per chunk).
+    This preserves markdown structure and ensures smooth streaming.
+    """
     return [text[i : i + size] for i in range(0, len(text), size)]
 
 

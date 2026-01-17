@@ -383,7 +383,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                                    draft_length=len(draft_report_content),
                                    session_status=session_status_from_db)
                         stream_generator.emit_status("Finalizing report...", step="report")
-                        for chunk in _chunk_text(draft_report_content, size=200):
+                        # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                        for chunk in _chunk_text(draft_report_content, size=10000):
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(draft_report_content)
@@ -393,7 +394,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         logger.info("Using generated final_report (draft_report not available)",
                                    final_report_length=len(final_report))
                         stream_generator.emit_status("Finalizing report...", step="report")
-                        for chunk in _chunk_text(final_report, size=200):
+                        # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                        for chunk in _chunk_text(final_report, size=10000):
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(final_report)
@@ -413,7 +415,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                                                draft_length=len(draft_report),
                                                note="Draft report is the structured research result with chapters")
                                     stream_generator.emit_status("Finalizing report...", step="report")
-                                    for chunk in _chunk_text(draft_report, size=200):
+                                    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                                    for chunk in _chunk_text(draft_report, size=10000):
                                         stream_generator.emit_report_chunk(chunk)
                                         await asyncio.sleep(0.02)
                                     stream_generator.emit_final_report(draft_report)
@@ -466,7 +469,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                             
                             if fallback_report:
                                 stream_generator.emit_status("Finalizing report...", step="report")
-                                for chunk in _chunk_text(fallback_report, size=200):
+                                # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                                for chunk in _chunk_text(fallback_report, size=10000):
                                     stream_generator.emit_report_chunk(chunk)
                                     await asyncio.sleep(0.02)
                                 stream_generator.emit_final_report(fallback_report)
@@ -553,11 +557,17 @@ async def _emit_answer(stream_generator: SocketIOStreamingGenerator, answer: str
         return
 
     await stream_generator.emit_status("Finalizing answer...", step="answer")
-    for chunk in _chunk_text(answer, size=180):
+    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+    # This preserves markdown structure and ensures smooth streaming
+    for chunk in _chunk_text(answer, size=10000):
         await stream_generator.emit_report_chunk(chunk)
         await asyncio.sleep(0.02)
     await stream_generator.emit_final_report(answer)
 
 
-def _chunk_text(text: str, size: int = 180) -> list[str]:
+def _chunk_text(text: str, size: int = 10000) -> list[str]:
+    """
+    Split text into chunks (same as deep research - 10000 chars per chunk).
+    This preserves markdown structure and ensures smooth streaming.
+    """
     return [text[i : i + size] for i in range(0, len(text), size)]

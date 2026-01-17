@@ -240,7 +240,11 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                 result = await chat_service.answer_simple(query, stream=stream_generator, messages=chat_history)
                 
                 stream_generator.emit_status("Drafting answer...", step="answer")
-                for chunk in _chunk_text(result.answer, size=180):
+                # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                # This preserves markdown structure and ensures smooth streaming
+                chunk_size = 10000
+                chunks = [result.answer[i:i+chunk_size] for i in range(0, len(result.answer), chunk_size)]
+                for chunk in chunks:
                     stream_generator.emit_report_chunk(chunk)
                     await asyncio.sleep(0.02)
                 stream_generator.emit_final_report(result.answer)
@@ -263,8 +267,11 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     if result.answer:
                         logger.info("Emitting final answer", answer_length=len(result.answer), mode=mode)
                         stream_generator.emit_status("Finalizing answer...", step="answer")
-                        # CRITICAL: Send answer in chunks so user sees progress even if connection is slow
-                        for chunk in _chunk_text(result.answer, size=180):
+                        # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                        # This preserves markdown structure and ensures smooth streaming
+                        chunk_size = 10000
+                        chunks = [result.answer[i:i+chunk_size] for i in range(0, len(result.answer), chunk_size)]
+                        for chunk in chunks:
                             stream_generator.emit_report_chunk(chunk)
                             await asyncio.sleep(0.02)
                         # CRITICAL: emit_final_report will automatically save to DB
@@ -438,7 +445,10 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     # Emit final report chunks and final report event
                     logger.info("Emitting final report", report_length=len(final_report))
                     stream_generator.emit_status("Finalizing report...", step="report")
-                    for chunk in _chunk_text(final_report, size=200):
+                    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                    chunk_size = 10000
+                    chunks = [final_report[i:i+chunk_size] for i in range(0, len(final_report), chunk_size)]
+                    for chunk in chunks:
                         stream_generator.emit_report_chunk(chunk)
                         await asyncio.sleep(0.02)
                     stream_generator.emit_final_report(final_report)
@@ -489,7 +499,10 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                         if fallback_report:
                             logger.info("Emitting fallback report", report_length=len(fallback_report))
                             stream_generator.emit_status("Finalizing report...", step="report")
-                            for chunk in _chunk_text(fallback_report, size=200):
+                            # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                            chunk_size = 10000
+                            chunks = [fallback_report[i:i+chunk_size] for i in range(0, len(fallback_report), chunk_size)]
+                            for chunk in chunks:
                                 stream_generator.emit_report_chunk(chunk)
                                 await asyncio.sleep(0.02)
                             stream_generator.emit_final_report(fallback_report)
@@ -553,7 +566,10 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
                     logger.info("Emitting fallback report after error", report_length=len(fallback_report))
                     stream_generator.emit_error(error=f"Research encountered an error: {str(e)}", details="Partial results available below")
                     stream_generator.emit_status("Sending partial results...", step="error")
-                    for chunk in _chunk_text(fallback_report, size=200):
+                    # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
+                    chunk_size = 10000
+                    chunks = [fallback_report[i:i+chunk_size] for i in range(0, len(fallback_report), chunk_size)]
+                    for chunk in chunks:
                         stream_generator.emit_report_chunk(chunk)
                         await asyncio.sleep(0.02)
                     stream_generator.emit_final_report(fallback_report)
