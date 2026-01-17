@@ -30,12 +30,46 @@ class PlanResearchNode(ResearchNode):
         original_query = state.get("original_query", query)
         query_analysis = state.get("query_analysis", {})
         mode = state.get("mode", "quality")
-        session_id = state.get("session_id", "unknown")
+        session_id = state.get("session_id")
+        if not session_id:
+            logger.warning("session_id not found in state - using 'unknown' for logging", state_keys=list(state.keys())[:10])
+            session_id = "unknown"
         chat_history = state.get("chat_history", [])
 
         # Access dependencies
         llm = self.deps.llm
         stream = self.deps.stream
+
+        # Log LLM configuration for debugging
+        llm_info = {}
+        if hasattr(llm, "_client"):
+            client = llm._client
+            if hasattr(client, "model_name"):
+                llm_info["model"] = client.model_name
+            if hasattr(client, "openai_api_base"):
+                llm_info["base_url"] = client.openai_api_base
+            if hasattr(client, "openai_api_key"):
+                # Only log first 10 chars of API key for security
+                api_key_preview = client.openai_api_key[:10] + "..." if client.openai_api_key else None
+                llm_info["api_key_preview"] = api_key_preview
+        
+        logger.info("Research planning - LLM configuration",
+                   llm_info=llm_info,
+                   session_id=session_id,
+                   note="This helps identify which provider/model is causing 'Blocked by Google' errors")
+        
+        # CRITICAL: Check if LLM has max_retries configured
+        if hasattr(llm, "_client"):
+            client = llm._client
+            if hasattr(client, "max_retries"):
+                logger.info("LLM retry configuration",
+                           max_retries=client.max_retries,
+                           session_id=session_id,
+                           note="Retry is configured on LLM client")
+            else:
+                logger.warning("LLM client missing max_retries",
+                             session_id=session_id,
+                             note="Retry may not be configured - this could cause issues with transient errors")
 
         if stream:
             stream.emit_status("Creating research plan...", step="planning")
@@ -59,6 +93,17 @@ class PlanResearchNode(ResearchNode):
             clarification_answers=clarification_answers,
             mode=mode
         )
+        
+        # CRITICAL: Log prompt length for debugging "Blocked by Google" errors
+        # Large prompts or specific content might trigger provider's content filter
+        prompt_length = len(prompt)
+        logger.info("Planning prompt built",
+                   prompt_length=prompt_length,
+                   query_length=len(original_query),
+                   deep_search_length=len(deep_search_result),
+                   clarification_length=len(clarification_answers),
+                   session_id=session_id,
+                   note="Large prompts (>50k chars) or specific content might trigger provider filters")
 
         try:
             system_prompt = """You are an expert research planner. Create comprehensive research plans with clear topics and priorities.
@@ -86,20 +131,63 @@ CRITICAL: All topics must relate to the original query. Include query context in
             }
 
         except Exception as e:
-            logger.error("Research planning failed", error=str(e), exc_info=True,
-                        session_id=session_id)
-
+            error_str = str(e)
+            error_type = type(e).__name__
+            
+            # Check for specific API errors
+            is_permission_error = "PermissionDeniedError" in error_type or "403" in error_str or "Blocked by Google" in error_str
+            is_rate_limit = "RateLimitError" in error_type or "429" in error_str or "rate limit" in error_str.lower()
+            is_timeout = "TimeoutError" in error_type or "timeout" in error_str.lower()
+            
+            # Log error with context including LLM info
+            logger.error("Research planning failed", 
+                        error=error_str[:500],  # Limit error message length
+                        error_type=error_type,
+                        is_permission_error=is_permission_error,
+                        is_rate_limit=is_rate_limit,
+                        is_timeout=is_timeout,
+                        llm_info=llm_info,
+                        session_id=session_id,
+                        exc_info=True,
+                        note="'Blocked by Google' usually means: 1) Using Google Gemini model via OpenRouter/other provider, 2) Provider's content policy blocking, 3) Region/IP restrictions")
+            
+            # Emit user-friendly error message via stream
+            if stream:
+                if is_permission_error:
+                    stream.emit_status("⚠️ API access denied - using fallback plan", step="planning")
+                elif is_rate_limit:
+                    stream.emit_status("⚠️ API rate limit reached - using fallback plan", step="planning")
+                elif is_timeout:
+                    stream.emit_status("⚠️ API timeout - using fallback plan", step="planning")
+                else:
+                    stream.emit_status("⚠️ Planning error - using fallback plan", step="planning")
+            
             # Fallback: create basic plan
             fallback_topics = self._create_fallback_topics(original_query, query_analysis)
+            
+            # Create fallback reasoning based on error type
+            if is_permission_error:
+                fallback_reasoning = "Fallback plan created due to API access restrictions. Research will continue with basic topics."
+            elif is_rate_limit:
+                fallback_reasoning = "Fallback plan created due to API rate limiting. Research will continue with basic topics."
+            elif is_timeout:
+                fallback_reasoning = "Fallback plan created due to API timeout. Research will continue with basic topics."
+            else:
+                fallback_reasoning = f"Fallback plan created due to error: {error_type}. Research will continue with basic topics."
+
+            logger.info("Using fallback research plan",
+                       topics_count=len(fallback_topics),
+                       session_id=session_id,
+                       note="Research will continue despite planning error")
 
             return {
                 "research_plan": {
-                    "reasoning": f"Fallback plan due to error: {str(e)}",
+                    "reasoning": fallback_reasoning,
                     "topics": fallback_topics,
-                    "stop": False
+                    "stop": False  # CRITICAL: Don't stop research, continue with fallback plan
                 },
                 "topics": fallback_topics,
-                "coordination_notes": "Basic fallback plan"
+                "coordination_notes": "Basic fallback plan - research will continue"
             }
 
     def _extract_clarification_answers(self, chat_history: list) -> str:

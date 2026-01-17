@@ -51,6 +51,70 @@ class GenerateReportNode(ResearchNode):
         draft_report = await self._read_draft_report(agent_memory_service, findings, query)
         main_document = await self._read_main_document(agent_memory_service)
 
+        # CRITICAL: If draft_report is substantial (>= 1000 chars), return it directly WITHOUT generation
+        # Supervisor wrote it throughout research, so it's the final report
+        if draft_report and len(draft_report.strip()) >= 1000:
+            logger.info("Draft report is substantial - returning it directly as final report (no LLM generation)",
+                       draft_length=len(draft_report),
+                       session_id=session_id,
+                       note="Supervisor wrote this throughout research, using it as final report")
+            
+            # CRITICAL: Remove metadata from draft_report before returning
+            # Remove "Research Report Draft", "Query:", "Started:", "Status:", "Overview" headers
+            lines = draft_report.split('\n')
+            cleaned_lines = []
+            skip_metadata = False
+            for i, line in enumerate(lines):
+                # Skip "Research Report Draft" header and metadata
+                if line.strip() == "# Research Report Draft" or line.strip().startswith("# Research Report Draft"):
+                    skip_metadata = True
+                    continue
+                # Skip metadata lines
+                if skip_metadata and (line.strip().startswith("**Query:**") or 
+                                     line.strip().startswith("**Started:**") or 
+                                     line.strip().startswith("**Status:**") or
+                                     line.strip().startswith("**Generated:**") or
+                                     line.strip() == "## Overview" or
+                                     line.strip().startswith("This is the working draft")):
+                    continue
+                # Stop skipping after first chapter or section
+                if skip_metadata and (line.startswith("## Chapter") or line.startswith("## ")):
+                    skip_metadata = False
+                if not skip_metadata:
+                    cleaned_lines.append(line)
+            
+            cleaned_draft = '\n'.join(cleaned_lines).strip()
+            
+            # Format it as a proper report (add title if needed, but only if no chapters)
+            if not cleaned_draft.strip().startswith("#") and not cleaned_draft.strip().startswith("## Chapter"):
+                formatted_report = f"# Research Report: {original_query}\n\n{cleaned_draft}"
+            else:
+                formatted_report = cleaned_draft
+            
+            if stream:
+                stream.emit_status("✅ Final report ready (from draft_report)", step="report")
+
+            # Save report to DB if session_manager available
+            if self.deps.session_manager:
+                try:
+                    await self.deps.session_manager.save_final_report(session_id, formatted_report)
+                    await self.deps.session_manager.complete_session(session_id, formatted_report)
+                    logger.info("Report saved to session in DB", session_id=session_id)
+                except Exception as e:
+                    logger.error("Failed to save report to session", error=str(e))
+
+            return {
+                "final_report": formatted_report,
+                "report_generated": True,
+                "should_continue": False
+            }
+
+        # Draft report is too short or missing - generate report using draft_report + findings summaries
+        logger.info("Draft report too short or missing - generating report with draft_report + findings summaries",
+                   draft_length=len(draft_report) if draft_report else 0,
+                   findings_count=len(findings),
+                   session_id=session_id)
+
         # Determine user language
         # Get user language from state (detected in create_initial_state)
         user_language = state.get("user_language", "English")
@@ -58,14 +122,29 @@ class GenerateReportNode(ResearchNode):
         # Extract clarification context
         clarification_context = self._extract_clarification_context(chat_history)
 
-        # Use draft_report as primary source
-        primary_source = draft_report if draft_report else main_document
-        if not primary_source:
-            primary_source = compressed_research if compressed_research else self._format_findings(findings)
-            logger.warning("No draft report or main document - using compressed/raw findings",
+        # Combine draft_report (if exists) with findings summaries for generation
+        if draft_report and len(draft_report.strip()) > 0:
+            findings_summary = self._format_findings(findings)
+            primary_source = f"{draft_report}\n\n## Additional Research Findings\n\n{findings_summary}"
+            logger.info("Combining draft_report with findings summaries for generation",
+                       draft_length=len(draft_report),
+                       findings_count=len(findings),
+                       session_id=session_id)
+        elif main_document:
+            primary_source = main_document
+            logger.warning("No draft_report, using main.md as source",
                           session_id=session_id)
+        elif compressed_research:
+            primary_source = compressed_research
+            logger.warning("No draft_report or main.md, using compressed_research as source",
+                          session_id=session_id)
+        else:
+            primary_source = self._format_findings(findings)
+            logger.warning("No draft report, main document, or compressed research - using raw findings",
+                          session_id=session_id,
+                          findings_count=len(findings))
 
-        # Prepare content for prompt (handle very large drafts)
+        # Prepare content for prompt (handle very large content)
         draft_report_for_prompt = self._prepare_content_for_prompt(primary_source)
 
         # Build prompt using prompt builder
@@ -99,10 +178,9 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
 
             # Validate report length
             if len(formatted_report) < 1500:
-                logger.warning("Report too short, regenerating with more detail",
+                logger.warning("Generated report too short, using combined source as fallback",
                              length=len(formatted_report),
                              session_id=session_id)
-                # Fallback: use draft report directly
                 formatted_report = self._create_fallback_report(original_query, draft_report_for_prompt, findings)
 
             if stream:
@@ -124,11 +202,16 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
             }
 
         except Exception as e:
-            logger.error("Report generation failed", error=str(e), exc_info=True,
-                        session_id=session_id)
+            logger.error("Report generation failed, using combined source as fallback", error=str(e), exc_info=True,
+                        session_id=session_id,
+                        source_available=bool(draft_report_for_prompt),
+                        source_length=len(draft_report_for_prompt) if draft_report_for_prompt else 0)
 
-            # Fallback: format draft report directly
+            # Fallback: use combined source (draft_report + findings or just findings)
             fallback_report = self._create_fallback_report(original_query, draft_report_for_prompt, findings)
+            logger.info("Using combined source as fallback report",
+                       fallback_length=len(fallback_report),
+                       session_id=session_id)
 
             return {
                 "final_report": fallback_report,
@@ -155,13 +238,24 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
             draft_report = await agent_memory_service.file_manager.read_file("draft_report.md")
             logger.info("Read draft report", length=len(draft_report))
 
-            # Check if draft is too short
-            if len(draft_report) < 1000:
-                logger.warning("Draft report too short, creating from findings",
-                             draft_length=len(draft_report))
+            # CRITICAL: If draft_report exists and is substantial (>= 1000 chars), use it as primary source
+            # If it's too short (< 1000 chars), it means supervisor didn't write much, so we need fallback
+            if draft_report and len(draft_report.strip()) >= 1000:
+                logger.info("Using draft_report.md as primary source (written by supervisor, substantial length)",
+                           draft_length=len(draft_report),
+                           note="This is the main report source written by supervisor throughout research")
+                return draft_report
+            elif draft_report and len(draft_report.strip()) > 0:
+                # Draft exists but is too short - supervisor didn't write much
+                # Return it anyway, but it will be used WITH findings for generation (fallback)
+                logger.warning("Draft report exists but is too short - will use with findings for generation",
+                             draft_length=len(draft_report),
+                             note="Draft will be combined with findings summaries for report generation")
+                return draft_report
+            else:
+                logger.warning("Draft report is empty, creating from findings as fallback",
+                             draft_length=len(draft_report) if draft_report else 0)
                 return self._create_draft_from_findings(findings, query)
-
-            return draft_report
 
         except FileNotFoundError:
             logger.warning("Draft report not found, creating from findings")
@@ -375,15 +469,28 @@ Research completed with {len(findings)} findings from multiple agents covering v
 
     def _create_fallback_report(self, query: str, draft: str, findings: list) -> str:
         """Create fallback report when generation fails.
+        
+        CRITICAL: This function should use draft_report (written by supervisor) as the main content.
+        Findings are only used for metadata (count), not as content source.
 
         Args:
             query: Original query
-            draft: Draft report content
-            findings: Agent findings
+            draft: Draft report content (should be draft_report.md written by supervisor)
+            findings: Agent findings (used only for metadata, not content)
 
         Returns:
             Fallback report
         """
+        # CRITICAL: If draft is the actual draft_report.md (has chapters), use it directly
+        # Don't wrap it in extra structure - supervisor already structured it
+        if "## Chapter" in draft or "# Chapter" in draft:
+            # This is the structured draft_report from supervisor - use it as-is
+            logger.info("Using structured draft_report as fallback (has chapters)",
+                       draft_length=len(draft),
+                       note="Supervisor wrote this, using it directly without modification")
+            return f"# Research Report: {query}\n\n{draft}\n\n---\n\n*Note: This report was generated from the draft report written by the supervisor throughout the research process.*"
+        
+        # Otherwise, format it as a report
         return f"""# Research Report: {query}
 
 ## Executive Summary
@@ -398,7 +505,7 @@ This report presents the research findings for: {query}
 
 ---
 
-*Note: This is a comprehensive report generated from research findings.*
+*Note: This is a comprehensive report generated from the draft report written by the supervisor throughout the research process.*
 """
 
 

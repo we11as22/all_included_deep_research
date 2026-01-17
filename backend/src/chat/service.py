@@ -139,9 +139,24 @@ class ChatSearchService:
         current_date = get_current_date()
         
         system_prompt = (
-            f"You are a helpful AI assistant. Provide clear, accurate, and helpful responses. "
-            f"Return JSON with fields reasoning, answer, key_points. "
-            f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs."
+            f"You are a helpful AI assistant. Provide comprehensive, detailed, and accurate responses in markdown format. "
+            f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs.\n\n"
+            f"CRITICAL MARKDOWN FORMATTING REQUIREMENT:\n"
+            f"- Your answer field MUST be valid markdown with proper formatting\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold** for emphasis, *italic* for subtle emphasis\n"
+            f"- Use proper markdown lists (- for unordered, 1. for ordered)\n"
+            f"- Use proper markdown links: [text](url)\n"
+            f"- Structure with clear markdown sections - do NOT use plain text!\n"
+            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n\n"
+            f"IMPORTANT:\n"
+            f"- Provide comprehensive, detailed answers (800-1500 words minimum - be thorough!)\n"
+            f"- Be thorough and complete - don't write brief summaries!\n"
+            f"- Use proper markdown formatting throughout your response\n"
+            f"- CRITICAL: Your answer field MUST be in markdown format with proper headings (##), lists, and formatting!\n"
+            f"- Do NOT return plain text - always use markdown syntax!\n"
+            f"- Return JSON with fields reasoning, answer (MUST be valid markdown!), key_points"
         )
         
         # Format chat history to show actual messages from the chat
@@ -165,7 +180,14 @@ class ChatSearchService:
             f"User question: {query}\n"
             f"Current date: {current_date}\n\n"
             f"{history_block}\n\n"
-            "Please provide a helpful and accurate response based on the conversation context above."
+            f"CRITICAL: Write your ENTIRE answer in markdown format with proper formatting:\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold**, *italic*, lists, headings - proper markdown syntax!\n"
+            f"- Do NOT use plain text with large letters - use markdown headings!\n"
+            f"- Be comprehensive and detailed (600-1200 words minimum)\n"
+            f"- Provide a helpful, accurate, and complete response based on the conversation context above.\n"
+            f"- Use proper markdown formatting throughout your response."
         )
         
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
@@ -773,39 +795,99 @@ class ChatSearchService:
 
         current_date = get_current_date()
         
+        # CRITICAL: Detect user language from query
+        def _detect_user_language(text: str) -> str:
+            """Detect user language from query text."""
+            if not text:
+                return "English"
+            try:
+                from langdetect import detect
+                detected = detect(text)
+                if detected == "ru":
+                    return "Russian"
+                elif detected == "en":
+                    return "English"
+                elif detected == "es":
+                    return "Spanish"
+                elif detected == "fr":
+                    return "French"
+                elif detected == "de":
+                    return "German"
+                elif detected == "zh-cn" or detected == "zh-tw":
+                    return "Chinese"
+                # Check for Cyrillic (Russian, Ukrainian, etc.)
+                if any('\u0400' <= char <= '\u04FF' for char in text):
+                    return "Russian"
+                return "English"
+            except Exception:
+                # Fallback: check for Cyrillic
+                if any('\u0400' <= char <= '\u04FF' for char in text):
+                    return "Russian"
+                return "English"
+        
+        user_language = _detect_user_language(query)
+        logger.info("Detected user language for synthesis", language=user_language, query_preview=query[:50])
+        
         # Mode-specific length guidelines (matching writer prompts)
+        # CRITICAL: Increased minimums to ensure comprehensive answers
         length_guide = {
-            "simple": "300-500 words",
-            "web": "400-600 words",  # Web Search (speed)
-            "speed": "400-600 words",
-            "deep": "800-1200 words",  # Deep Search (balanced)
-            "balanced": "800-1200 words",
-            "quality": "1500-3000 words",
-            "research": "1500-3000 words"
-        }.get(mode, "500-800 words")
+            "simple": "500-800 words",
+            "web": "600-1000 words",  # Web Search (speed) - increased from 400-600
+            "speed": "600-1000 words",  # Increased from 400-600
+            "deep": "1200-2000 words",  # Deep Search (balanced) - increased from 800-1200
+            "balanced": "1200-2000 words",  # Increased from 800-1200
+            "quality": "2000-4000 words",  # Increased from 1500-3000
+            "research": "2000-4000 words"  # Increased from 1500-3000
+        }.get(mode, "800-1200 words")
         
         system_prompt = (
             f"You are an expert research assistant synthesizing information from multiple sources. "
             f"Current date: {current_date}\n\n"
+            f"CRITICAL LANGUAGE REQUIREMENT:\n"
+            f"- Write your ENTIRE answer in {user_language} (the same language as the user's query)\n"
+            f"- All text, headings, citations, and sources section must be in {user_language}\n"
+            f"- Detect the language from the user's query and match it exactly\n"
+            f"- Do NOT mix languages - use ONLY {user_language} throughout the entire answer\n\n"
+            f"CRITICAL MARKDOWN FORMATTING REQUIREMENT:\n"
+            f"- Your answer field MUST be valid markdown with proper formatting\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold** for emphasis, *italic* for subtle emphasis\n"
+            f"- Use proper markdown lists (- for unordered, 1. for ordered)\n"
+            f"- Use proper markdown links: [text](url)\n"
+            f"- Structure with clear markdown sections - do NOT use plain text!\n"
+            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n\n"
             f"CRITICAL INSTRUCTIONS:\n"
             f"1. Use ALL provided sources - each one has valuable information\n"
             f"2. Synthesize into a comprehensive, well-structured answer ({length_guide})\n"
             f"3. CITE EVERY FACT with inline references [1], [2], etc.\n"
             f"4. Include specific details, data, and examples from sources\n"
             f"5. If sources provide different perspectives, present them all\n"
-            f"6. Structure with clear sections using markdown (##, ###)\n"
-            f"7. Be thorough - don't leave out important information\n\n"
-            f"Return JSON with: reasoning (why sources support answer), answer (full markdown with citations), key_points (list)"
+            f"6. Structure with clear sections using markdown (##, ###) - NOT plain text!\n"
+            f"7. Be thorough and comprehensive - don't leave out important information\n"
+            f"8. Use proper markdown formatting: **bold**, *italic*, lists, headings\n"
+            f"9. Preserve all markdown formatting in your response\n"
+            f"10. Be detailed and complete - don't write brief summaries!\n\n"
+            f"Return JSON with: reasoning (why sources support answer), answer (MUST be valid markdown with proper formatting!), key_points (list)"
         )
         user_prompt = (
             f"User question: {query}\n"
             f"Search query: {search_query}\n"
             f"Mode: {mode}\n"
             f"Current date: {current_date}\n\n"
+            f"CRITICAL: Write your ENTIRE answer in {user_language} (the same language as the query above).\n"
+            f"All text, headings, citations, and sources section must be in {user_language}.\n\n"
+            f"CRITICAL MARKDOWN FORMATTING:\n"
+            f"- Your answer MUST be valid markdown with proper formatting\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold**, *italic*, lists, headings - proper markdown syntax!\n"
+            f"- Do NOT use plain text with large letters - use markdown headings!\n\n"
             f"{history_block}\n\n"
             f"{memory_block}\n\n"
             f"Sources ({len(sources)} sources provided - USE THEM ALL):\n{sources_block}\n\n"
-            f"Write a comprehensive answer using ALL sources above. Each source adds value - synthesize them together."
+            f"Write a comprehensive, detailed answer using ALL sources above. Each source adds value - synthesize them together.\n"
+            f"Be thorough and complete - don't write brief summaries! Use proper markdown formatting throughout."
         )
 
         structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")

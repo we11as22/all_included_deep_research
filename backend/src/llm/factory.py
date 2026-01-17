@@ -38,11 +38,15 @@ def create_chat_model(
         if not settings.openai_api_key or not settings.openai_api_key.strip():
             raise ValueError("OpenAI API key not configured. Please set OPENAI_API_KEY in backend/.env file")
 
+        # CRITICAL: Get max_retries from settings (default 3 if not set)
+        max_retries = getattr(settings, "max_retries", 3)
+        
         llm_kwargs = {
             "model": model_name,
             "api_key": settings.openai_api_key,
             "max_tokens": max_tokens,
             "temperature": temperature,
+            "max_retries": max_retries,  # CRITICAL: Enable retry on client level
         }
 
         # Support for any OpenAI-compatible API (OpenRouter, 302.AI, etc.)

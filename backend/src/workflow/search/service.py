@@ -110,12 +110,36 @@ class SearchService:
             stream.emit_status("Generating answer...", step="chat")
 
         from langchain_core.messages import SystemMessage, HumanMessage
+        from src.workflow.search.classifier import get_current_date
+
+        # CRITICAL: Include current date and time for context
+        current_date = get_current_date()
+        from datetime import datetime
+        current_time = datetime.now().strftime("%H:%M:%S")
 
         # Simple Q&A without sources
-        system_prompt = """You are a helpful AI assistant. Answer questions concisely and accurately.
+        system_prompt = f"""You are a helpful AI assistant. Answer questions comprehensively and accurately in markdown format.
 
-IMPORTANT: Only answer from your training data. Do NOT make up information.
-If you don't know something or it requires recent information, say so clearly."""
+Current date: {current_date}
+Current time: {current_time}
+
+CRITICAL MARKDOWN FORMATTING REQUIREMENT:
+- Your answer MUST be valid markdown with proper formatting
+- Use ## for main sections (NOT # - start with ##)
+- Use ### for subsections
+- Use **bold** for emphasis, *italic* for subtle emphasis
+- Use proper markdown lists (- for unordered, 1. for ordered)
+- Structure with clear markdown sections - do NOT use plain text!
+- CRITICAL: Format your answer as markdown, not plain text with large letters!
+
+IMPORTANT:
+- Provide comprehensive, detailed answers (600-1200 words minimum - NOT 300-800!)
+- Only answer from your training data. Do NOT make up information.
+- If you don't know something or it requires recent information, say so clearly.
+- Be thorough and complete - don't write brief summaries!
+- Use proper markdown formatting throughout your response.
+- CRITICAL: Your answer MUST be in markdown format with proper headings (##), lists, and formatting!
+- Do NOT return plain text - always use markdown syntax!"""
 
         # Format chat history
         messages = [SystemMessage(content=system_prompt)]

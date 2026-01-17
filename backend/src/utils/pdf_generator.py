@@ -204,9 +204,11 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     report_with_links = _make_citations_clickable(report, sources)
     
     # Convert markdown to HTML
+    # CRITICAL: Use 'extra' extension which includes link processing
+    # This ensures all markdown links [text](url) are converted to <a> tags
     html = markdown.markdown(
         report_with_links,
-        extensions=['extra', 'nl2br', 'sane_lists'],
+        extensions=['extra', 'nl2br', 'sane_lists', 'tables', 'fenced_code'],
     )
     
     # Parse HTML and extract text with links
@@ -322,11 +324,11 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
             if isinstance(text, bytes):
                 text = text.decode('utf-8', errors='replace')
             if text:
-                # Check for links in text
+                # Check for links in text - if parent is <a>, create clickable link
                 if element.parent and element.parent.name == 'a':
                     href = element.parent.get('href', '')
                     link_text = text
-                    # Format as clickable link
+                    # Format as clickable link using ReportLab's link format
                     story.append(
                         Paragraph(
                             f'<link href="{href}" color="blue"><u>{link_text}</u></link>',
@@ -334,7 +336,8 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                         )
                     )
                 else:
-                    # Regular text
+                    # Regular text - but check if it contains any links that weren't processed
+                    # This shouldn't happen if markdown conversion worked correctly
                     story.append(Paragraph(text, body_style))
             return
         
@@ -365,49 +368,73 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                 story.append(Paragraph(f'<b>{text}</b>', body_style))
                 story.append(Spacer(1, 0.06 * inch))
         elif tag == 'p':
+            # Process paragraph with all its children, preserving links
+            para_html = str(element)
+            # Ensure UTF-8 for HTML
+            if isinstance(para_html, bytes):
+                para_html = para_html.decode('utf-8', errors='replace')
+            
+            # CRITICAL: Replace ALL <a> tags with ReportLab clickable link format
+            # Handle both simple links and links with attributes
+            # Pattern 1: <a href="url">text</a>
+            para_html = re.sub(
+                r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
+                r'<link href="\1" color="blue"><u>\2</u></link>',
+                para_html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            # Pattern 2: <a href="url" color="blue">[1]</a> (citations)
+            para_html = re.sub(
+                r'<a\s+href="([^"]+)"[^>]*color="blue"[^>]*>\[(\d+)\]</a>',
+                r'<link href="\1" color="blue"><u>[\2]</u></link>',
+                para_html,
+                flags=re.IGNORECASE
+            )
+            # Pattern 3: Nested links or complex content
+            para_html = re.sub(
+                r'<a\s+href="([^"]+)"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>',
+                lambda m: f'<link href="{m.group(1)}" color="blue"><u>{re.sub(r"<[^>]+>", "", m.group(2))}</u></link>',
+                para_html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            
+            # Remove HTML tags except ReportLab tags (<link>, <u>, <b>, <i>, etc.)
+            # But keep the link tags we just created
+            # ReportLab supports: <link>, <u>, <b>, <i>, <font>, etc.
+            
             text = element.get_text().strip()
-            # Ensure UTF-8 encoding
-            if isinstance(text, bytes):
-                text = text.decode('utf-8', errors='replace')
-            if text:
-                # Check for links in paragraph
-                para_html = str(element)
-                # Ensure UTF-8 for HTML
-                if isinstance(para_html, bytes):
-                    para_html = para_html.decode('utf-8', errors='replace')
-                # Replace <a> tags with reportlab link format
-                para_html = re.sub(
-                    r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
-                    r'<link href="\1" color="blue"><u>\2</u></link>',
-                    para_html,
-                )
-                # Also handle citations [1] that are now links
-                para_html = re.sub(
-                    r'<a\s+href="([^"]+)"[^>]*color="blue">\[(\d+)\]</a>',
-                    r'<link href="\1" color="blue"><u>[\2]</u></link>',
-                    para_html,
-                )
+            if text or para_html.strip():
                 story.append(Paragraph(para_html, body_style))
                 story.append(Spacer(1, 0.06 * inch))
         elif tag == 'ul' or tag == 'ol':
             for li in element.find_all('li', recursive=False):
+                # Process list item with all its children, preserving links
+                li_html = str(li)
+                # Ensure UTF-8 for HTML
+                if isinstance(li_html, bytes):
+                    li_html = li_html.decode('utf-8', errors='replace')
+                
+                # CRITICAL: Replace ALL <a> tags with ReportLab clickable link format
+                # Handle both simple links and links with attributes
+                li_html = re.sub(
+                    r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
+                    r'<link href="\1" color="blue"><u>\2</u></link>',
+                    li_html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                # Handle nested links
+                li_html = re.sub(
+                    r'<a\s+href="([^"]+)"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>',
+                    lambda m: f'<link href="{m.group(1)}" color="blue"><u>{re.sub(r"<[^>]+>", "", m.group(2))}</u></link>',
+                    li_html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                
+                # Remove <li> tags, keep content
+                li_html = re.sub(r'</?li[^>]*>', '', li_html)
+                
                 text = li.get_text().strip()
-                # Ensure UTF-8 encoding
-                if isinstance(text, bytes):
-                    text = text.decode('utf-8', errors='replace')
-                if text:
-                    # Check for links in list item
-                    li_html = str(li)
-                    # Ensure UTF-8 for HTML
-                    if isinstance(li_html, bytes):
-                        li_html = li_html.decode('utf-8', errors='replace')
-                    li_html = re.sub(
-                        r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
-                        r'<link href="\1" color="blue"><u>\2</u></link>',
-                        li_html,
-                    )
-                    # Remove <li> tags, keep content
-                    li_html = re.sub(r'</?li[^>]*>', '', li_html)
+                if text or li_html.strip():
                     story.append(Paragraph(f'• {li_html}', body_style))
                     story.append(Spacer(1, 0.04 * inch))
             story.append(Spacer(1, 0.1 * inch))
@@ -415,16 +442,19 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
             # Handled in ul/ol
             pass
         elif tag == 'a':
-            # Links handled in parent elements
+            # CRITICAL: Handle standalone links (not inside paragraphs/lists)
+            # This ensures all links are clickable, even if they're standalone elements
             href = element.get('href', '')
             text = element.get_text().strip()
             if text and href:
+                # Format as clickable link using ReportLab's link format
                 story.append(
                     Paragraph(
                         f'<link href="{href}" color="blue"><u>{text}</u></link>',
                         link_style,
                     )
                 )
+                story.append(Spacer(1, 0.04 * inch))
         elif tag == 'strong' or tag == 'b':
             text = element.get_text().strip()
             if text:
@@ -450,16 +480,39 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
             process_element(element)
     
     # Add sources section at the end if available
-    if sources:
+    # Also check if there's a "## Sources" section in the HTML that we should preserve
+    sources_section = soup.find('h2', string=re.compile(r'Sources', re.IGNORECASE))
+    if sources_section:
+        # Process the Sources section from HTML (preserves markdown links)
         story.append(PageBreak())
         story.append(Paragraph("Sources", heading1_style))
         story.append(Spacer(1, 0.2 * inch))
         
-        # Create table for sources
+        # Find the content after the Sources heading
+        next_sibling = sources_section.find_next_sibling()
+        while next_sibling:
+            if next_sibling.name and next_sibling.name.startswith('h'):
+                break  # Stop at next heading
+            process_element(next_sibling)
+            next_sibling = next_sibling.find_next_sibling()
+    
+    # Also add extracted sources as a table if we have them
+    if sources:
+        if not sources_section:  # Only add table if Sources section wasn't in HTML
+            story.append(PageBreak())
+            story.append(Paragraph("Sources", heading1_style))
+            story.append(Spacer(1, 0.2 * inch))
+        
+        # Create table for sources with clickable links
         source_data = [['#', 'Title', 'URL']]
         for num in sorted(sources.keys()):
             title, url = sources[num]
-            source_data.append([str(num), title[:50], url[:60]])
+            # Make URL clickable in the table
+            source_data.append([
+                str(num), 
+                title[:50], 
+                f'<link href="{url}" color="blue"><u>{url[:60]}</u></link>'
+            ])
         
         source_table = Table(source_data, colWidths=[0.5 * inch, 3 * inch, 3.5 * inch])
         source_table.setStyle(

@@ -426,13 +426,36 @@ class ResearchStreamingGenerator(StreamingGenerator):
                     )
                     existing_message = existing_result.scalar_one_or_none()
                     
+                    # CRITICAL: Generate embedding for search functionality
+                    # This ensures ALL final messages (from all modes) are searchable
+                    embedding = None
+                    if final_content.strip():
+                        try:
+                            embedding_provider = self.app_state.get("embedding_provider")
+                            if embedding_provider:
+                                embedding_vector = await embedding_provider.embed_text(final_content)
+                                from src.database.schema import EMBEDDING_DIMENSION
+                                db_dimension = EMBEDDING_DIMENSION
+                                if len(embedding_vector) < db_dimension:
+                                    embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                                elif len(embedding_vector) > db_dimension:
+                                    embedding_vector = embedding_vector[:db_dimension]
+                                embedding = embedding_vector
+                                logger.debug("Generated embedding for final message", message_id=message_id, embedding_dim=len(embedding_vector))
+                            else:
+                                logger.warning("No embedding_provider available - final message will not be searchable", message_id=message_id)
+                        except Exception as e:
+                            logger.warning("Failed to generate embedding for final message", error=str(e), message_id=message_id, exc_info=True)
+                    
                     if existing_message:
                         # Update existing message
                         existing_message.content = final_content
                         existing_message.role = "assistant"
+                        if embedding is not None:
+                            existing_message.embedding = embedding
                         chat.updated_at = datetime.now()
                         await session.commit()
-                        logger.info("Final message updated in DB", message_id=message_id, content_length=len(final_content))
+                        logger.info("Final message updated in DB", message_id=message_id, content_length=len(final_content), has_embedding=embedding is not None)
                         return
                     else:
                         # Create new message
@@ -441,11 +464,12 @@ class ResearchStreamingGenerator(StreamingGenerator):
                             message_id=message_id,
                             role="assistant",
                             content=final_content,
+                            embedding=embedding,
                         )
                         session.add(message)
                         chat.updated_at = datetime.now()
                         await session.commit()
-                        logger.info("Final message saved to DB", message_id=message_id, content_length=len(final_content))
+                        logger.info("Final message saved to DB", message_id=message_id, content_length=len(final_content), has_embedding=embedding is not None)
                         return
                         
             except Exception as e:

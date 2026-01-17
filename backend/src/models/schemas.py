@@ -92,8 +92,8 @@ class SynthesizedAnswer(BaseModel):
 
     answer: str = Field(
         ...,
-        description="Synthesized answer to the query",
-        min_length=100
+        description="Synthesized answer to the query in markdown format. MUST use proper markdown: ## for main sections (NOT #), ### for subsections, **bold**, *italic*, lists, links. Do NOT use plain text with large letters - use markdown headings! CRITICAL: Answer must be comprehensive (600-1500 words minimum) and fully formatted in markdown!",
+        min_length=400  # Increased from 200 to ensure more comprehensive answers
     )
 
     # key_points has default but must be in required array for Azure/OpenRouter

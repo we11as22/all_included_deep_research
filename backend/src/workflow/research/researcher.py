@@ -190,12 +190,15 @@ async def _run_researcher_agent_impl(
     if stream:
         stream.emit_research_start({"researcher_id": agent_id, "topic": current_task.title})
         # Convert todos to dict format for emission
+        # CRITICAL: Include all fields to match supervisor's format for consistency
         todos_dict = [
             {
                 "title": t.title,
                 "status": t.status,
-                "note": t.note,
-                "url": t.url
+                "objective": t.objective if hasattr(t, "objective") else "",
+                "expected_output": t.expected_output if hasattr(t, "expected_output") else "",
+                "note": t.note if hasattr(t, "note") else "",
+                "url": t.url if hasattr(t, "url") else None
             }
             for t in todos
         ]
@@ -355,13 +358,44 @@ Available actions:
 - scrape_url(urls: list[str]): Get full content from URLs
 - done(): Signal completion
 
+**CRITICAL: Information Verification and Source Quality:**
+- **MANDATORY: Always verify information when in doubt** - If you have ANY doubt about the accuracy, reliability, or credibility of information, you MUST cross-check it with multiple independent sources
+- **MANDATORY: Do NOT trust questionable or biased sources** - Be critical of sources that:
+  * Show clear bias, agenda, or conflict of interest
+  * Lack proper citations or references
+  * Come from unverified or unknown publishers
+  * Contain sensationalist, exaggerated, or unsubstantiated claims
+  * Are from sources with known political, commercial, or ideological agendas
+- **MANDATORY: Prefer authoritative sources** - Prioritize:
+  * Academic publications, peer-reviewed research
+  * Official government or institutional sources
+  * Established news organizations with editorial standards
+  * Expert-authored content from recognized authorities
+  * Primary sources over secondary interpretations
+- **MANDATORY: Cross-verify critical claims** - For important facts, statistics, or claims:
+  * Find the same information in at least 2-3 independent sources
+  * Check if sources cite their data or provide references
+  * Look for conflicting information and investigate discrepancies
+  * If sources contradict each other, note this in your findings
+- **MANDATORY: Question suspicious information** - If information seems:
+  * Too good to be true
+  * Contradicts established knowledge without explanation
+  * Comes from a single source without verification
+  * Has obvious bias or agenda
+  * Then you MUST search for additional sources to verify or refute it
+- **MANDATORY: Report source quality** - In your findings, note:
+  * The reliability and authority of sources used
+  * Any concerns about bias or credibility
+  * Whether information was verified across multiple sources
+  * Any discrepancies or contradictions found
+
 **CRITICAL: Evaluating search results before scraping:**
-- When you receive search results, CAREFULLY evaluate each result's RELEVANCE to your current task
-- Look at the TITLE and SNIPPET - do they relate to your task objective?
-- Only scrape URLs that are CLEARLY relevant to your task
-- If a result's title/snippet doesn't match your task, SKIP it - don't waste time scraping irrelevant content
-- Example: If your task is "ВВС Германии техника", skip results about "ВВС США" or "техника вообще"
-- Focus on scraping sources that directly help answer your specific task
+- When you receive search results, CAREFULLY evaluate each result's RELEVANCE AND CREDIBILITY
+- Look at the TITLE, SNIPPET, and SOURCE DOMAIN - do they relate to your task AND appear credible?
+- Only scrape URLs that are CLEARLY relevant to your task AND from trustworthy sources
+- If a result's title/snippet doesn't match your task OR comes from a questionable source, SKIP it
+- Example: If your task is "ВВС Германии техника", skip results about "ВВС США" or "техника вообще" or from unreliable sources
+- Focus on scraping sources that directly help answer your specific task AND are from authoritative, credible sources
 
 **CRITICAL: Query reformulation strategy (to avoid getting stuck):**
 - If your search results are NOT relevant to your task, you MUST try DIFFERENT search queries
@@ -1013,12 +1047,15 @@ Create an updated research plan incorporating this new direction. Keep it concis
 
     # Emit updated todos with correct status
     if stream:
+        # CRITICAL: Include all fields to match supervisor's format for consistency
         todos_dict = [
             {
                 "title": t.title,
                 "status": t.status,  # Should be "done" for completed task
-                "note": t.note,
-                "url": t.url
+                "objective": t.objective if hasattr(t, "objective") else "",
+                "expected_output": t.expected_output if hasattr(t, "expected_output") else "",
+                "note": t.note if hasattr(t, "note") else "",
+                "url": t.url if hasattr(t, "url") else None
             }
             for t in todos
         ]

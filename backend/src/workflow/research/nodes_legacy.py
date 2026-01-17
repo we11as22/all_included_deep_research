@@ -112,13 +112,44 @@ async def _save_message_to_db_async(
                 )
                 existing_message = existing_result.scalar_one_or_none()
                 
+                # CRITICAL: Generate embedding for search functionality
+                # This ensures ALL messages (from all modes: chat, web_search, deep_search, deep_research) are searchable
+                embedding = None
+                if content.strip():
+                    try:
+                        embedding_provider = app_state.get("embedding_provider")
+                        # Fallback: try to get from stream if not in app_state
+                        if not embedding_provider and hasattr(stream, "app_state"):
+                            stream_app_state = stream.app_state
+                            if isinstance(stream_app_state, dict):
+                                embedding_provider = stream_app_state.get("embedding_provider")
+                            else:
+                                embedding_provider = getattr(stream_app_state, "embedding_provider", None)
+                        
+                        if embedding_provider:
+                            embedding_vector = await embedding_provider.embed_text(content)
+                            from src.database.schema import EMBEDDING_DIMENSION
+                            db_dimension = EMBEDDING_DIMENSION
+                            if len(embedding_vector) < db_dimension:
+                                embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                            elif len(embedding_vector) > db_dimension:
+                                embedding_vector = embedding_vector[:db_dimension]
+                            embedding = embedding_vector
+                            logger.debug("Generated embedding for message", message_id=message_id, embedding_dim=len(embedding_vector))
+                        else:
+                            logger.warning("No embedding_provider available - message will not be searchable", message_id=message_id)
+                    except Exception as e:
+                        logger.warning("Failed to generate embedding for message", error=str(e), message_id=message_id, exc_info=True)
+                
                 if existing_message:
                     # Update existing message
                     existing_message.content = content
                     existing_message.role = role
+                    if embedding is not None:
+                        existing_message.embedding = embedding
                     chat.updated_at = datetime.now()
                     await session.commit()
-                    logger.info("Message updated in DB", message_id=message_id, role=role, content_length=len(content))
+                    logger.info("Message updated in DB", message_id=message_id, role=role, content_length=len(content), has_embedding=embedding is not None)
                     return True
                 else:
                     # Create new message
@@ -127,11 +158,12 @@ async def _save_message_to_db_async(
                         message_id=message_id,
                         role=role,
                         content=content,
+                        embedding=embedding,
                     )
                     session.add(message)
                     chat.updated_at = datetime.now()
                     await session.commit()
-                    logger.info("Message saved to DB", message_id=message_id, role=role, content_length=len(content))
+                    logger.info("Message saved to DB", message_id=message_id, role=role, content_length=len(content), has_embedding=embedding is not None)
                     return True
                     
         except Exception as e:
@@ -202,21 +234,41 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
                 logger.info("Found deep search result in chat history", message_index=i)
                 break
     
-    # Step 2: Find clarification questions (should come AFTER deep search)
+    # Step 2: Find clarification questions (should come AFTER deep search OR in the same message)
     if deep_search_done:
-        for i in range(deep_search_index + 1, len(chat_history)):
-            msg = chat_history[i]
+        # CRITICAL: Check the same message first (in case deep search and clarification are combined)
+        if deep_search_index >= 0:
+            msg = chat_history[deep_search_index]
             if msg.get("role") == "assistant":
                 content = msg.get("content", "").lower()
+                # Check if clarification is also in the same message (combined message)
                 if "clarification" in content or "🔍" in content or "clarify" in content:
                     found_clarification = True
-                    clarification_index = i
-                    logger.info("Found clarification questions in chat history", message_index=i, after_deep_search=True)
+                    clarification_index = deep_search_index
+                    logger.info("Found clarification questions in same message as deep search (combined message)", 
+                               message_index=deep_search_index, 
+                               note="Deep search and clarification are in one message")
                     # Step 3: Check if user answered (next message should be from user)
-                    if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                    if deep_search_index + 1 < len(chat_history) and chat_history[deep_search_index + 1].get("role") == "user":
                         has_user_answer = True
-                        logger.info("User answered clarification questions", answer_preview=chat_history[i + 1].get("content", "")[:100])
-                        break
+                        logger.info("User answered clarification questions", 
+                                   answer_preview=chat_history[deep_search_index + 1].get("content", "")[:100])
+        
+        # Also check messages AFTER deep search (in case they were sent separately)
+        if not found_clarification:
+            for i in range(deep_search_index + 1, len(chat_history)):
+                msg = chat_history[i]
+                if msg.get("role") == "assistant":
+                    content = msg.get("content", "").lower()
+                    if "clarification" in content or "🔍" in content or "clarify" in content:
+                        found_clarification = True
+                        clarification_index = i
+                        logger.info("Found clarification questions in chat history", message_index=i, after_deep_search=True)
+                        # Step 3: Check if user answered (next message should be from user)
+                        if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
+                            has_user_answer = True
+                            logger.info("User answered clarification questions", answer_preview=chat_history[i + 1].get("content", "")[:100])
+                            break
     
     # If deep search was done AND clarification was asked AND user answered, skip deep search
     if deep_search_done and found_clarification and has_user_answer:
@@ -347,13 +399,50 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
                 chunks = [full_message[i:i+chunk_size] for i in range(0, len(full_message), chunk_size)]
                 logger.info("Sending deep search result in chunks", total_length=len(full_message), chunks_count=len(chunks))
                 
+                # CRITICAL: Ensure last chunk ends with proper separation (2 empty lines = 4 newlines)
+                # If last chunk doesn't end with \n\n\n\n, add it to ensure proper separation with clarification
+                # This is ONLY for deep research mode - other modes don't need this
+                if chunks:
+                    last_chunk = chunks[-1]
+                    # Check if last chunk ends with exactly 4 newlines (2 empty lines)
+                    trailing_newlines = len(last_chunk) - len(last_chunk.rstrip('\n'))
+                    if trailing_newlines < 4:
+                        # Add enough newlines to make it 4 total (2 empty lines)
+                        chunks[-1] = last_chunk.rstrip('\n') + '\n' * 4
+                        logger.info("Added trailing newlines to last deep search chunk for proper separation",
+                                   added_newlines=4-trailing_newlines,
+                                   note="Deep research mode only - ensures 2 empty lines before clarification")
+                    elif trailing_newlines > 4:
+                        # Too many newlines - normalize to exactly 4
+                        chunks[-1] = last_chunk.rstrip('\n') + '\n' * 4
+                        logger.info("Normalized trailing newlines in last deep search chunk",
+                                   original_newlines=trailing_newlines,
+                                   note="Normalized to exactly 4 newlines (2 empty lines)")
+                
                 for i, chunk in enumerate(chunks):
                     stream.emit_report_chunk(chunk)
                     # Small delay between chunks to ensure smooth streaming
                     if i < len(chunks) - 1:  # Don't sleep after last chunk
                         await asyncio.sleep(0.03)  # Small delay between chunks
                 
-                logger.info("Deep search FULL result emitted to stream", result_length=len(result), chunks_sent=len(chunks))
+                # CRITICAL: Add extra delay after last deep search chunk to ensure frontend processes it
+                # before clarification chunk arrives - this helps with proper markdown rendering
+                await asyncio.sleep(0.5)
+                
+                # CRITICAL: Verify last chunk ends with proper separation
+                if chunks:
+                    last_chunk = chunks[-1]
+                    trailing_newlines_count = len(last_chunk) - len(last_chunk.rstrip('\n'))
+                    last_chars = last_chunk[-30:] if len(last_chunk) >= 30 else last_chunk
+                    logger.info("Deep search FULL result emitted to stream", 
+                               result_length=len(result), 
+                               chunks_sent=len(chunks),
+                               last_chunk_length=len(last_chunk),
+                               trailing_newlines=trailing_newlines_count,
+                               last_chars_preview=repr(last_chars),
+                               note="Last chunk should end with \\n\\n\\n\\n (4 newlines) for proper separation")
+                else:
+                    logger.warning("No chunks to send for deep search!", result_length=len(result))
                 
                 # CRITICAL: Do NOT save deep search separately - it will be saved together with clarification questions
                 # This ensures deep search and questions are in the same message and won't be lost on page reload
@@ -361,8 +450,14 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
                            result_length=len(result),
                            note="Deep search will be combined with clarification in one message")
                 
-                # Small delay to ensure all chunks are sent before continuing
-                await asyncio.sleep(0.15)
+                # CRITICAL: Longer delay to ensure all chunks are fully processed by frontend before sending clarification
+                # This ensures proper separation between deep search and clarification
+                # CRITICAL: This delay is ONLY for deep research mode - other modes don't need it
+                # CRITICAL: Increased delay to 1.0 seconds to ensure frontend fully processes and renders all deep search chunks
+                await asyncio.sleep(1.0)  # Increased delay to ensure frontend processes all chunks and renders them
+                logger.info("Delay completed before sending clarification questions",
+                           delay_seconds=1.0,
+                           note="Ensures frontend has fully processed and rendered all deep search chunks before clarification")
             except Exception as e:
                 logger.error("Failed to emit deep search result to stream", error=str(e), exc_info=True)
                 # Try to emit at least a status message
@@ -401,7 +496,16 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     
     # Also try to get from research_session if available
     session_id = state.get("session_id")
-    if not deep_search_result_text and session_id:
+    # CRITICAL: Get stream BEFORE trying to access it in session retrieval
+    # Restore runtime dependencies if not in state
+    state = _restore_runtime_deps(state)
+    
+    llm = state.get("llm")
+    stream = state.get("stream")
+    settings = state.get("settings")
+    
+    # CRITICAL: Now that stream is available, try to get deep search from session
+    if not deep_search_result_text and session_id and stream:
         try:
             from src.workflow.research.session.manager import SessionManager
             session_factory = stream.app_state.get("session_factory") if stream else None
@@ -415,6 +519,7 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
                                result_length=len(deep_search_result_text) if deep_search_result_text else 0)
         except Exception as e:
             logger.warning("Failed to get deep search from session", error=str(e))
+    
     chat_history = state.get("chat_history", [])
     # Restore runtime dependencies if not in state
     state = _restore_runtime_deps(state)
@@ -422,6 +527,17 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     llm = state.get("llm")
     stream = state.get("stream")
     settings = state.get("settings")
+    
+    # CRITICAL: Check if LLM is available
+    if not llm:
+        logger.error("CRITICAL: llm is None in clarify_with_user_node!", state_keys=list(state.keys()))
+        deps = _get_runtime_deps()
+        llm = deps.get("llm")
+        if llm:
+            state["llm"] = llm
+            logger.info("LLM restored from runtime deps context")
+        else:
+            logger.error("CRITICAL: llm is None even after restoring from context! Will use fallback questions immediately")
     
     # CRITICAL: Log if stream is missing and try to restore from context
     if not stream:
@@ -495,7 +611,15 @@ async def clarify_with_user_node(state: Dict[str, Any]) -> Dict[str, Any]:
     deep_search_context = f"\n\n**DEEP SEARCH RESULT:**\n{deep_search_result}" if deep_search_result else ""
     logger.info("Deep search context prepared", context_length=len(deep_search_context))
     
+    # CRITICAL: Include current date and time for context
+    from datetime import datetime
+    current_date = datetime.now().strftime("%B %d, %Y")
+    current_time = datetime.now().strftime("%H:%M:%S")
+    
     prompt = f"""Generate 2-3 clarifying questions about this research topic.
+
+Current date: {current_date}
+Current time: {current_time}
 
 Query: {user_message_for_context}
 {deep_search_context}
@@ -541,54 +665,55 @@ Format questions with:
 """
     
     try:
-        # Get user language for system prompt and fallback
-        user_language = state.get("user_language", "English")
+        # CRITICAL: Don't use user_language from state - let LLM detect language from query itself
+        # This is simpler and more reliable
         
-        system_prompt = f"""You are a research planning expert. You MUST always generate clarifying questions to help improve research quality. 
+        system_prompt = """You are a research planning expert. Generate clarifying questions to help improve research quality.
 
 CRITICAL REQUIREMENTS:
-1. Write all questions in {user_language} - match the user's language exactly
+1. Write all questions in the SAME LANGUAGE as the user's query - detect the language from the query and match it exactly
 2. Generate questions STRICTLY about the SPECIFIC TOPIC from the original user message
 3. Do NOT generate questions about topics that are NOT mentioned in the original query or deep search context
-4. If the original query is about a specific topic, all questions MUST be about aspects of THAT topic, not unrelated topics
-5. Questions should help refine the research approach FOR THE ORIGINAL TOPIC, not introduce new topics
-6. You MUST return at least 2-3 questions in the questions list - NEVER return empty list
-7. Make questions specific to the query topic, not generic
-8. Questions must be tailored to the specific query - use the query content to create relevant questions
+4. Questions should help refine the research approach FOR THE ORIGINAL TOPIC
+5. You MUST return at least 2-3 questions in the questions list - NEVER return empty list
+6. Make questions specific to the query topic, not generic
 
 MANDATORY: The questions field MUST contain 2-3 questions. The model enforces min_length=2, so you MUST provide questions."""
         
-        # CRITICAL: Add timeout to prevent infinite hanging
-        # If LLM call takes too long, fallback to default questions
-        clarification = None
-        try:
+        # Check if LLM is available
+        if not llm:
+            logger.error("LLM is None - cannot generate clarification questions")
+            clarification = None
+        else:
             import asyncio
-            # Set timeout to 30 seconds for clarification generation
-            clarification = await asyncio.wait_for(
-                llm.with_structured_output(ClarificationNeeds).ainvoke([
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": prompt}
-                ]),
-                timeout=30.0
-            )
-            logger.info("Clarification questions generated successfully", 
-                       questions_count=len(clarification.questions) if clarification and clarification.questions else 0)
-        except asyncio.TimeoutError:
-            logger.error("CRITICAL: Clarification generation TIMED OUT after 30 seconds - using fallback questions",
-                        note="LLM call took too long, falling back to default questions")
-            clarification = None
-        except Exception as e:
-            logger.error("Failed to generate clarification questions with structured output", error=str(e), exc_info=True)
-            # Fallback: create default questions
-            clarification = None
-        
-        # Get user language for fallback questions (already set above, but ensure it's available)
-        if not user_language:
-            user_language = state.get("user_language", "English")
+            if stream:
+                stream.emit_status("Generating clarification questions...", step="clarification")
+            
+            try:
+                # Set timeout to 30 seconds for clarification generation
+                clarification = await asyncio.wait_for(
+                    llm.with_structured_output(ClarificationNeeds).ainvoke([
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]),
+                    timeout=30.0
+                )
+                logger.info("Clarification questions generated successfully", 
+                           questions_count=len(clarification.questions) if clarification and clarification.questions else 0)
+            except asyncio.TimeoutError:
+                logger.error("Clarification generation TIMED OUT - using fallback questions")
+                clarification = None
+                if stream:
+                    stream.emit_status("Using default questions (LLM timeout)", step="clarification")
+            except Exception as e:
+                logger.error("Failed to generate clarification questions", error=str(e), exc_info=True)
+                clarification = None
+                if stream:
+                    stream.emit_status("Using default questions (LLM error)", step="clarification")
         
         # Handle case when clarification generation failed
         if clarification is None:
-            logger.warning("Clarification generation failed - using fallback questions", user_language=user_language)
+            logger.warning("Clarification generation failed - using fallback questions")
             questions_to_send = []
         else:
             questions_count = len(clarification.questions) if clarification.questions else 0
@@ -598,116 +723,51 @@ MANDATORY: The questions field MUST contain 2-3 questions. The model enforces mi
                 questions_count=questions_count,
                 can_proceed=clarification.can_proceed_without,
                 original_query=user_message_for_context[:100],
-                user_language=user_language,
                 questions_preview=[q.question[:100] if hasattr(q, 'question') else str(q)[:100] for q in clarification.questions[:3]] if clarification.questions else [],
-                has_questions=bool(clarification.questions),
-                note="LLM should always generate 2-3 questions - if empty, will use fallback"
+                has_questions=bool(clarification.questions)
             )
-            
-            # CRITICAL: Check if LLM actually generated questions
-            if not clarification.questions or len(clarification.questions) == 0:
-                logger.warning("LLM returned empty questions list - this should not happen!",
-                             needs_clarification=clarification.needs_clarification,
-                             reasoning_preview=clarification.reasoning[:200] if hasattr(clarification, 'reasoning') else "N/A",
-                             note="Structured output should enforce questions generation with min_length=2")
             
             questions_to_send = clarification.questions if clarification.questions else []
         
-        # If LLM didn't generate questions, create default ones based on query and deep search
+        # If LLM didn't generate questions, create simple default ones
+        # CRITICAL: Don't use user_language - just create universal questions that work for any language
         if not questions_to_send or len(questions_to_send) == 0:
-            logger.warning("LLM didn't generate questions or returned empty list, creating context-aware default ones",
-                         questions_from_llm=len(clarification.questions) if clarification.questions else 0,
-                         user_language=user_language,
+            logger.warning("LLM didn't generate questions, creating simple default ones",
                          query_preview=user_message_for_context[:100])
             from src.workflow.research.models import ClarifyingQuestion
             
-            # Create context-aware default questions based on user language and query
-            if user_language == "Russian":
-                questions_to_send = [
-                    ClarifyingQuestion(
-                        question=f"Какой конкретный аспект темы '{user_message_for_context[:50]}...' должен быть основным фокусом исследования?",
-                        why_needed="Это поможет сузить область исследования и обеспечить покрытие наиболее важных аспектов.",
-                        default_assumption="Мы исследуем все основные аспекты комплексно."
-                    ),
-                    ClarifyingQuestion(
-                        question="Какой уровень детализации вам нужен? (например, обзор, технический разбор, исторический контекст, практическое применение)",
-                        why_needed="Это определяет глубину и тип информации, которую мы соберем.",
-                        default_assumption="Мы предоставим комплексный обзор с ключевыми техническими деталями."
-                    ),
-                    ClarifyingQuestion(
-                        question="Есть ли конкретные источники, перспективы или углы зрения, которые вы хотите, чтобы мы приоритизировали?",
-                        why_needed="Это поможет нам сосредоточиться на наиболее релевантных источниках информации.",
-                        default_assumption="Мы будем использовать разнообразные источники и перспективы для сбалансированного покрытия."
-                    )
-                ]
-            else:
-                # English or other languages
-                questions_to_send = [
-                    ClarifyingQuestion(
-                        question=f"What specific aspect of '{user_message_for_context[:50]}...' should be the primary focus of the research?",
-                        why_needed="This helps narrow down the research scope and ensure we cover the most important aspects.",
-                        default_assumption="We'll research all major aspects comprehensively."
-                    ),
-                    ClarifyingQuestion(
-                        question="What level of detail do you need? (e.g., overview, technical deep-dive, historical context, practical applications)",
-                        why_needed="This determines the depth and type of information we'll gather.",
-                        default_assumption="We'll provide a comprehensive overview with key technical details."
-                    ),
-                    ClarifyingQuestion(
-                        question="Are there any specific sources, perspectives, or angles you want us to prioritize?",
-                        why_needed="This helps us focus on the most relevant information sources.",
-                        default_assumption="We'll use diverse sources and perspectives for balanced coverage."
-                    )
-                ]
-            
-            logger.info("Created context-aware default questions",
-                       questions_count=len(questions_to_send),
-                       user_language=user_language,
-                       note="These are fallback questions - LLM should have generated specific ones")
-        
-        # CRITICAL: ALWAYS send questions to user - this is mandatory after deep search
-        # If questions_to_send is empty, we MUST create fallback questions
-        if not questions_to_send or len(questions_to_send) == 0:
-            logger.error("CRITICAL: questions_to_send is empty! Creating emergency fallback questions",
-                        clarification_was_none=clarification is None,
-                        clarification_questions_count=len(clarification.questions) if clarification and clarification.questions else 0)
-            from src.workflow.research.models import ClarifyingQuestion
-            
-            # Emergency fallback - always create questions
-            if user_language == "Russian":
-                questions_to_send = [
-                    ClarifyingQuestion(
-                        question=f"Какой конкретный аспект темы '{user_message_for_context[:50]}...' должен быть основным фокусом исследования?",
-                        why_needed="Это поможет сузить область исследования и обеспечить покрытие наиболее важных аспектов.",
-                        default_assumption="Мы исследуем все основные аспекты комплексно."
-                    ),
-                    ClarifyingQuestion(
-                        question="Какой уровень детализации вам нужен? (например, обзор, технический разбор, исторический контекст, практическое применение)",
-                        why_needed="Это определяет глубину и тип информации, которую мы соберем.",
-                        default_assumption="Мы предоставим комплексный обзор с ключевыми техническими деталями."
-                    )
-                ]
-            else:
-                questions_to_send = [
-                    ClarifyingQuestion(
-                        question=f"What specific aspect of '{user_message_for_context[:50]}...' should be the primary focus of the research?",
-                        why_needed="This helps narrow down the research scope and ensure we cover the most important aspects.",
-                        default_assumption="We'll research all major aspects comprehensively."
-                    ),
-                    ClarifyingQuestion(
-                        question="What level of detail do you need? (e.g., overview, technical deep-dive, historical context, practical applications)",
-                        why_needed="This determines the depth and type of information we'll gather.",
-                        default_assumption="We'll provide a comprehensive overview with key technical details."
-                    )
-                ]
-            logger.warning("Created emergency fallback questions", questions_count=len(questions_to_send))
+            # Simple universal questions - LLM will handle language in actual generation
+            questions_to_send = [
+                ClarifyingQuestion(
+                    question=f"What specific aspect of '{user_message_for_context[:50]}...' should be the primary focus?",
+                    why_needed="This helps narrow down the research scope.",
+                    default_assumption="We'll research all major aspects comprehensively."
+                ),
+                ClarifyingQuestion(
+                    question="What level of detail do you need?",
+                    why_needed="This determines the depth of information we'll gather.",
+                    default_assumption="We'll provide a comprehensive overview."
+                )
+            ]
         
         # ALWAYS send questions to user - this is mandatory after deep search
+        # CRITICAL: Log before sending to track execution flow
+        logger.info("About to send clarification questions",
+                   questions_count=len(questions_to_send) if questions_to_send else 0,
+                   has_stream=bool(stream),
+                   deep_search_result_length=len(deep_search_result_text) if deep_search_result_text else 0,
+                   note="This log confirms we reached the sending stage")
+        
         if questions_to_send and len(questions_to_send) > 0:
             # CRITICAL: Get deep search result from state to combine with clarification questions
             # This ensures both are in the same message and won't be lost on page reload
             # Use the deep_search_result_text we extracted earlier
             deep_search_result = deep_search_result_text
+            
+            logger.info("Preparing to send clarification questions",
+                       questions_count=len(questions_to_send),
+                       has_deep_search=bool(deep_search_result),
+                       note="Combining deep search with clarification questions")
             
             # CRITICAL: If deep search was already sent separately (for streaming), we still need to include it
             # in the combined message for DB persistence. But we should NOT send it again via stream.
@@ -753,15 +813,78 @@ Research will proceed after you provide your answers.*""")
             if stream:
                 # CRITICAL: If deep search was already sent, only send clarification part
                 # Otherwise send full combined message
-                # Check if deep search was already emitted by looking at recent chat history
+                # CRITICAL: Check if deep search was already emitted by looking at recent chat history AND database
+                # This ensures we catch deep search even if it was sent in a previous session
                 deep_search_already_sent = False
+                existing_deep_search_message_id = None
+                
+                # First check chat_history (from current session)
                 if chat_history:
-                    for msg in reversed(chat_history[-3:]):  # Check last 3 messages
+                    for msg in reversed(chat_history[-5:]):  # Check last 5 messages
                         if msg.get("role") == "assistant" and "Initial Deep Search Context" in msg.get("content", ""):
                             deep_search_already_sent = True
-                            logger.info("Deep search already sent separately - only sending clarification part",
-                                       note="Deep search will be in combined DB message")
+                            logger.info("Deep search found in chat_history - already sent separately",
+                                       note="Will update existing message in DB with combined content")
                             break
+                
+                # Also check database directly (for page reloads and cross-session scenarios)
+                # CRITICAL: Check for BOTH separate deep search AND combined messages
+                if not deep_search_already_sent and stream:
+                    try:
+                        from src.database.schema import ChatMessageModel
+                        from sqlalchemy import select
+                        
+                        app_state = stream.app_state if stream else {}
+                        chat_id = app_state.get("chat_id")
+                        session_factory = app_state.get("session_factory")
+                        
+                        if chat_id and session_factory:
+                            async with session_factory() as session:
+                                # CRITICAL: First check for combined message (deep search + clarification)
+                                # This is the preferred format - both in one message
+                                combined_result = await session.execute(
+                                    select(ChatMessageModel)
+                                    .where(
+                                        ChatMessageModel.chat_id == chat_id,
+                                        ChatMessageModel.role == "assistant",
+                                        ChatMessageModel.content.like("%Initial Deep Search Context%"),
+                                        ChatMessageModel.content.like("%Clarification Needed%")
+                                    )
+                                    .order_by(ChatMessageModel.created_at.desc())
+                                    .limit(1)
+                                )
+                                combined_msg = combined_result.scalar_one_or_none()
+                                
+                                if combined_msg:
+                                    # Combined message already exists - don't update, it's already correct
+                                    deep_search_already_sent = True
+                                    logger.info("Combined deep search + clarification already exists in database",
+                                              existing_message_id=combined_msg.message_id,
+                                              note="Message already contains both parts, no update needed")
+                                else:
+                                    # Check for separate deep search message (without clarification)
+                                    separate_result = await session.execute(
+                                        select(ChatMessageModel)
+                                        .where(
+                                            ChatMessageModel.chat_id == chat_id,
+                                            ChatMessageModel.role == "assistant",
+                                            ChatMessageModel.content.like("%Initial Deep Search Context%"),
+                                            ~ChatMessageModel.content.like("%Clarification Needed%")  # NOT contains clarification
+                                        )
+                                        .order_by(ChatMessageModel.created_at.desc())
+                                        .limit(1)
+                                    )
+                                    existing_msg = separate_result.scalar_one_or_none()
+                                    
+                                    if existing_msg:
+                                        deep_search_already_sent = True
+                                        existing_deep_search_message_id = existing_msg.message_id
+                                        logger.info("Separate deep search found in database - will update with combined content",
+                                                  existing_message_id=existing_deep_search_message_id,
+                                                  existing_content_length=len(existing_msg.content),
+                                                  note="Will update existing message to include clarification")
+                    except Exception as e:
+                        logger.warning("Failed to check database for existing deep search message", error=str(e))
                 
                 try:
                     if deep_search_already_sent and deep_search_result:
@@ -770,6 +893,10 @@ Research will proceed after you provide your answers.*""")
                         # CRITICAL: Deep search ends with \n\n\n\n (4 newlines = 2 empty lines) - see line 340
                         # Clarification should start directly without extra newlines since deep search already has 2 empty lines
                         # Result: \n\n\n\n (end of deep search) + (start of clarification) = 2 empty lines separation
+                        # CRITICAL: Clarification starts directly without extra newlines
+                        # Deep search already ends with \n\n\n\n (4 newlines = 2 empty lines)
+                        # When frontend concatenates: existing (ends with \n\n\n\n) + clarification_only (starts with ##)
+                        # Result: proper 2 empty lines separation in markdown
                         clarification_only = f"""## 🔍 Clarification Needed
 
 Before starting the research, I need to clarify a few points:
@@ -781,7 +908,30 @@ Before starting the research, I need to clarify a few points:
 *Note: Please answer these questions to help guide the research direction. 
 Research will proceed after you provide your answers.*"""
                         
-                        stream.emit_report_chunk(clarification_only)
+                        # CRITICAL: Verify that clarification starts correctly (no leading newlines)
+                        if clarification_only.startswith('\n'):
+                            logger.warning("Clarification has leading newlines - removing them for proper separation",
+                                         clarification_preview=clarification_only[:100])
+                            clarification_only = clarification_only.lstrip('\n')
+                        
+                        # CRITICAL: Ensure proper separation between deep search and clarification
+                        # Deep search already ends with \n\n\n\n (4 newlines = 2 empty lines)
+                        # When sending clarification separately, we need to ensure frontend sees the separation
+                        # Markdown requires 2 empty lines (4 newlines) for proper section separation
+                        # Since deep search ends with \n\n\n\n, clarification should start directly
+                        # But to ensure frontend renders it correctly, add explicit markdown separator
+                        # Use markdown horizontal rule or ensure proper spacing
+                        clarification_with_separator = "\n\n---\n\n" + clarification_only
+                        
+                        # CRITICAL: Add delay before sending clarification to ensure deep search chunk is fully processed
+                        # This gives frontend time to render the deep search content before clarification arrives
+                        await asyncio.sleep(1.0)
+                        
+                        stream.emit_report_chunk(clarification_with_separator)
+                        logger.info("Clarification chunk sent", 
+                                   clarification_length=len(clarification_only),
+                                   starts_with=clarification_only[:50],
+                                   note="Should start with '## 🔍' without leading newlines")
                         logger.info("Clarification questions emitted (deep search already sent separately)",
                                    clarification_length=len(clarification_only))
                     else:
@@ -804,10 +954,68 @@ Research will proceed after you provide your answers.*"""
                     
                     # CRITICAL: Save combined message (deep search + clarification) to DB
                     # This ensures both are persisted together and won't be lost on page reload
+                    # IMPORTANT: If deep search was already sent separately, update existing message
+                    # Otherwise create new message with combined content
                     from uuid import uuid4
                     import time
                     session_id = state.get("session_id", "unknown")
-                    message_id = f"deep_search_clarification_{session_id}_{int(time.time() * 1000)}"
+                    
+                    # CRITICAL: Always use existing message_id if found, otherwise create new
+                    # This ensures we update the same message instead of creating duplicates
+                    message_id = existing_deep_search_message_id
+                    if not message_id:
+                        # Check if combined message already exists (shouldn't happen, but handle it)
+                        try:
+                            from src.database.schema import ChatMessageModel
+                            from sqlalchemy import select
+                            
+                            app_state = stream.app_state if stream else {}
+                            chat_id = app_state.get("chat_id")
+                            session_factory = app_state.get("session_factory")
+                            
+                            if chat_id and session_factory:
+                                async with session_factory() as session:
+                                    # Check for existing combined message
+                                    result = await session.execute(
+                                        select(ChatMessageModel)
+                                        .where(
+                                            ChatMessageModel.chat_id == chat_id,
+                                            ChatMessageModel.role == "assistant",
+                                            ChatMessageModel.content.like("%Initial Deep Search Context%"),
+                                            ChatMessageModel.content.like("%Clarification Needed%")
+                                        )
+                                        .order_by(ChatMessageModel.created_at.desc())
+                                        .limit(1)
+                                    )
+                                    existing_combined = result.scalar_one_or_none()
+                                    if existing_combined:
+                                        message_id = existing_combined.message_id
+                                        logger.info("Found existing combined message - will update it",
+                                                  message_id=message_id,
+                                                  note="Updating existing combined message instead of creating duplicate")
+                        except Exception as e:
+                            logger.warning("Failed to check for existing combined message", error=str(e))
+                    
+                    # Create new message_id if still not found
+                    if not message_id:
+                        message_id = f"deep_search_clarification_{session_id}_{int(time.time() * 1000)}"
+                    
+                    # CRITICAL: Verify combined_message has proper separation before saving
+                    # Ensure deep search ends with \n\n\n\n (4 newlines) and clarification starts with ##
+                    if "## Initial Deep Search Context" in combined_message and "## 🔍 Clarification Needed" in combined_message:
+                        # Verify separation is correct
+                        deep_search_end = combined_message.find("## 🔍 Clarification Needed")
+                        if deep_search_end > 0:
+                            before_clarification = combined_message[:deep_search_end]
+                            trailing_newlines = len(before_clarification) - len(before_clarification.rstrip('\n'))
+                            if trailing_newlines < 4:
+                                # Fix separation - ensure 4 newlines before clarification
+                                combined_message = before_clarification.rstrip('\n') + '\n' * 4 + combined_message[deep_search_end:]
+                                logger.info("Fixed separation in combined message before saving",
+                                           added_newlines=4-trailing_newlines,
+                                           note="Ensured 4 newlines (2 empty lines) between deep search and clarification")
+                    
+                    # Save or update message in DB (update if message_id exists, create if new)
                     await _save_message_to_db_async(
                         stream=stream,
                         role="assistant",
@@ -816,14 +1024,21 @@ Research will proceed after you provide your answers.*"""
                     )
                     logger.info("Combined deep search + clarification saved to DB",
                                message_id=message_id,
-                               content_length=len(combined_message))
+                               content_length=len(combined_message),
+                               has_deep_search="## Initial Deep Search Context" in combined_message,
+                               has_clarification="## 🔍 Clarification Needed" in combined_message,
+                               was_update=bool(existing_deep_search_message_id),
+                               note="Message will contain both deep search and clarification for proper page reload")
                 except Exception as e:
                     logger.error("Failed to emit clarification questions as report chunk", error=str(e), exc_info=True)
                 
                 # CRITICAL: Update status to indicate questions were sent
                 try:
                     stream.emit_status("✅ Clarification questions sent - please answer them", step="clarification")
-                    logger.info("Status updated: Clarification questions sent")
+                    logger.info("Status updated: Clarification questions sent",
+                               questions_count=len(questions_to_send),
+                               combined_message_length=len(combined_message),
+                               note="Questions should now be visible on frontend")
                 except Exception as e:
                     logger.error("Failed to emit clarification status", error=str(e))
                 
@@ -836,7 +1051,9 @@ Research will proceed after you provide your answers.*"""
                            message_length=len(combined_message),
                            deep_search_used=bool(deep_search_result),
                            has_deep_search=bool(deep_search_result),
-                           note="Questions MUST be visible to user")
+                           chunks_sent=len(chunks) if 'chunks' in locals() else 0,
+                           clarification_only_sent=deep_search_already_sent if 'deep_search_already_sent' in locals() else False,
+                           note="Questions MUST be visible to user - check frontend if not showing")
             
             # Always proceed with assumptions (user can answer later, but research continues)
             logger.info("Clarifying questions shown to user, proceeding with default assumptions. User can provide answers in chat.")
@@ -849,7 +1066,6 @@ Research will proceed after you provide your answers.*"""
             # This should never happen after our fixes, but log if it does
             logger.error("CRITICAL: questions_to_send is empty after all fallbacks! This should not happen!",
                         clarification_was_none=clarification is None,
-                        user_language=user_language,
                         query_preview=user_message_for_context[:100])
             # Even in this case, try to create emergency questions
             from src.workflow.research.models import ClarifyingQuestion
@@ -877,7 +1093,45 @@ Research will proceed after you provide your answers.*"""
             return {"clarification_needed": True, "clarification_questions": [{"question": q.question, "why_needed": q.why_needed, "default_assumption": q.default_assumption} for q in emergency_questions]}
         
     except Exception as e:
-        logger.error("Clarification analysis failed", error=str(e))
+        logger.error("Clarification analysis failed", error=str(e), exc_info=True)
+        # CRITICAL: Even if everything fails, try to send emergency questions
+        # This ensures user always sees questions, not just "Analyzing..."
+        if stream:
+            try:
+                from src.workflow.research.models import ClarifyingQuestion
+                emergency_questions = [
+                    ClarifyingQuestion(
+                        question="What specific aspect should be the primary focus?",
+                        why_needed="To narrow down research scope",
+                        default_assumption="We'll research all major aspects"
+                    ),
+                    ClarifyingQuestion(
+                        question="What level of detail do you need?",
+                        why_needed="To determine research depth",
+                        default_assumption="We'll provide comprehensive overview"
+                    )
+                ]
+                emergency_message = "## 🔍 Clarification Needed\n\n**Q1:** What specific aspect should be the primary focus?\n\n**Q2:** What level of detail do you need?"
+                stream.emit_report_chunk(emergency_message)
+                await _save_message_to_db_async(
+                    stream=stream,
+                    role="assistant",
+                    content=emergency_message,
+                    message_id=f"emergency_clarification_{state.get('session_id', 'unknown')}"
+                )
+                stream.emit_status("✅ Emergency clarification questions sent", step="clarification")
+                logger.warning("Sent emergency clarification questions after error",
+                             error=str(e)[:200],
+                             note="User should see questions even after error")
+                return {
+                    "clarification_needed": True,
+                    "clarification_questions": [
+                        {"question": q.question, "why_needed": q.why_needed, "default_assumption": q.default_assumption}
+                        for q in emergency_questions
+                    ]
+                }
+            except Exception as e2:
+                logger.error("CRITICAL: Failed to send emergency questions after error", error=str(e2), exc_info=True)
         return {"clarification_needed": False}
 
 
@@ -1103,7 +1357,10 @@ Create specific research topics that agents can investigate to build a complete 
             {"role": "user", "content": prompt}
         ])
 
-        session_id = state.get("session_id", "unknown")
+        session_id = state.get("session_id")
+        if not session_id:
+            logger.warning("session_id not found in state - using 'unknown' for logging", state_keys=list(state.keys())[:10])
+            session_id = "unknown"
         logger.info("Research plan created", 
                    topics_count=len(plan.topics),
                    session_id=session_id)
@@ -1247,7 +1504,10 @@ async def create_agent_characteristics_enhanced_node(state: Dict[str, Any]) -> D
     estimated_from_llm = state.get("estimated_agent_count", max_agent_count)
     agent_count = min(estimated_from_llm, max_agent_count)  # CRITICAL: Cap at settings limit
     
-    session_id = state.get("session_id", "unknown")
+    session_id = state.get("session_id")
+    if not session_id:
+        logger.warning("session_id not found in state - using 'unknown' for logging", state_keys=list(state.keys())[:10])
+        session_id = "unknown"
     logger.info("Creating agent characteristics", 
                agent_count=agent_count, 
                estimated_from_llm=estimated_from_llm,
@@ -1908,14 +2168,23 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                             # CRITICAL: Process supervisor review immediately when agent completes
                             # Don't wait for all agents - supervisor should review EACH agent's work as soon as they complete
                             # This ensures supervisor updates draft_report and manages tasks in real-time
-                            # IMPORTANT: Supervisor is called even if limit reached - limit only applies to TODO operations, not findings processing
-                            if supervisor_call_count < max_supervisor_calls:
-                                logger.info(f"Agent {agent_id} completed task - calling supervisor immediately for review (call {supervisor_call_count + 1}/{max_supervisor_calls}, completed={completed_count}/{len(agent_tasks)})")
+                            # CRITICAL: Supervisor is ALWAYS called for findings processing and draft_report writing
+                            # Limit applies ONLY to TODO operations (create_agent_todo, update_agent_todo), NOT to findings processing
+                            # CRITICAL: Other agents continue working in parallel - supervisor review doesn't block them
+                            
+                            # Track call count for TODO operations limit, but ALWAYS call supervisor for findings
+                            is_todo_operations_available = supervisor_call_count < max_supervisor_calls
+                            
+                            if is_todo_operations_available:
+                                # Increment counter only for TODO operations tracking
                                 supervisor_call_count += 1
                                 state["supervisor_call_count"] = supervisor_call_count
+                                logger.info(f"Agent {agent_id} completed task - calling supervisor for review (call {supervisor_call_count}/{max_supervisor_calls}, TODO operations available)",
+                                          note="Other agents continue working in parallel during supervisor review")
                             else:
-                                logger.info(f"Agent {agent_id} completed task - calling supervisor for findings processing only (limit reached: {supervisor_call_count}/{max_supervisor_calls}, TODO operations disabled)",
-                                          note="Supervisor can still process findings and write to draft_report, but cannot create/update todos")
+                                # Don't increment counter, but STILL call supervisor for findings processing
+                                logger.info(f"Agent {agent_id} completed task - calling supervisor for findings processing (TODO limit reached: {supervisor_call_count}/{max_supervisor_calls})",
+                                          note="Supervisor will process findings and write to draft_report, but TODO operations are disabled")
                             
                             try:
                                 if settings:
@@ -1926,10 +2195,41 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                                     supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
                                 
                                 if stream:
-                                    if supervisor_call_count <= max_supervisor_calls:
+                                    if is_todo_operations_available:
                                         stream.emit_status(f"👔 Supervisor reviewing findings from {agent_id} (call {supervisor_call_count}/{max_supervisor_calls})", step="supervisor")
                                     else:
-                                        stream.emit_status(f"👔 Supervisor processing findings from {agent_id} (limit reached, TODO operations disabled)", step="supervisor")
+                                        stream.emit_status(f"👔 Supervisor processing findings from {agent_id} (TODO limit reached, writing to draft_report)", step="supervisor")
+                                
+                                # CRITICAL: Supervisor review happens while other agents continue working
+                                # This is non-blocking - agents run in parallel via asyncio.create_task
+                                # CRITICAL: Ensure deep_search_result is in state before calling supervisor
+                                deep_search_result_in_state = state.get("deep_search_result", "")
+                                if not deep_search_result_in_state:
+                                    logger.warning("deep_search_result missing from state before supervisor call",
+                                                 state_keys=list(state.keys())[:20],
+                                                 note="Supervisor may not have access to initial deep search context")
+                                else:
+                                    logger.debug("deep_search_result available in state for supervisor",
+                                                has_deep_search=bool(deep_search_result_in_state),
+                                                deep_search_type=type(deep_search_result_in_state).__name__)
+                                
+                                # CRITICAL: Add current finding to state so supervisor can see it
+                                # Supervisor reads findings from state, not from cycle_findings
+                                if result:
+                                    existing_findings = state.get("findings", state.get("agent_findings", []))
+                                    # Check if this finding is already in state (avoid duplicates)
+                                    finding_already_in_state = any(
+                                        f.get("topic") == result.get("topic") and f.get("agent_id") == result.get("agent_id")
+                                        for f in existing_findings
+                                    )
+                                    if not finding_already_in_state:
+                                        existing_findings.append(result)
+                                        state["findings"] = existing_findings
+                                        state["agent_findings"] = existing_findings
+                                        logger.info(f"Added finding to state for supervisor",
+                                                   finding_topic=result.get("topic", "unknown"),
+                                                   total_findings_in_state=len(existing_findings),
+                                                   note="Supervisor will now see this finding in state")
                                 
                                 from src.workflow.research.supervisor_agent import run_supervisor_agent
                                 decision = await run_supervisor_agent(
@@ -1943,13 +2243,62 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                                 state["should_continue"] = decision.get("should_continue", False)
                                 state["replanning_needed"] = decision.get("replanning_needed", False)
                                 
+                                # CRITICAL: After supervisor review, check if supervisor created new tasks
+                                # Even if supervisor says stop, we must check for new tasks before stopping
+                                # Supervisor might have created new tasks before deciding to stop
+                                new_pending_tasks = 0  # Initialize before use
+                                if agent_file_service:
+                                    try:
+                                        # Check if any agents have new pending tasks after supervisor review
+                                        agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
+                                        all_agent_ids = []
+                                        for file_path in agent_files:
+                                            agent_id = file_path.replace("agents/", "").replace(".md", "")
+                                            if agent_id.startswith("agent_") and agent_id != "supervisor":
+                                                all_agent_ids.append(agent_id)
+                                        
+                                        new_pending_tasks = 0
+                                        agents_with_new_tasks = []
+                                        for agent_id in all_agent_ids:
+                                            agent_file = await agent_file_service.read_agent_file(agent_id)
+                                            todos = agent_file.get("todos", [])
+                                            pending_tasks = [t for t in todos if t.status == "pending"]
+                                            in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+                                            if pending_tasks or in_progress_tasks:
+                                                agents_with_new_tasks.append(agent_id)
+                                                new_pending_tasks += len(pending_tasks) + len(in_progress_tasks)
+                                        
+                                        if new_pending_tasks > 0:
+                                            logger.info(f"After supervisor review: {len(agents_with_new_tasks)} agents have {new_pending_tasks} pending/in_progress tasks",
+                                                       agents_with_tasks=agents_with_new_tasks,
+                                                       total_pending=new_pending_tasks,
+                                                       note="Supervisor created new tasks - agents will continue working in next cycle")
+                                            # CRITICAL: If supervisor created new tasks, we MUST continue
+                                            # Override supervisor's decision to stop if there are new tasks
+                                            state["should_continue"] = True
+                                            logger.info("Overriding supervisor's stop decision because new tasks were created",
+                                                       note="Agents must complete all tasks before finalization")
+                                    except Exception as e:
+                                        logger.error("Error checking for new tasks after supervisor review", error=str(e), exc_info=True)
+                                
+                                # CRITICAL: Update status after supervisor review completes
+                                # If supervisor decided to continue or created new tasks, show that agents are working
+                                if stream:
+                                    if state.get("should_continue", False) or new_pending_tasks > 0:
+                                        # Supervisor decided to continue or created new tasks - agents are working
+                                        if new_pending_tasks > 0:
+                                            stream.emit_status(f"🚀 Agents continuing work ({new_pending_tasks} tasks remaining)", step="agents")
+                                        else:
+                                            stream.emit_status("🚀 Agents continuing research...", step="agents")
+                                    elif not decision.get("should_continue", False):
+                                        # Supervisor decided to stop
+                                        stream.emit_status("✅ Supervisor decided research is complete", step="supervisor")
+                                
                                 # CRITICAL: Even if supervisor says stop, check if there are pending tasks
                                 # Supervisor might have created new tasks before deciding to stop
                                 # We need to check pending tasks before actually stopping
-                                if not decision.get("should_continue", False):
+                                if not decision.get("should_continue", False) and not state.get("should_continue", False):
                                     logger.info("Supervisor decided to stop", decision_reasoning=decision.get("reasoning", "")[:200])
-                                    if stream:
-                                        stream.emit_status("✅ Supervisor decided research is complete", step="supervisor")
                                     # Don't break immediately - check for pending tasks first
                                     # The check below will verify if there are pending tasks
                                     # If there are pending tasks, we'll continue despite supervisor's decision
@@ -2091,6 +2440,10 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                             state["should_continue"] = False
                             state["replanning_needed"] = False
                             
+                            # CRITICAL: Update status after supervisor finalization
+                            if stream:
+                                stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+                            
                             logger.info("Forced supervisor finalization completed", 
                                       decision=decision.get("should_continue"),
                                       note="Research will proceed to report generation")
@@ -2146,6 +2499,62 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                            max_calls=max_supervisor_calls,
                            note="This is a special finalization call when all tasks are done")
                 
+                # CRITICAL: Extract ALL findings from supervisor_queue and add to state BEFORE finalization
+                # This ensures supervisor sees all findings when finalizing the report
+                if supervisor_queue and supervisor_queue.size() > 0:
+                    findings_from_queue = []
+                    temp_events = []
+                    queue_size = supervisor_queue.size()
+                    for _ in range(queue_size):
+                        try:
+                            event = supervisor_queue.queue.get_nowait()
+                            temp_events.append(event)
+                            if event.result:
+                                findings_from_queue.append(event.result)
+                        except:
+                            break
+                    
+                    # Put events back in queue (they'll be processed properly by supervisor)
+                    for event in temp_events:
+                        await supervisor_queue.queue.put(event)
+                    
+                    # Add findings to state so supervisor can see them
+                    if findings_from_queue:
+                        existing_findings = state.get("findings", state.get("agent_findings", []))
+                        # Combine existing findings with queue findings (avoid duplicates)
+                        for new_finding in findings_from_queue:
+                            finding_already_exists = any(
+                                f.get("topic") == new_finding.get("topic") and 
+                                f.get("agent_id") == new_finding.get("agent_id")
+                                for f in existing_findings
+                            )
+                            if not finding_already_exists:
+                                existing_findings.append(new_finding)
+                        
+                        state["findings"] = existing_findings
+                        state["agent_findings"] = existing_findings
+                        logger.info(f"Extracted {len(findings_from_queue)} findings from supervisor_queue before finalization",
+                                   total_findings=len(existing_findings),
+                                   note="Supervisor will now see ALL findings when finalizing report")
+                
+                # Also extract findings from cycle_findings if available
+                if cycle_findings and len(cycle_findings) > 0:
+                    existing_findings = state.get("findings", state.get("agent_findings", []))
+                    for new_finding in cycle_findings:
+                        finding_already_exists = any(
+                            f.get("topic") == new_finding.get("topic") and 
+                            f.get("agent_id") == new_finding.get("agent_id")
+                            for f in existing_findings
+                        )
+                        if not finding_already_exists:
+                            existing_findings.append(new_finding)
+                    
+                    state["findings"] = existing_findings
+                    state["agent_findings"] = existing_findings
+                    logger.info(f"Added {len(cycle_findings)} findings from cycle_findings to state before finalization",
+                               total_findings=len(existing_findings),
+                               note="Supervisor will now see ALL findings when finalizing report")
+                
                 from src.workflow.research.supervisor_agent import run_supervisor_agent
                 decision = await run_supervisor_agent(
                     state=state,
@@ -2159,8 +2568,13 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 state["should_continue"] = False
                 state["replanning_needed"] = False
                 
+                # CRITICAL: Update status after supervisor finalization
+                if stream:
+                    stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+                
                 logger.info("Forced supervisor finalization completed", 
                           decision=decision.get("should_continue"),
+                          total_findings=len(state.get("findings", state.get("agent_findings", []))),
                           note="Research will proceed to report generation")
             except Exception as e:
                 logger.error("Failed to force supervisor finalization", error=str(e), exc_info=True)
@@ -2169,6 +2583,10 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 state["replanning_needed"] = False
             
             agents_active = False
+            # CRITICAL: After finalization, we should NOT process queue again - supervisor already finalized
+            # Just break and return state with should_continue=False to trigger report generation
+            logger.info("All tasks completed and supervisor finalized - breaking to trigger report generation",
+                       note="should_continue=False will route to compress_findings -> generate_report")
             break
         
         # After cycle completes, check if there are any remaining items in supervisor queue
@@ -2177,25 +2595,30 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
         logger.info(f"After cycle {iteration_count}: supervisor queue size = {queue_size}, cycle findings = {len(cycle_findings)}")
         
         # Process any remaining items in queue (should be rare, as we process during cycle)
-        if queue_size > 0:
-            # CRITICAL: Supervisor is called even if limit reached - limit only applies to TODO operations
-            # Findings processing (write_draft_report, update_synthesized_report) is NOT limited
-            if supervisor_call_count < max_supervisor_calls:
-                logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (supervisor call {supervisor_call_count + 1}/{max_supervisor_calls})")
+        # CRITICAL: Only process queue if agents are still active (not finalized)
+        if queue_size > 0 and agents_active:
+            # CRITICAL: Supervisor is ALWAYS called for findings processing and draft_report writing
+            # Limit applies ONLY to TODO operations, NOT to findings processing
+            is_todo_operations_available = supervisor_call_count < max_supervisor_calls
+            
+            if is_todo_operations_available:
+                # Increment counter only for TODO operations tracking
                 supervisor_call_count += 1
                 state["supervisor_call_count"] = supervisor_call_count
+                logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (call {supervisor_call_count}/{max_supervisor_calls}, TODO operations available)")
             else:
-                logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (limit reached: {supervisor_call_count}/{max_supervisor_calls}, TODO operations disabled)",
-                          note="Supervisor can still process findings and write to draft_report, but cannot create/update todos")
+                # Don't increment counter, but STILL call supervisor for findings processing
+                logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (TODO limit reached: {supervisor_call_count}/{max_supervisor_calls})",
+                          note="Supervisor will process findings and write to draft_report, but TODO operations are disabled")
             
             if stream:
-                if supervisor_call_count <= max_supervisor_calls:
+                if is_todo_operations_available:
                     stream.emit_status(f"👔 Supervisor reviewing findings (call {supervisor_call_count}/{max_supervisor_calls})", step="supervisor")
                 else:
-                    stream.emit_status(f"👔 Supervisor processing findings (limit reached, TODO operations disabled)", step="supervisor")
+                    stream.emit_status(f"👔 Supervisor processing findings (TODO limit reached, writing to draft_report)", step="supervisor")
             
-            # Call supervisor agent to review and process findings
-            # IMPORTANT: Supervisor is called even if limit reached - limit only blocks TODO operations
+            # CRITICAL: Call supervisor agent to review and process findings
+            # Supervisor is ALWAYS called - limit only blocks TODO operations, NOT findings processing
             from src.workflow.research.supervisor_agent import run_supervisor_agent
             
             try:
@@ -2207,6 +2630,45 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                     from src.config.settings import get_settings
                     settings_obj = get_settings()
                     supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
+                
+                # CRITICAL: Extract findings from supervisor_queue and add to state
+                # Supervisor needs findings in state to process them
+                if supervisor_queue and supervisor_queue.size() > 0:
+                    findings_from_queue = []
+                    # Get all pending findings from queue (peek without removing)
+                    temp_events = []
+                    queue_size = supervisor_queue.size()
+                    for _ in range(queue_size):
+                        try:
+                            event = supervisor_queue.queue.get_nowait()
+                            temp_events.append(event)
+                            if event.result:
+                                findings_from_queue.append(event.result)
+                        except:
+                            break
+                    
+                    # Put events back in queue (they'll be processed properly by supervisor)
+                    for event in temp_events:
+                        await supervisor_queue.queue.put(event)
+                    
+                    # Add findings to state so supervisor can see them
+                    if findings_from_queue:
+                        existing_findings = state.get("findings", state.get("agent_findings", []))
+                        # Combine existing findings with queue findings (avoid duplicates)
+                        for new_finding in findings_from_queue:
+                            finding_already_exists = any(
+                                f.get("topic") == new_finding.get("topic") and 
+                                f.get("agent_id") == new_finding.get("agent_id")
+                                for f in existing_findings
+                            )
+                            if not finding_already_exists:
+                                existing_findings.append(new_finding)
+                        
+                        state["findings"] = existing_findings
+                        state["agent_findings"] = existing_findings
+                        logger.info(f"Extracted {len(findings_from_queue)} findings from supervisor_queue and added to state",
+                                   total_findings=len(existing_findings),
+                                   note="Supervisor will now see these findings in state")
                 
                 decision = await run_supervisor_agent(
                     state=state,
@@ -2220,12 +2682,41 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 state["should_continue"] = decision.get("should_continue", False)
                 state["replanning_needed"] = decision.get("replanning_needed", False)
                 
+                # CRITICAL: Update status after supervisor review completes
+                if stream:
+                    if not decision.get("should_continue", False):
+                        stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+                    else:
+                        # Check if there are pending tasks
+                        if agent_file_service:
+                            try:
+                                agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
+                                all_agent_ids = []
+                                for file_path in agent_files:
+                                    agent_id = file_path.replace("agents/", "").replace(".md", "")
+                                    if agent_id.startswith("agent_") and agent_id != "supervisor":
+                                        all_agent_ids.append(agent_id)
+                                
+                                total_pending = 0
+                                for agent_id in all_agent_ids:
+                                    agent_file = await agent_file_service.read_agent_file(agent_id)
+                                    todos = agent_file.get("todos", [])
+                                    pending_tasks = [t for t in todos if t.status == "pending"]
+                                    in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+                                    total_pending += len(pending_tasks) + len(in_progress_tasks)
+                                
+                                if total_pending > 0:
+                                    stream.emit_status(f"🚀 Agents continuing work ({total_pending} tasks remaining)", step="agents")
+                                else:
+                                    stream.emit_status("🚀 Research continuing...", step="agents")
+                            except Exception as e:
+                                logger.warning("Failed to check pending tasks for status update", error=str(e))
+                                stream.emit_status("🚀 Research continuing...", step="agents")
+                
                 # If supervisor says stop, break the loop
                 if not decision.get("should_continue", False):
                     logger.info("Supervisor decided to stop, breaking agent execution loop", 
                                decision_reasoning=decision.get("reasoning", "")[:200])
-                    if stream:
-                        stream.emit_status("✅ Supervisor decided research is complete", step="supervisor")
                     agents_active = False
                     break
                 
@@ -2285,14 +2776,16 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
     new_iteration = current_iteration + iteration_count
     logger.info(f"Agent execution completed", cycles=iteration_count, total_iteration=new_iteration, max_iterations=max_iterations, supervisor_calls=supervisor_call_count, max_reached=(iteration_count >= max_iterations))
     
-    # CRITICAL: If supervisor call limit reached, MUST finalize draft_report with ALL findings (no truncation)
-    # This is MANDATORY to ensure a comprehensive report is always available even if supervisor couldn't complete it
+    # CRITICAL: Supervisor continues to be called even after TODO limit is reached
+    # Supervisor can still process findings and write chapters to draft_report
+    # Finalization happens only when all tasks are completed, NOT when limit is reached
     agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
     agent_file_service = stream.app_state.get("agent_file_service") if stream else None
     
-    # CRITICAL: ALWAYS finalize draft_report with ALL findings when supervisor limit reached
-    # This ensures all agent artifacts are in draft_report even if supervisor can't process them
-    if supervisor_call_count >= max_supervisor_calls:
+    # NOTE: We do NOT finalize draft_report here when limit is reached
+    # Supervisor will continue to be called for findings processing and will write chapters
+    # Finalization happens in generate_final_report_enhanced_node when all tasks are done
+    if False:  # Disabled - supervisor continues working after limit
         logger.info("MANDATORY: Supervisor call limit reached - finalizing draft_report with ALL findings", 
                    supervisor_calls=supervisor_call_count, max_calls=max_supervisor_calls, findings_count=len(all_findings))
         
@@ -2339,9 +2832,22 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
                 
                 findings_text = "\n\n".join(findings_sections)
                 
-                # Append to existing draft or create new
-                if len(draft_content) > 500:
-                    # Append to existing draft
+                # CRITICAL: Check if draft_report already has chapters from supervisor
+                # If supervisor wrote chapters, DO NOT overwrite them - just append synthesis if needed
+                import re
+                has_chapters = bool(re.search(r'##\s+Chapter\s+\d+:', draft_content))
+                
+                if has_chapters:
+                    # Supervisor already wrote chapters - DO NOT overwrite!
+                    # Only append final synthesis if draft is substantial
+                    logger.info("Draft report already contains chapters from supervisor - preserving them",
+                              draft_length=len(draft_content),
+                              chapters_detected=True,
+                              note="Will NOT overwrite supervisor's chapters")
+                    # Don't overwrite - supervisor's chapters are already there
+                    final_draft = draft_content
+                elif len(draft_content) > 500:
+                    # Draft exists but no chapters - append synthesis
                     final_draft = f"""{draft_content}
 
 ---
@@ -2361,7 +2867,29 @@ async def execute_agents_enhanced_node(state: Dict[str, Any]) -> Dict[str, Any]:
 Research completed with {len(all_findings)} comprehensive findings from {len(agent_characteristics)} research agents. All agents have completed their tasks and provided full results.
 """
                 else:
-                    # Create new comprehensive draft
+                    # Draft is empty or too short - create comprehensive draft
+                    # BUT: Use Chapter format to match supervisor's format
+                    logger.warning("Draft report is empty or too short - creating comprehensive draft with Chapter format",
+                                 draft_length=len(draft_content),
+                                 note="Using Chapter format to match supervisor's structure")
+                    
+                    # Create chapters from findings (matching supervisor's format)
+                    chapters_text = []
+                    for i, f in enumerate(all_findings, 1):
+                        full_summary = f.get('summary', 'No summary')
+                        all_key_findings = f.get('key_findings', [])
+                        sources = f.get('sources', [])
+                        topic = f.get('topic', 'Unknown Topic')
+                        
+                        chapter_content = f"{full_summary}\n\n"
+                        if all_key_findings:
+                            chapter_content += "### Key Findings\n\n" + "\n".join([f"- {kf}" for kf in all_key_findings]) + "\n\n"
+                        if sources:
+                            sources_list = [f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:30]]
+                            chapter_content += "### Sources\n\n" + "\n".join(sources_list) + "\n"
+                        
+                        chapters_text.append(f"## Chapter {i}: {topic}\n\n{chapter_content}")
+                    
                     final_draft = f"""# Research Report Draft
 
 **Query:** {query}
@@ -2369,13 +2897,7 @@ Research completed with {len(all_findings)} comprehensive findings from {len(age
 **Total Findings:** {len(all_findings)}
 **Supervisor Calls:** {supervisor_call_count}/{max_supervisor_calls}
 
-## Executive Summary
-
-This report synthesizes findings from {len(agent_characteristics)} research agents working on: {query}
-
-## Detailed Findings (Complete, No Truncation)
-
-{findings_text}
+{chr(10).join(chapters_text)}
 
 ## Conclusion
 
@@ -2616,10 +3138,21 @@ async def supervisor_review_enhanced_node(state: Dict[str, Any]) -> Dict[str, An
             state=state,
             llm=llm,
             stream=stream,
+            supervisor_queue=None,  # No queue for finalization call
             max_iterations=supervisor_max_iterations
         )
         
         logger.info("Supervisor agent completed", decision=decision)
+        
+        # CRITICAL: Update status after supervisor review completes
+        # If supervisor decided to finish, show finalization status
+        if stream:
+            if not decision.get("should_continue", False):
+                stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+            else:
+                # Supervisor decided to continue (shouldn't happen in finalization, but handle it)
+                stream.emit_status("🚀 Research continuing...", step="agents")
+        
         return decision
 
     except Exception as e:
@@ -2638,33 +3171,48 @@ async def supervisor_review_enhanced_node(state: Dict[str, Any]) -> Dict[str, An
                     except FileNotFoundError:
                         draft_content = ""
                     
-                    # If draft_report is empty or short, create/update it with findings
-                    if len(draft_content) < 500:
+                    # CRITICAL: Check if draft_report already has chapters from supervisor
+                    # If supervisor wrote chapters, DO NOT overwrite them!
+                    import re
+                    has_chapters = bool(re.search(r'##\s+Chapter\s+\d+:', draft_content))
+                    
+                    if has_chapters:
+                        # Supervisor already wrote chapters - DO NOT overwrite!
+                        logger.info("Draft report already contains chapters from supervisor - preserving them after error",
+                                  draft_length=len(draft_content),
+                                  chapters_detected=True,
+                                  note="Will NOT overwrite supervisor's chapters even after error")
+                        # Don't overwrite - supervisor's chapters are already there
+                    elif len(draft_content) < 500:
+                        # Draft is empty or too short AND no chapters - create with Chapter format
                         from datetime import datetime
                         query = state.get("query", "")
                         
-                        findings_sections = []
-                        for f in findings:
-                            findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
-
-**Agent:** {f.get('agent_id', 'unknown')}
-**Summary:** {f.get('summary', 'No summary')}
-**Key Findings:** {', '.join(f.get('key_findings', [])[:5])}
-""")
+                        # Create chapters from findings (matching supervisor's format)
+                        chapters_text = []
+                        for i, f in enumerate(findings, 1):
+                            topic = f.get('topic', 'Unknown Topic')
+                            summary = f.get('summary', 'No summary')
+                            key_findings = f.get('key_findings', [])
+                            
+                            chapter_content = f"{summary}\n\n"
+                            if key_findings:
+                                chapter_content += "### Key Findings\n\n" + "\n".join([f"- {kf}" for kf in key_findings[:10]]) + "\n"
+                            
+                            chapters_text.append(f"## Chapter {i}: {topic}\n\n{chapter_content}")
                         
-                        findings_text = "\n\n".join(findings_sections)
                         draft_content = f"""# Research Report Draft
 
 **Query:** {query}
 **Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 **Note:** Supervisor encountered an error, but findings are available below.
 
-## Findings
-
-{findings_text}
+{chr(10).join(chapters_text)}
 """
                         await agent_memory_service.file_manager.write_file("draft_report.md", draft_content)
-                        logger.info("Updated draft_report with findings after supervisor error", findings_count=len(findings))
+                        logger.info("Updated draft_report with findings in Chapter format after supervisor error", 
+                                  findings_count=len(findings),
+                                  note="Used Chapter format to match supervisor's structure")
             except Exception as e2:
                 logger.warning("Failed to update draft_report after supervisor error", error=str(e2))
         
@@ -2768,13 +3316,16 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
             from collections import OrderedDict
             
             # Extract all chapters (## Chapter N: Title)
+            # CRITICAL: Also match single # Chapter format to catch duplicates
             chapter_pattern = r'##\s+Chapter\s+(\d+):\s+([^\n]+)'
+            single_hash_pattern = r'#\s+Chapter\s+(\d+):\s+([^\n]+)'
             chapters = OrderedDict()
             current_chapter = None
             current_content = []
             
             lines = draft_report_raw.split('\n')
             in_new_findings = False
+            seen_chapter_titles = set()  # Track seen chapter titles to prevent duplicates
             
             for i, line in enumerate(lines):
                 # Skip "New Findings" sections
@@ -2787,32 +3338,55 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
                 if in_new_findings:
                     continue
                 
-                # Check if this is a chapter header
+                # Check if this is a chapter header (## Chapter N: Title or # Chapter N: Title)
                 match = re.match(chapter_pattern, line)
+                if not match:
+                    match = re.match(single_hash_pattern, line)
+                
                 if match:
+                    chapter_num = int(match.group(1))
+                    chapter_title = match.group(2).strip()
+                    chapter_key = f"{chapter_num}:{chapter_title.lower()}"
+                    
+                    # CRITICAL: Check for duplicates - if we've seen this chapter before, skip it
+                    if chapter_key in chapters or chapter_title.lower() in seen_chapter_titles:
+                        logger.warning("Skipping duplicate chapter",
+                                     chapter_number=chapter_num,
+                                     chapter_title=chapter_title,
+                                     note="This chapter was already added - skipping duplicate")
+                        # Reset current_chapter to skip this duplicate
+                        current_chapter = None
+                        current_content = []
+                        continue
+                    
                     # Save previous chapter if exists
                     if current_chapter:
-                        chapter_key = f"{current_chapter['number']}:{current_chapter['title'].lower()}"
-                        if chapter_key not in chapters:
-                            chapters[chapter_key] = {
+                        prev_chapter_key = f"{current_chapter['number']}:{current_chapter['title'].lower()}"
+                        if prev_chapter_key not in chapters:
+                            chapters[prev_chapter_key] = {
                                 'number': current_chapter['number'],
                                 'title': current_chapter['title'],
                                 'content': '\n'.join(current_content).strip()
                             }
+                            seen_chapter_titles.add(current_chapter['title'].lower())
                     
                     # Start new chapter
                     current_chapter = {
-                        'number': int(match.group(1)),
-                        'title': match.group(2).strip()
+                        'number': chapter_num,
+                        'title': chapter_title
                     }
                     current_content = []
                 elif current_chapter:
-                    # Skip metadata lines like "**Added:**", "**Agent:**", "**Confidence:**", "**Updated:**"
+                    # Skip metadata lines like "**Added:**", "**Agent:**", "**Confidence:**", "**Updated:**", "**Finding ID:**"
                     # Also skip raw findings sections like "### Summary", "### Key Findings" (these are from raw findings, not chapters)
                     if line.strip().startswith("**Added:**") or \
                        line.strip().startswith("**Agent:**") or \
                        line.strip().startswith("**Confidence:**") or \
                        line.strip().startswith("**Updated:**") or \
+                       line.strip().startswith("**Finding ID:**") or \
+                       "Finding ID:" in line or \
+                       "agent_1.done" in line or \
+                       "agent_2.done" in line or \
                        (line.strip().startswith("### Summary") and "Detailed Research Findings" in '\n'.join(current_content[-5:])) or \
                        (line.strip().startswith("### Key Findings") and "Detailed Research Findings" in '\n'.join(current_content[-5:])) or \
                        (line.strip().startswith("### Sources") and "Detailed Research Findings" in '\n'.join(current_content[-5:])) or \
@@ -2827,12 +3401,13 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
             # Save last chapter
             if current_chapter:
                 chapter_key = f"{current_chapter['number']}:{current_chapter['title'].lower()}"
-                if chapter_key not in chapters:
+                if chapter_key not in chapters and current_chapter['title'].lower() not in seen_chapter_titles:
                     chapters[chapter_key] = {
                         'number': current_chapter['number'],
                         'title': current_chapter['title'],
                         'content': '\n'.join(current_content).strip()
                     }
+                    seen_chapter_titles.add(current_chapter['title'].lower())
             
             # Build clean draft report with unique chapters
             if chapters:
@@ -2841,17 +3416,68 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
                 
                 chapters_text = []
                 chapter_num = 1
-                for chapter_key, chapter_data in chapters.items():
+                # CRITICAL: Sort chapters by original number to preserve order, but renumber sequentially
+                sorted_chapters = sorted(chapters.items(), key=lambda x: x[1]['number'])
+                for chapter_key, chapter_data in sorted_chapters:
+                    # CRITICAL: Clean up sources sections within chapter content - remove duplicate "## Sources" sections
+                    chapter_content = chapter_data['content']
+                    
+                    # Find all "## Sources" sections in this chapter
+                    import re
+                    sources_pattern = r'##\s+Sources\s*\n\n(.*?)(?=\n\n##\s+Chapter|\Z)'
+                    sources_matches = list(re.finditer(sources_pattern, chapter_content, re.DOTALL))
+                    
+                    if len(sources_matches) > 1:
+                        # Multiple sources sections found - deduplicate and keep only the last one
+                        logger.warning("Found multiple Sources sections in chapter - deduplicating",
+                                     chapter_title=chapter_data['title'],
+                                     sources_sections_count=len(sources_matches))
+                        
+                        # Extract all unique sources from all sections
+                        seen_source_urls = set()
+                        all_sources = []
+                        
+                        for match in sources_matches:
+                            sources_text = match.group(1)
+                            # Extract individual source lines
+                            source_lines = [line.strip() for line in sources_text.split('\n') if line.strip() and line.strip().startswith('-')]
+                            for line in source_lines:
+                                # Extract URL from markdown link format: - [Title](URL)
+                                url_match = re.search(r'\(([^)]+)\)', line)
+                                if url_match:
+                                    url = url_match.group(1).lower().rstrip('/')
+                                    if url not in seen_source_urls:
+                                        seen_source_urls.add(url)
+                                        all_sources.append(line)
+                                else:
+                                    # No URL, check by title
+                                    title_match = re.search(r'\[([^\]]+)\]', line)
+                                    if title_match:
+                                        title = title_match.group(1).lower()
+                                        if title not in [s.split(']')[0].replace('- [', '').lower() for s in all_sources]:
+                                            all_sources.append(line)
+                                    else:
+                                        # Plain text source
+                                        if line not in all_sources:
+                                            all_sources.append(line)
+                        
+                        # Remove all sources sections and add single deduplicated one at the end
+                        for match in reversed(sources_matches):
+                            chapter_content = chapter_content[:match.start()] + chapter_content[match.end():]
+                        
+                        # Add single deduplicated sources section at the end
+                        if all_sources:
+                            chapter_content = chapter_content.rstrip() + f"\n\n## Sources\n\n" + "\n".join(all_sources) + "\n"
+                    
                     chapters_text.append(f"""## Chapter {chapter_num}: {chapter_data['title']}
 
-{chapter_data['content']}
+{chapter_content}
 """)
                     chapter_num += 1
                 
-                # CRITICAL: Simple, clean structure - just chapters, no metadata, no overview
-                draft_report = f"""# Research Report: {query}
-
-{''.join(chapters_text)}
+                # CRITICAL: Simple, clean structure - just chapters, no metadata, no overview, no "Research Report Draft" header
+                # This will be used directly as final report, so no metadata needed
+                draft_report = f"""{''.join(chapters_text)}
 """
                 logger.info("Cleaned draft report", 
                           original_length=len(draft_report_raw),
@@ -2859,15 +3485,46 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
                           chapters_count=len(chapters),
                           removed_duplicates=True)
             else:
-                # No chapters found, use original
-                draft_report = draft_report_raw
-                logger.warning("No chapters found in draft_report, using original", length=len(draft_report))
+                # No chapters found - check if original has substantial content
+                # CRITICAL: If original is only initial structure or very short, it means supervisor didn't write chapters
+                # But if original has substantial content (even without "Chapter" format), use it
+                initial_structure_indicators = [
+                    "## Overview",
+                    "This is the working draft",
+                    "Status: In Progress",
+                    "**Started:**"
+                ]
+                has_only_initial_structure = any(indicator in draft_report_raw for indicator in initial_structure_indicators) and len(draft_report_raw) < 500
+                
+                if has_only_initial_structure:
+                    # Only initial structure found - supervisor didn't write chapters
+                    logger.warning("No chapters found in draft_report and only initial structure present - supervisor may not have called write_draft_report",
+                                 original_length=len(draft_report_raw),
+                                 findings_count=len(findings),
+                                 note="Will create draft from findings if available")
+                    draft_report = ""  # Mark as empty to trigger fallback
+                else:
+                    # Original has content even without "Chapter" format - use it
+                    draft_report = draft_report_raw
+                    logger.warning("No chapters found in draft_report but original has content, using original", 
+                                 original_length=len(draft_report_raw),
+                                 note="Draft may not follow Chapter format but has content")
             
             # CRITICAL: Check if draft report is properly filled
             # If draft report is too short or empty, create it from all findings
-            if len(draft_report) < 1000:
-                logger.warning("Draft report is too short or empty - creating comprehensive draft from all findings", 
-                             draft_length=len(draft_report), findings_count=len(findings))
+            # BUT: Only do fallback if draft_report is truly empty or very short
+            # If supervisor wrote content but it's just under 1000 chars, that's still valid
+            if not draft_report or len(draft_report.strip()) < 500:
+                # CRITICAL: This is a fallback - supervisor should have written to draft_report
+                logger.error("CRITICAL: Draft report is too short or empty - FALLBACK TRIGGERED!", 
+                           draft_length=len(draft_report) if draft_report else 0,
+                           findings_count=len(findings),
+                           original_length=len(draft_report_raw) if 'draft_report_raw' in locals() else 0,
+                           chapters_found=len(chapters) if 'chapters' in locals() else 0,
+                           note="This indicates supervisor may not have called write_draft_report or wrote insufficient content")
+                logger.warning("Creating comprehensive draft from all findings as fallback", 
+                             draft_length=len(draft_report) if draft_report else 0, 
+                             findings_count=len(findings))
                 
                 # Create comprehensive draft report from ALL findings (no truncation)
                 from datetime import datetime
@@ -2875,27 +3532,57 @@ async def generate_final_report_enhanced_node(state: Dict[str, Any]) -> Dict[str
                 
                 findings_sections = []
                 for f in findings:
+                    # CRITICAL: Extract ALL information from finding - no truncation, no loss
                     full_summary = f.get('summary', 'No summary')
                     all_key_findings = f.get('key_findings', [])
                     sources = f.get('sources', [])
+                    # Get additional fields that might contain important information
+                    detailed_analysis = f.get('detailed_analysis', '')
+                    methodology = f.get('methodology', '')
+                    conclusions = f.get('conclusions', '')
+                    topic = f.get('topic', 'Unknown Topic')
+                    agent_id = f.get('agent_id', 'unknown')
+                    confidence = f.get('confidence', 'unknown')
                     
-                    findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
-
-**Agent:** {f.get('agent_id', 'unknown')}
-**Confidence:** {f.get('confidence', 'unknown')}
-
-### Summary
-
-{full_summary}
-
-### Key Findings
-
-{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
-
-### Sources ({len(sources)})
-
-{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:20]]) if sources else "No sources"}
-""")
+                    # Build comprehensive section with ALL available information
+                    section_parts = [f"## {topic}"]
+                    
+                    # Add metadata
+                    section_parts.append(f"\n**Agent:** {agent_id}")
+                    section_parts.append(f"**Confidence:** {confidence}")
+                    
+                    # Add summary (full, not truncated)
+                    section_parts.append(f"\n### Summary\n\n{full_summary}")
+                    
+                    # Add detailed analysis if available
+                    if detailed_analysis and detailed_analysis.strip():
+                        section_parts.append(f"\n### Detailed Analysis\n\n{detailed_analysis}")
+                    
+                    # Add methodology if available
+                    if methodology and methodology.strip():
+                        section_parts.append(f"\n### Methodology\n\n{methodology}")
+                    
+                    # Add key findings (all of them, not truncated)
+                    if all_key_findings:
+                        # CRITICAL: Extract list comprehension outside f-string to avoid syntax errors
+                        key_findings_list = [f"- {kf}" for kf in all_key_findings]
+                        section_parts.append(f"\n### Key Findings\n\n{chr(10).join(key_findings_list)}")
+                    else:
+                        section_parts.append("\n### Key Findings\n\nNo key findings listed")
+                    
+                    # Add conclusions if available
+                    if conclusions and conclusions.strip():
+                        section_parts.append(f"\n### Conclusions\n\n{conclusions}")
+                    
+                    # Add sources (all of them, not just first 20)
+                    if sources:
+                        # CRITICAL: Extract list comprehension outside f-string to avoid syntax errors
+                        sources_list = [f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources]
+                        section_parts.append(f"\n### Sources ({len(sources)})\n\n{chr(10).join(sources_list)}")
+                    else:
+                        section_parts.append("\n### Sources\n\nNo sources listed")
+                    
+                    findings_sections.append("\n".join(section_parts) + "\n")
                 
                 findings_text = "\n\n".join(findings_sections)
                 
@@ -2926,7 +3613,12 @@ Research completed with {len(findings)} findings from multiple agents covering v
             else:
                 logger.info("Draft report contains comprehensive research", draft_length=len(draft_report))
         except FileNotFoundError:
-            logger.warning("Draft report not found - MANDATORY: creating comprehensive draft from all findings", findings_count=len(findings))
+            # CRITICAL: Draft report doesn't exist - this means supervisor NEVER called write_draft_report
+            # This is a serious error - supervisor should have written to draft_report
+            logger.error("CRITICAL: Draft report not found - supervisor never created draft_report.md!", 
+                       findings_count=len(findings),
+                       note="This indicates supervisor did not call write_draft_report - this should not happen!")
+            logger.warning("MANDATORY: creating comprehensive draft from all findings as fallback", findings_count=len(findings))
             if stream:
                 stream.emit_status("Creating draft report from all findings...", step="report")
             
@@ -2936,27 +3628,57 @@ Research completed with {len(findings)} findings from multiple agents covering v
             
             findings_sections = []
             for f in findings:
+                # CRITICAL: Extract ALL information from finding - no truncation, no loss
                 full_summary = f.get('summary', 'No summary')
                 all_key_findings = f.get('key_findings', [])
                 sources = f.get('sources', [])
+                # Get additional fields that might contain important information
+                detailed_analysis = f.get('detailed_analysis', '')
+                methodology = f.get('methodology', '')
+                conclusions = f.get('conclusions', '')
+                topic = f.get('topic', 'Unknown Topic')
+                agent_id = f.get('agent_id', 'unknown')
+                confidence = f.get('confidence', 'unknown')
                 
-                findings_sections.append(f"""## {f.get('topic', 'Unknown Topic')}
-
-**Agent:** {f.get('agent_id', 'unknown')}
-**Confidence:** {f.get('confidence', 'unknown')}
-
-### Summary
-
-{full_summary}
-
-### Key Findings
-
-{chr(10).join([f"- {kf}" for kf in all_key_findings]) if all_key_findings else "No key findings"}
-
-### Sources ({len(sources)})
-
-{chr(10).join([f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources[:20]]) if sources else "No sources"}
-""")
+                # Build comprehensive section with ALL available information
+                section_parts = [f"## {topic}"]
+                
+                # Add metadata
+                section_parts.append(f"\n**Agent:** {agent_id}")
+                section_parts.append(f"**Confidence:** {confidence}")
+                
+                # Add summary (full, not truncated)
+                section_parts.append(f"\n### Summary\n\n{full_summary}")
+                
+                # Add detailed analysis if available
+                if detailed_analysis and detailed_analysis.strip():
+                    section_parts.append(f"\n### Detailed Analysis\n\n{detailed_analysis}")
+                
+                # Add methodology if available
+                if methodology and methodology.strip():
+                    section_parts.append(f"\n### Methodology\n\n{methodology}")
+                
+                # Add key findings (all of them, not truncated)
+                if all_key_findings:
+                    # CRITICAL: Extract list comprehension outside f-string to avoid syntax errors
+                    key_findings_list = [f"- {kf}" for kf in all_key_findings]
+                    section_parts.append(f"\n### Key Findings\n\n{chr(10).join(key_findings_list)}")
+                else:
+                    section_parts.append("\n### Key Findings\n\nNo key findings listed")
+                
+                # Add conclusions if available
+                if conclusions and conclusions.strip():
+                    section_parts.append(f"\n### Conclusions\n\n{conclusions}")
+                
+                # Add sources (all of them, not just first 20)
+                if sources:
+                    # CRITICAL: Extract list comprehension outside f-string to avoid syntax errors
+                    sources_list = [f"- {s.get('title', 'Unknown')}: {s.get('url', 'N/A')}" for s in sources]
+                    section_parts.append(f"\n### Sources ({len(sources)})\n\n{chr(10).join(sources_list)}")
+                else:
+                    section_parts.append("\n### Sources\n\nNo sources listed")
+                
+                findings_sections.append("\n".join(section_parts) + "\n")
             
             findings_text = "\n\n".join(findings_sections)
             

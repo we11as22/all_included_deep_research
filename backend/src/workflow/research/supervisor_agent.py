@@ -247,7 +247,26 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
         content = args.get("content", "")
         # Support both chapter_title and section_title (for backward compatibility)
         chapter_title = args.get("chapter_title") or args.get("section_title", "Chapter")
-        finding_data = args.get("finding", None)  # Optional: full finding data for chapter summary
+        finding_data_raw = args.get("finding", None)  # Optional: full finding data for chapter summary
+        
+        # CRITICAL: Ensure finding_data is a dict, not a string
+        finding_data = None
+        if finding_data_raw:
+            if isinstance(finding_data_raw, dict):
+                finding_data = finding_data_raw
+            elif isinstance(finding_data_raw, str):
+                # Try to parse JSON string if it's a string
+                try:
+                    import json
+                    finding_data = json.loads(finding_data_raw)
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("finding_data is a string but not valid JSON, treating as None",
+                                 finding_data_preview=finding_data_raw[:100] if finding_data_raw else None)
+                    finding_data = None
+            else:
+                logger.warning("finding_data has unexpected type, treating as None",
+                             finding_data_type=type(finding_data_raw).__name__)
+                finding_data = None
         
         # CRITICAL: Log context for debugging
         logger.info("write_draft_report called - context available",
@@ -258,7 +277,8 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                    clarification_length=len(clarification_context) if clarification_context else 0,
                    clarification_preview=clarification_context[:200] if clarification_context else "None",
                    existing_chapters=len(chapter_summaries),
-                   chapter_summaries_preview=[ch.get("chapter_title", "Unknown") for ch in chapter_summaries[-5:]],
+                   chapter_summaries_preview=[ch.get("chapter_title", "Unknown") if isinstance(ch, dict) else str(ch)[:50] for ch in chapter_summaries[-5:]],
+                   finding_data_type=type(finding_data).__name__ if finding_data else "None",
                    note="Supervisor has access to: query, deep_search, clarification, existing chapters - use this to write adapted chapter")
         
         # CRITICAL: Build context summary for supervisor to see when writing chapter
@@ -270,10 +290,10 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
             "existing_chapters_count": len(chapter_summaries),
             "existing_chapters_summaries": [
                 {
-                    "chapter_number": ch.get("chapter_number"),
-                    "chapter_title": ch.get("chapter_title"),
-                    "topic": ch.get("topic"),
-                    "summary_preview": ch.get("summary", "")[:200]
+                    "chapter_number": ch.get("chapter_number") if isinstance(ch, dict) else None,
+                    "chapter_title": ch.get("chapter_title", "Unknown") if isinstance(ch, dict) else str(ch)[:50],
+                    "topic": ch.get("topic", "Unknown") if isinstance(ch, dict) else None,
+                    "summary_preview": ch.get("summary", "")[:200] if isinstance(ch, dict) else ""
                 }
                 for ch in chapter_summaries[-5:]  # Last 5 chapters
             ]
@@ -285,40 +305,203 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
             current = await agent_memory_service.file_manager.read_file(draft_file)
         except FileNotFoundError:
             # Create initial draft report with structure for chapters
+            # CRITICAL: Use datetime from module-level import, not local variable
             query = context.get('query', 'Unknown')
-            current = f"""# Research Report Draft
-
-**Query:** {query}
-**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-**Status:** In Progress
-
-## Overview
-
-This is the working draft of the research report. Each chapter represents findings from one agent task.
-
----
-"""
+            from datetime import datetime as dt_module
+            # CRITICAL: Create clean draft report WITHOUT metadata - just start with chapters
+            # Metadata will be removed from final report anyway
+            current = ""
         
         # Create new chapter (not just a section update)
         # CRITICAL: Simple structure - just chapter title and content, no metadata
-        chapter_number = current.count("## Chapter") + 1  # Count existing chapters
+        # CRITICAL: Parse existing chapters to find maximum chapter number (not just count)
+        # This prevents duplicate chapter numbers when multiple agents write simultaneously
+        # NOTE: Regex is used ONLY for numbering, NOT for duplicate detection
+        # Duplicate detection is done via chapter_summaries (primary) and draft_report.md (fallback)
+        import re
+        chapter_pattern = r'##\s+Chapter\s+(\d+):'
+        existing_chapter_numbers = []
+        for match in re.finditer(chapter_pattern, current):
+            chapter_num = int(match.group(1))
+            existing_chapter_numbers.append(chapter_num)
         
-        # Extract sources from finding_data if available, add at end of chapter
+        # Also check for "# Chapter" format (single #) for numbering
+        single_hash_pattern = r'#\s+Chapter\s+(\d+):'
+        for match in re.finditer(single_hash_pattern, current):
+            chapter_num = int(match.group(1))
+            existing_chapter_numbers.append(chapter_num)
+        
+        # CRITICAL: Check for duplicate chapter titles
+        # Primary check: chapter_summaries (automatically provided to supervisor)
+        # Fallback check: current draft_report.md (in case chapter_summaries are not updated yet)
+        chapter_title_normalized = chapter_title.strip().lower()
+        
+        # Check chapter_summaries first
+        if chapter_summaries:
+            for ch in chapter_summaries:
+                if isinstance(ch, dict):
+                    existing_title = ch.get("chapter_title", "").strip().lower()
+                    if existing_title and existing_title == chapter_title_normalized:
+                        logger.warning("Chapter with this title already exists in chapter_summaries - skipping duplicate",
+                                     chapter_title=chapter_title,
+                                     existing_title=ch.get("chapter_title", "Unknown"),
+                                     note="Supervisor has access to existing chapters and should not add duplicates")
+                        return {
+                            "success": False,
+                            "message": f"Chapter '{chapter_title}' already exists in draft report. Check chapter_summaries before adding new chapters.",
+                            "chapter_number": None,
+                        }
+        
+        # Fallback: Check current draft_report.md directly (in case chapter_summaries are not updated)
+        # This is a safety check - chapter_summaries should be the primary source
+        if current:
+            # Simple check: if chapter title appears in draft_report, it's likely a duplicate
+            # Check for "## Chapter N: {chapter_title}" pattern
+            title_in_draft = chapter_title_normalized in current.lower()
+            if title_in_draft:
+                # More precise check: look for chapter header with this title
+                title_pattern_check = re.compile(r'##\s+Chapter\s+\d+:\s+([^\n]+)', re.IGNORECASE)
+                for match in title_pattern_check.finditer(current):
+                    existing_title_in_draft = match.group(1).strip().lower()
+                    if existing_title_in_draft == chapter_title_normalized:
+                        logger.warning("Chapter with this title already exists in draft_report.md - skipping duplicate",
+                                     chapter_title=chapter_title,
+                                     note="Fallback check: found duplicate in draft_report.md even though not in chapter_summaries")
+                        return {
+                            "success": False,
+                            "message": f"Chapter '{chapter_title}' already exists in draft report. Check chapter_summaries before adding new chapters.",
+                            "chapter_number": None,
+                        }
+        
+        # Get next chapter number (max + 1, or 1 if no chapters exist)
+        if existing_chapter_numbers:
+            chapter_number = max(existing_chapter_numbers) + 1
+        else:
+            chapter_number = 1
+        
+        logger.info("Calculated chapter number",
+                   existing_chapters=existing_chapter_numbers,
+                   next_chapter=chapter_number,
+                   chapter_summaries_count=len(chapter_summaries),
+                   note="Parsed existing chapters to find max number, checked for duplicates via chapter_summaries")
+        
+        # CRITICAL: Extract sources from finding_data if available, add at end of chapter
+        # If finding_data not provided or doesn't have sources, try to find finding in state's findings
         sources_section = ""
-        if finding_data and finding_data.get("sources"):
+        sources = []
+        
+        # First, try to get sources from finding_data
+        if finding_data and isinstance(finding_data, dict) and finding_data.get("sources"):
             sources = finding_data.get("sources", [])
+            logger.info("Found sources in finding_data",
+                       sources_count=len(sources),
+                       chapter_title=chapter_title)
+        else:
+            # Fallback: try to find finding in state's findings by matching topic/chapter_title
+            # This ensures sources are added even if supervisor didn't pass finding parameter
+            findings_from_state = context.get("findings", [])
+            if findings_from_state:
+                # First, try to match by topic or chapter_title (exact or partial match)
+                matched_finding = None
+                for f in findings_from_state:
+                    if isinstance(f, dict):
+                        finding_topic = f.get("topic", "")
+                        finding_title = f.get("title", "")
+                        # Match if topic or title matches chapter_title (case-insensitive, partial match)
+                        if (finding_topic and chapter_title and 
+                            (finding_topic.lower() in chapter_title.lower() or 
+                             chapter_title.lower() in finding_topic.lower())) or \
+                           (finding_title and chapter_title and 
+                            (finding_title.lower() in chapter_title.lower() or 
+                             chapter_title.lower() in finding_title.lower())):
+                            if f.get("sources"):
+                                matched_finding = f
+                                logger.info("Found sources in state findings by matching topic/title",
+                                           sources_count=len(f.get("sources", [])),
+                                           chapter_title=chapter_title,
+                                           finding_topic=finding_topic,
+                                           note="Sources extracted from state findings as fallback")
+                                break
+                
+                # If no match found, try to find any finding with sources that hasn't been added yet
+                # Check if this finding's topic is already in draft_report as a chapter
+                if not matched_finding:
+                    try:
+                        current_draft = await agent_memory_service.file_manager.read_file("draft_report.md")
+                        for f in findings_from_state:
+                            if isinstance(f, dict) and f.get("sources"):
+                                finding_topic = f.get("topic", "")
+                                # Check if this finding's topic is already in draft_report
+                                if finding_topic and finding_topic not in current_draft:
+                                    matched_finding = f
+                                    logger.info("Found sources in state findings (finding not yet added as chapter)",
+                                               sources_count=len(f.get("sources", [])),
+                                               chapter_title=chapter_title,
+                                               finding_topic=finding_topic,
+                                               note="Using first finding with sources that hasn't been added yet")
+                                    break
+                    except Exception as e:
+                        logger.warning("Failed to check draft_report for finding matching", error=str(e))
+                
+                if matched_finding and matched_finding.get("sources"):
+                    sources = matched_finding.get("sources", [])
+        
+        # Format sources section
+        # CRITICAL: Deduplicate sources by URL to prevent duplicate sources in the same chapter
+        if sources:
+            seen_source_urls = set()
             sources_list = []
             for source in sources[:30]:  # Limit to 30 sources per chapter
-                title = source.get("title", "Unknown")
-                url = source.get("url", "")
-                if url:
-                    sources_list.append(f"- [{title}]({url})")
-                else:
-                    sources_list.append(f"- {title}")
+                # Ensure source is a dict before calling .get()
+                if isinstance(source, dict):
+                    title = source.get("title", "Unknown")
+                    url = source.get("url", "")
+                    # Normalize URL for deduplication (lowercase, strip trailing slashes)
+                    url_normalized = url.lower().rstrip('/') if url else ""
+                    
+                    # Skip if we've already seen this URL
+                    if url_normalized and url_normalized in seen_source_urls:
+                        continue
+                    
+                    if url_normalized:
+                        seen_source_urls.add(url_normalized)
+                    
+                    if url:
+                        sources_list.append(f"- [{title}]({url})")
+                    else:
+                        # Also check for duplicate titles if no URL
+                        existing_titles = [s.split(']')[0].replace('- [', '').lower() for s in sources_list]
+                        if title.lower() not in existing_titles:
+                            sources_list.append(f"- {title}")
+                elif isinstance(source, str):
+                    # If source is a string (URL), check for duplicates
+                    url_normalized = source.lower().rstrip('/')
+                    if url_normalized not in seen_source_urls:
+                        seen_source_urls.add(url_normalized)
+                        sources_list.append(f"- {source}")
+            
             if sources_list:
                 sources_section = f"\n\n## Sources\n\n" + "\n".join(sources_list) + "\n"
+                logger.info("Sources section created",
+                           sources_count=len(sources_list),
+                           original_sources_count=len(sources),
+                           chapter_title=chapter_title,
+                           note="Sources deduplicated and added at end of chapter")
+            else:
+                logger.warning("Sources list is empty after formatting and deduplication",
+                             sources_count=len(sources),
+                             chapter_title=chapter_title)
+        else:
+            logger.warning("No sources found for chapter",
+                         chapter_title=chapter_title,
+                         finding_data_provided=bool(finding_data),
+                         finding_data_has_sources=bool(finding_data and isinstance(finding_data, dict) and finding_data.get("sources")),
+                         note="Sources will NOT be added to this chapter")
         
         # Format chapter with clean structure - no metadata, just title, content, and sources
+        # CRITICAL: Use ONLY "## Chapter N: Title" format (two #, not one #)
+        # This is the ONLY allowed format - no variations!
+        # Sources are added automatically at the end - LLM is instructed not to write them in content
         chapter = f"""
 
 ---
@@ -348,15 +531,18 @@ This is the working draft of the research report. Each chapter represents findin
                     current_metadata["chapter_summaries"] = []
                 
                 # Create chapter summary (full, not heavily truncated)
+                # CRITICAL: datetime is already imported at module level, use it directly
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
                 chapter_summary = {
                     "chapter_number": chapter_number,
                     "chapter_title": chapter_title,
                     "timestamp": timestamp,
-                    "agent_id": finding_data.get("agent_id", "unknown") if finding_data else "unknown",
-                    "topic": finding_data.get("topic", chapter_title) if finding_data else chapter_title,
-                    "summary": finding_data.get("summary", content[:500]) if finding_data else content[:500],
-                    "key_findings": finding_data.get("key_findings", [])[:10] if finding_data else [],  # First 10 key findings
-                    "sources_count": len(finding_data.get("sources", [])) if finding_data else 0,
+                    "agent_id": finding_data.get("agent_id", "unknown") if finding_data and isinstance(finding_data, dict) else "unknown",
+                    "topic": finding_data.get("topic", chapter_title) if finding_data and isinstance(finding_data, dict) else chapter_title,
+                    "summary": finding_data.get("summary", content[:500]) if finding_data and isinstance(finding_data, dict) else content[:500],
+                    "key_findings": finding_data.get("key_findings", [])[:10] if finding_data and isinstance(finding_data, dict) else [],  # First 10 key findings
+                    "sources_count": len(finding_data.get("sources", [])) if finding_data and isinstance(finding_data, dict) else 0,
                     "content_preview": content[:1000]  # First 1000 chars of content
                 }
                 
@@ -1009,6 +1195,16 @@ class SupervisorToolsRegistry:
                           "**CRITICAL**: Write DETAILED content based on the finding - include specific facts, dates, numbers, technical details from the finding. "
                           "DO NOT write brief summaries - write FULL, DETAILED chapter with extensive information from the finding. "
                           "Each chapter should be substantial (500-1500 words) and cover the finding comprehensively. "
+                          "**CRITICAL FORMAT REQUIREMENT**: Chapter format is STRICTLY '## Chapter N: Title' (two #, space, Chapter, space, number, colon, space, title). "
+                          "**FORBIDDEN**: Do NOT use '# Chapter' (single #) or any other format - ONLY '## Chapter N: Title'. "
+                          "**FORBIDDEN**: Do NOT add multiple titles for the same chapter - use ONLY '## Chapter N: Title' format, no additional '# Chapter' or '## Title' lines. "
+                          "**MANDATORY**: You have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE calling this tool to ensure the chapter title doesn't already exist. If it exists, do NOT add it again - the tool will return an error if you try to add a duplicate. "
+                          "**CRITICAL MARKDOWN FORMAT**: Use proper markdown formatting: '##' for chapter titles (already added automatically), '###' for subsections, '**bold**' for emphasis, '*italic*' for emphasis, '-' for lists, '[text](url)' for links. "
+                          "**CRITICAL SOURCES RULE**: Sources are added AUTOMATICALLY at the end of each chapter with clickable links in format '- [Title](URL)'. "
+                          "**FORBIDDEN**: Do NOT write sources, references, links, or '## Sources' sections in your content - they are automatically added from finding data. "
+                          "**FORBIDDEN**: Do NOT include any source lists, reference sections, citation lists, or links in the chapter content. "
+                          "**FORBIDDEN**: Do NOT add duplicate sources with the same URL - sources are automatically deduplicated. "
+                          "Focus ONLY on writing the chapter content itself - sources will be added automatically. "
                           "**CONTEXT FOR WRITING**: When you call this tool, you have access to: "
                           "1) Original user query (to understand the research goal), "
                           "2) Deep search result (initial context from deep search), "
@@ -1021,11 +1217,11 @@ class SupervisorToolsRegistry:
                 "properties": {
                     "content": {
                         "type": "string",
-                        "description": "Chapter content based on the finding (markdown format, comprehensive and detailed)"
+                        "description": "Chapter content based on the finding (markdown format, comprehensive and detailed, 1000-2500 words). Use proper markdown: ### for subsections, **bold** for emphasis, *italic* for emphasis, - for lists. **CRITICAL**: Sources are added AUTOMATICALLY at the end of the chapter with clickable links in format '- [Title](URL)'. **FORBIDDEN**: Do NOT write sources, references, or links in the content - they will be automatically added from the finding data. Do NOT include '## Sources', '## References', or any source lists in your content."
                     },
                     "chapter_title": {
                         "type": "string",
-                        "description": "Title for this chapter based on the finding topic (e.g., 'Historical Analysis of Topic X', 'Technical Specifications of Y'). REQUIRED."
+                        "description": "Title for this chapter based on the finding topic (e.g., 'Historical Analysis of Topic X', 'Technical Specifications of Y'). REQUIRED. **CRITICAL**: You have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE calling this tool to ensure this chapter title doesn't already exist. If it exists, do NOT add it again - the tool will return an error if you try to add a duplicate."
                     },
                     "section_title": {
                         "type": "string",
@@ -1375,7 +1571,42 @@ async def run_supervisor_agent(
                query=query[:100] if query else None,
                query_length=len(query) if query else 0,
                has_clarification_context=bool(state.get("clarification_context", "")))
+    
+    # CRITICAL: Extract findings from supervisor_queue if provided
+    # This ensures supervisor sees findings even if they're only in queue
     findings = state.get("findings", state.get("agent_findings", []))
+    if supervisor_queue and supervisor_queue.size() > 0:
+        # Extract findings from queue events
+        queue_findings = []
+        temp_events = []
+        queue_size = supervisor_queue.size()
+        for _ in range(queue_size):
+            try:
+                event = supervisor_queue.queue.get_nowait()
+                temp_events.append(event)
+                if event.result:
+                    queue_findings.append(event.result)
+            except:
+                break
+        
+        # Put events back (they'll be processed properly)
+        for event in temp_events:
+            await supervisor_queue.queue.put(event)
+        
+        # Combine with existing findings (avoid duplicates)
+        if queue_findings:
+            for new_finding in queue_findings:
+                finding_already_exists = any(
+                    f.get("topic") == new_finding.get("topic") and 
+                    f.get("agent_id") == new_finding.get("agent_id")
+                    for f in findings
+                )
+                if not finding_already_exists:
+                    findings.append(new_finding)
+            
+            logger.info(f"Extracted {len(queue_findings)} findings from supervisor_queue",
+                       total_findings=len(findings),
+                       note="Supervisor will process these findings")
     agent_characteristics = state.get("agent_characteristics", {})
     research_plan = state.get("research_plan", {})
     iteration = state.get("iteration", 0)
@@ -1632,7 +1863,15 @@ async def run_supervisor_agent(
                chat_history_length=len(chat_history) if chat_history else 0)
     
     # Create supervisor prompt
+    # CRITICAL: Include current date and time for supervisor context
+    from datetime import datetime
+    current_date = datetime.now().strftime("%B %d, %Y")
+    current_time = datetime.now().strftime("%H:%M:%S")
+    
     system_prompt = f"""You are the research supervisor coordinating a team of researcher agents.
+
+Current date: {current_date}
+Current time: {current_time}
 
 **CRITICAL: LANGUAGE REQUIREMENT**
 - **MANDATORY**: You MUST write all content (notes, draft_report.md, todos, directives) in {user_language}
@@ -1753,7 +1992,7 @@ Available tools:
 - write_draft_report: **PRIMARY TOOL** - Add a new CHAPTER to draft_report.md based on a finding from an agent. 
   * CRITICAL: Draft report is structured by chapters - each chapter = one finding from one agent task
   * When you receive a finding from an agent (in the findings list below), you MUST add it as a new chapter
-  * Write comprehensive, detailed content (500-1500 words) based on the finding
+  * Write comprehensive, detailed content (1000-2500 words) based on the finding - chapters must be FULL and DETAILED
   * Include ALL details, facts, data, and evidence from the finding
   * Use chapter_title based on the finding topic
   * Pass the full finding data in the "finding" parameter for chapter summary storage
@@ -1784,13 +2023,29 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
 3. **For each NEW finding** (not yet added to draft_report as a chapter):
    - **Call write_draft_report** to add it as a new chapter
    - Use chapter_title based on the finding topic (e.g., "Technical Analysis of X", "Historical Context of Y")
-   - Write comprehensive content (500-1500 words) based on ALL information from the finding
+   - Write comprehensive content (1000-2500 words) based on ALL information from the finding - chapters must be FULL and DETAILED, not brief summaries
    - Include: summary, key findings, sources, analysis, and synthesis
    - Pass the full finding data in the "finding" parameter for chapter summary storage
    - **CRITICAL**: Each finding MUST become a separate chapter - do NOT combine multiple findings into one chapter
+   - **CRITICAL FORMAT REQUIREMENT**: Chapter format is STRICTLY "## Chapter N: Title" (two #, space, Chapter, space, number, colon, space, title)
+   - **FORBIDDEN**: Do NOT use "# Chapter" (single #) or any other format - ONLY "## Chapter N: Title"
+   - **FORBIDDEN**: Do NOT add duplicate chapters - you have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE adding a new chapter to ensure it doesn't already exist. If a chapter with the same title already exists, do NOT add it again.
+   - **FORBIDDEN**: Do NOT add multiple titles for the same chapter - use ONLY "## Chapter N: Title" format, no additional "# Chapter" or "## Title" lines
+   - **CRITICAL MARKDOWN FORMAT REQUIREMENTS**:
+     * Use proper markdown formatting: `##` for chapter titles, `###` for subsections, `**bold**` for emphasis, `*italic*` for emphasis
+     * Chapter content should use proper markdown: paragraphs separated by blank lines, lists with `-` or `*`, code blocks with triple backticks
+     * **CRITICAL SOURCES RULE**: Sources are added AUTOMATICALLY at the end of each chapter with clickable links in format `- [Title](URL)`
+     * **FORBIDDEN**: Do NOT write sources, references, links, or "## Sources" sections in your content - they are automatically added from finding data
+     * **FORBIDDEN**: Do NOT include any source lists, reference sections, or citation lists in the chapter content
+     * Sources are extracted from the finding and formatted automatically - you should focus only on writing the chapter content itself
 4. **Write YOUR notes** - use write_supervisor_note for personal observations
 5. **CRITICAL: Add ALL findings as chapters** - if you don't add findings as chapters, information will be lost!
 6. **After adding chapters**, review agent progress and create new todos if needed
+   - **CRITICAL**: If you see gaps in research coverage or aspects of the query that aren't being researched, you MUST add new tasks!
+   - **Check**: Does the current research fully cover the user's query "{query}"? If not, add tasks to fill gaps!
+   - **Check**: Are there important aspects, subtopics, or angles that agents haven't covered yet? Add tasks for them!
+   - **Check**: Do agents need more specific guidance or refined objectives? Use update_agent_todo to improve existing tasks!
+   - **MANDATORY**: You MUST actively identify and add tasks if research is incomplete - don't wait for agents to finish everything!
 4. Add only KEY INSIGHTS to main.md (not all items - items stay in items/ directory) - ONLY essential shared information
 5. Check each agent's progress - ensure they cover DIFFERENT aspects
 6. **CRITICAL**: 
@@ -1818,6 +2073,12 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
    - **FORBIDDEN**: Do NOT create generic tasks like "History of technology" when user asked about "Soviet carrier aviation" - always relate to the specific query!
    - **FORBIDDEN**: Do NOT create agent_4, agent_5, etc. - you have exactly {max_agents} agents (agent_1 to agent_{max_agents}). Use existing agents!
 7. **MANDATORY: You MUST call at least ONE tool on EVERY iteration** - never return empty tool_calls!
+   - **CRITICAL**: If you return empty tool_calls, the system will fail and research will stop!
+   - **ALWAYS call at least ONE of these tools**: write_draft_report, create_agent_todo, update_agent_todo, make_final_decision, read_draft_report, review_agent_progress
+   - **If you see findings that need to be added as chapters**: Call write_draft_report
+   - **If you see gaps in research that need more tasks**: Call create_agent_todo or update_agent_todo
+   - **If all findings are processed and tasks are done**: Call make_final_decision with decision="finish"
+   - **NEVER return without calling at least one tool!**
    - If you need to review: call read_draft_report (see RAW findings), read_main_document, or review_agent_progress
    - **After reviewing RAW FINDINGS, you MUST call update_synthesized_report** to synthesize them into structured report
    - If you need to update documents: call update_synthesized_report (primary), write_main_document, or write_supervisor_note
@@ -1977,7 +2238,7 @@ Current findings from agents (last 10, summarized):
 - Draft report is structured by chapters - one chapter = one finding
 - You MUST call write_draft_report for each NEW finding to add it as a chapter
 - Read draft_report.md first to see which findings are already added as chapters
-- For each finding NOT yet in draft_report, add it as a new chapter with comprehensive content (500-1500 words)
+- For each finding NOT yet in draft_report, add it as a new chapter with comprehensive content (1000-2500 words) - chapters must be FULL and DETAILED, not brief summaries
 - Pass the full finding data in the "finding" parameter when calling write_draft_report
 
 **CONTEXT AVAILABLE WHEN WRITING CHAPTERS** (use this when calling write_draft_report):
@@ -1998,7 +2259,11 @@ Current findings from agents (last 10, summarized):
   * Avoids repetition of information already in existing chapters
   * Preserves ALL details, facts, and data from the finding (NO information loss)
   * Integrates smoothly with the rest of the draft report
+  * **CRITICAL: Chapters must be FULL and DETAILED (1000-2500 words), not brief summaries!**
+  * Include ALL information from the finding: full summary, all key findings, detailed analysis, methodology, conclusions
+  * Expand on the finding with context, examples, and synthesis - don't just copy the finding text
 - DO NOT just copy the finding - adapt it to the research context while keeping all information
+- DO NOT write brief summaries - chapters must be comprehensive and detailed!
 
 {notes_section}
 
@@ -2304,6 +2569,14 @@ CRITICAL INSTRUCTIONS:
                     
                     # Add clarification_context to context
                     tool_context["clarification_context"] = state.get("clarification_context", "")
+                    
+                    # CRITICAL: Add findings to context for write_draft_report to extract sources
+                    # This allows write_draft_report to find sources even if finding parameter is not passed
+                    findings_from_state = state.get("findings", state.get("agent_findings", []))
+                    tool_context["findings"] = findings_from_state
+                    logger.debug("Added findings to tool_context",
+                               findings_count=len(findings_from_state),
+                               note="write_draft_report can use this to extract sources if finding parameter not provided")
                     
                     # Add chapter summaries to context (for write_draft_report to see existing chapters)
                     if tool_name == "write_draft_report" and tool_context.get("session_id") and tool_context.get("session_factory"):
@@ -2643,6 +2916,41 @@ Research completed with {len(findings)} findings from multiple agents covering v
                should_continue=final_decision["should_continue"],
                decision_made=decision_made,
                reasoning_preview=final_decision.get("reasoning", "")[:200])
+    
+    # CRITICAL: Update status after supervisor review completes
+    # This ensures frontend doesn't show stale "Supervisor reviewing iteration #1..." status
+    if stream:
+        if not final_decision.get("should_continue", False):
+            # Supervisor decided to finish
+            stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+        else:
+            # Supervisor decided to continue - check if there are pending tasks
+            if agent_file_service:
+                try:
+                    agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
+                    all_agent_ids = []
+                    for file_path in agent_files:
+                        agent_id = file_path.replace("agents/", "").replace(".md", "")
+                        if agent_id.startswith("agent_") and agent_id != "supervisor":
+                            all_agent_ids.append(agent_id)
+                    
+                    total_pending = 0
+                    for agent_id in all_agent_ids:
+                        agent_file = await agent_file_service.read_agent_file(agent_id)
+                        todos = agent_file.get("todos", [])
+                        pending_tasks = [t for t in todos if t.status == "pending"]
+                        in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+                        total_pending += len(pending_tasks) + len(in_progress_tasks)
+                    
+                    if total_pending > 0:
+                        stream.emit_status(f"🚀 Agents continuing work ({total_pending} tasks remaining)", step="agents")
+                    else:
+                        stream.emit_status("🚀 Research continuing...", step="agents")
+                except Exception as e:
+                    logger.warning("Failed to check pending tasks for status update", error=str(e))
+                    stream.emit_status("🚀 Research continuing...", step="agents")
+            else:
+                stream.emit_status("🚀 Research continuing...", step="agents")
     
     return final_decision
 

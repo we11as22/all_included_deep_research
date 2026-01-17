@@ -22,7 +22,7 @@ class CitedAnswer(BaseModel):
 
     reasoning: str = Field(description="Why the sources support this answer")
     answer: str = Field(
-        description="Final answer with inline citations [1], [2], etc. in markdown format"
+        description="Final answer with inline citations [1], [2], etc. in markdown format. MUST use proper markdown: ## for main sections (NOT #), ### for subsections, **bold**, *italic*, lists, links. Do NOT use plain text with large letters - use markdown headings!"
     )
     citations: list[str] = Field(
         description="List of source URLs as strings: ['https://example.com', 'https://example2.com', ...]"
@@ -58,11 +58,16 @@ CRITICAL CITATION RULES:
 - Never make claims without sources
 - If sources conflict, mention both: "While [1] suggests X, [2] indicates Y"
 
-Formatting:
-- Use markdown: **bold**, *italic*, lists, headings
-- Structure with clear sections (##, ###)
-- Write like a knowledgeable blog post
+CRITICAL FORMATTING REQUIREMENTS:
+- You MUST use markdown formatting throughout your entire answer
+- Use ## for main sections, ### for subsections (NOT # for main title - start with ##)
+- Use **bold** for emphasis, *italic* for subtle emphasis
+- Use proper markdown lists (- for unordered, 1. for ordered)
+- Use proper markdown links: [text](url)
+- Structure with clear sections using markdown headings (##, ###)
+- Write like a knowledgeable blog post with proper markdown formatting
 - Be engaging but factual
+- CRITICAL: Your answer field MUST be valid markdown - use markdown syntax, not plain text!
 """
 
     if mode == "speed":
@@ -70,13 +75,14 @@ Formatting:
 MODE: SPEED
 
 Provide a complete, informative answer:
-- 400-600 words minimum
-- Focus on key points but cover them fully
+- 600-1000 words minimum (NOT 400-600 - be comprehensive!)
+- Focus on key points but cover them FULLY and in detail
 - Use ALL provided sources - each source has valuable information
-- Clear structure with sections
+- Clear structure with markdown sections (## for main sections, ### for subsections)
 - Still cite everything!
+- CRITICAL: Use proper markdown formatting - ## for sections, **bold**, *italic*, lists
 
-IMPORTANT: Don't just summarize snippets - synthesize information from ALL sources into a comprehensive answer.
+IMPORTANT: Don't just summarize snippets - synthesize information from ALL sources into a comprehensive answer with proper markdown formatting.
 """
 
     elif mode == "balanced":
@@ -84,15 +90,16 @@ IMPORTANT: Don't just summarize snippets - synthesize information from ALL sourc
 MODE: BALANCED
 
 Provide thorough, comprehensive coverage:
-- 800-1200 words minimum
-- Well-organized sections with clear structure
+- 1200-2000 words minimum (NOT 800-1200 - be comprehensive and detailed!)
+- Well-organized sections with clear markdown structure (## for main sections, ### for subsections)
 - Use ALL provided sources - synthesize information from each
-- Cover main aspects of the topic in depth
+- Cover main aspects of the topic in depth with full details
 - Include specific details, data, and examples from sources
 - Compare different perspectives if sources provide them
+- CRITICAL: Use proper markdown formatting throughout - ## for sections, **bold**, *italic*, lists, links
 
 IMPORTANT: You have many sources available - use them all! Don't just pick a few.
-Each source adds value - synthesize them into a complete picture.
+Each source adds value - synthesize them into a complete picture with proper markdown formatting.
 """
 
     else:  # quality
@@ -195,8 +202,48 @@ async def writer_agent(
         for i, src in enumerate(unique_sources)
     ])
 
+    # CRITICAL: Detect user language from query
+    def _detect_user_language(text: str) -> str:
+        """Detect user language from query text."""
+        if not text:
+            return "English"
+        try:
+            from langdetect import detect
+            detected = detect(text)
+            if detected == "ru":
+                return "Russian"
+            elif detected == "en":
+                return "English"
+            elif detected == "es":
+                return "Spanish"
+            elif detected == "fr":
+                return "French"
+            elif detected == "de":
+                return "German"
+            elif detected == "zh-cn" or detected == "zh-tw":
+                return "Chinese"
+            # Check for Cyrillic (Russian, Ukrainian, etc.)
+            if any('\u0400' <= char <= '\u04FF' for char in text):
+                return "Russian"
+            return "English"
+        except Exception:
+            # Fallback: check for Cyrillic
+            if any('\u0400' <= char <= '\u04FF' for char in text):
+                return "Russian"
+            return "English"
+    
+    user_language = _detect_user_language(query)
+    logger.info("Detected user language for writer", language=user_language, query_preview=query[:50])
+
     # Get writer prompt
     system_prompt = get_writer_prompt(mode)
+    
+    # CRITICAL: Add language instruction to system prompt
+    system_prompt += f"\n\nCRITICAL LANGUAGE REQUIREMENT:\n"
+    system_prompt += f"- Write your ENTIRE answer in {user_language}\n"
+    system_prompt += f"- All text, headings, citations, and sources section must be in {user_language}\n"
+    system_prompt += f"- Detect the language from the user's query and match it exactly\n"
+    system_prompt += f"- Do NOT mix languages - use ONLY {user_language} throughout the entire answer\n"
 
     # Build user prompt
     sources_count = len(unique_sources)
@@ -207,15 +254,32 @@ Research sources ({sources_count} sources provided - USE ALL OF THEM):
 
 Write a comprehensive answer with inline citations [1], [2], etc.
 
+CRITICAL LANGUAGE REQUIREMENT:
+- Write your ENTIRE answer in {user_language} (the same language as the query)
+- All text, headings, citations, and sources section must be in {user_language}
+- Do NOT mix languages - use ONLY {user_language}
+
+CRITICAL MARKDOWN FORMATTING REQUIREMENT:
+- Your answer field MUST be valid markdown with proper formatting
+- Use ## for main sections (NOT # - start with ##)
+- Use ### for subsections
+- Use **bold** for emphasis, *italic* for subtle emphasis
+- Use proper markdown lists (- for unordered, 1. for ordered)
+- Use proper markdown links: [text](url)
+- Structure with clear markdown sections - do NOT use plain text!
+- CRITICAL: Format your answer as markdown, not plain text with large letters!
+
 IMPORTANT INSTRUCTIONS:
 - Use information from ALL {sources_count} sources - each one has valuable content
 - Synthesize information from all sources into a coherent, complete answer
 - Don't just use the first few sources - leverage ALL available research
 - Include specific details, data, and examples from different sources
 - If sources provide different perspectives, present them all with citations
+- Be comprehensive and detailed - don't write brief summaries!
 
-Remember: CITE EVERY FACT. Return JSON with: reasoning, answer, citations (list of URL strings), confidence.
+Remember: CITE EVERY FACT. Return JSON with: reasoning, answer (MUST be valid markdown!), citations (list of URL strings), confidence.
 CRITICAL: citations must be a list of URL strings, e.g. ["https://example.com", "https://example2.com"]
+CRITICAL: answer field MUST contain properly formatted markdown, not plain text!
 """
 
     try:

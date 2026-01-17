@@ -211,6 +211,7 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
         "debug_mode": bool(getattr(app_request.app.state, "settings", None) and app_request.app.state.settings.debug_mode),
         "chat_id": request.chat_id,  # CRITICAL: Pass chat_id for saving messages to DB
         "session_factory": app_request.app.state.session_factory,  # For DB access
+        "embedding_provider": app_request.app.state.embedding_provider,  # CRITICAL: For generating embeddings for message search
     }
     stream_generator = ResearchStreamingGenerator(session_id=session_id, app_state=app_state)
 
@@ -668,7 +669,41 @@ async def stream_chat(request: ChatCompletionRequest, app_request: Request):
 
 
 def _chunk_text(text: str, size: int = 180) -> list[str]:
-    return [text[i : i + size] for i in range(0, len(text), size)]
+    """
+    Split text into chunks, trying to preserve markdown structure.
+    Prefers breaking at newlines or markdown boundaries.
+    """
+    if len(text) <= size:
+        return [text]
+    
+    chunks = []
+    i = 0
+    
+    while i < len(text):
+        # Try to find a good break point within the chunk size
+        chunk_end = min(i + size, len(text))
+        
+        # If we're not at the end, try to find a better break point
+        if chunk_end < len(text):
+            # Prefer breaking at newlines
+            newline_pos = text.rfind('\n', i, chunk_end)
+            if newline_pos > i:
+                chunk_end = newline_pos + 1
+            else:
+                # Try to break at space to avoid breaking words
+                space_pos = text.rfind(' ', i, chunk_end)
+                if space_pos > i:
+                    chunk_end = space_pos + 1
+                # Otherwise break at markdown boundaries (##, ###, etc.)
+                elif chunk_end > i + 10:  # Only if we have enough space
+                    md_boundary = text.rfind('##', i, chunk_end)
+                    if md_boundary > i:
+                        chunk_end = md_boundary
+        
+        chunks.append(text[i:chunk_end])
+        i = chunk_end
+    
+    return chunks
 
 
 @router.post("/stream/{session_id}/cancel")
