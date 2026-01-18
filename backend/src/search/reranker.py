@@ -116,11 +116,20 @@ class SemanticReranker:
             # Keep at least top 50% of results, or all if we have few results
             if len(filtered_scores) < max(3, int(len(result_scores) * 0.5)):
                 # Too aggressive filtering - use lower threshold but still filter
-                min_similarity_threshold = 0.15
+                # CRITICAL: Use 0.25 instead of 0.15 to filter out more irrelevant results
+                # 0.15 is too low and allows irrelevant results (like НУХТ for Qwen3 queries)
+                min_similarity_threshold = 0.25
                 filtered_scores = [
                     (result, score) for result, score in result_scores
                     if score >= min_similarity_threshold
                 ]
+                logger.warning(
+                    "Reranking fallback to lower threshold",
+                    query=query[:100],
+                    threshold=min_similarity_threshold,
+                    filtered_count=len(filtered_scores),
+                    note="Using 0.25 instead of 0.15 to filter irrelevant results"
+                )
             
             # If still too few, keep all but log a warning
             if len(filtered_scores) < 3 and len(result_scores) >= 3:

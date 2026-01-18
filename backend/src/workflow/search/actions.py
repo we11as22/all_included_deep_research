@@ -127,16 +127,31 @@ class ActionRegistry:
 async def web_search_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
     """Execute web search action with parallel queries."""
     queries = args.get("queries", [])
-    max_results = args.get("max_results", 5)
+    # CRITICAL: Increase default max_results for better coverage
+    # 5 results per query is too few - increase to 10 for balanced/quality modes
+    mode = context.get("mode", "speed")
+    default_max_results = 10 if mode in ["balanced", "quality"] else 5
+    max_results = args.get("max_results", default_max_results)
 
     search_provider = context.get("search_provider")
     stream = context.get("stream")
+    original_query = context.get("original_query")  # Get original user query from context
 
     if not search_provider:
         return {"error": "Search provider not available"}
 
+    # CRITICAL: Add original user query to search queries if not already present
+    # This ensures we always search for the original query even if LLM generates different queries
+    if original_query and original_query not in queries:
+        # Add original query at the beginning to prioritize it
+        queries = [original_query] + queries
+        logger.info(f"Added original_query to search queries", original_query=original_query[:100], total_queries=len(queries))
+    
+    # Limit to 3 queries total (including original if added)
+    queries = queries[:3]
+
     # Log queries for debugging relevance
-    logger.info(f"web_search_handler received queries", queries=queries, queries_count=len(queries))
+    logger.info(f"web_search_handler received queries", queries=queries, queries_count=len(queries), original_query=original_query[:100] if original_query else None)
 
     # Emit all queries at once
     if stream:
@@ -271,11 +286,18 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
 
             logger.debug(f"URL scraped and summarized: {url}")
 
+            # CRITICAL: Preserve markdown if available - writer needs it for proper formatting
+            original_markdown = None
+            if hasattr(content, "markdown") and content.markdown:
+                original_markdown = content.markdown
+                logger.debug(f"Preserving markdown content for writer", url=url, markdown_length=len(original_markdown))
+
             return {
                 "url": url,
                 "title": title,
                 "content": summary,  # Always use summary (LLM or smart truncation)
                 "summary": summary,  # Full context for writer!
+                "markdown": original_markdown,  # CRITICAL: Preserve markdown for proper formatting in writer
             }
 
         except Exception as e:
@@ -346,6 +368,109 @@ async def reasoning_preamble_handler(args: dict[str, Any], context: dict[str, An
     return {"reasoning": reasoning}
 
 
+async def select_urls_to_scrape_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
+    """Select URLs to scrape based on search results analysis.
+    
+    LLM analyzes search results (title + snippet) and selects most relevant URLs for scraping.
+    This is similar to how deep research researchers evaluate results before scraping.
+    """
+    search_results = args.get("search_results", [])
+    original_query = args.get("original_query", "")
+    # CRITICAL: Fallback to context if original_query not provided in args
+    if not original_query:
+        original_query = context.get("original_query", "")
+    
+    max_urls = args.get("max_urls", 5)  # Default: select top 5 URLs
+    
+    llm = context.get("llm")
+    stream = context.get("stream")
+    
+    logger.info(
+        "select_urls_to_scrape called",
+        search_results_count=len(search_results),
+        original_query_provided=bool(args.get("original_query")),
+        original_query_from_context=bool(context.get("original_query")),
+        original_query_preview=original_query[:100] if original_query else "None"
+    )
+    
+    if not llm:
+        logger.warning("No LLM available for URL selection, using top results")
+        # Fallback: return top results
+        return {
+            "selected_urls": [r.get("url", "") for r in search_results[:max_urls] if r.get("url")],
+            "reasoning": "Fallback: selected top results (no LLM available)"
+        }
+    
+    if not search_results:
+        logger.warning("No search results provided for URL selection")
+        return {"selected_urls": [], "reasoning": "No search results to analyze"}
+    
+    # Format search results for LLM analysis
+    results_text = "\n\n".join([
+        f"[{i+1}] Title: {r.get('title', 'No title')}\n"
+        f"URL: {r.get('url', 'No URL')}\n"
+        f"Snippet: {r.get('snippet', r.get('content', ''))[:300]}"
+        for i, r in enumerate(search_results[:15])  # Analyze top 15 results
+    ])
+    
+    # Create prompt for LLM to select URLs
+    from langchain_core.messages import SystemMessage, HumanMessage
+    from pydantic import BaseModel, Field
+    
+    class URLSelection(BaseModel):
+        """Selected URLs for scraping."""
+        selected_urls: list[str] = Field(description="List of URLs to scrape (max 5-10 URLs)")
+        reasoning: str = Field(description="Why these URLs were selected")
+    
+    prompt = f"""Analyze the following search results and select the most relevant URLs to scrape for answering the user's query.
+
+Original Query: {original_query}
+
+Search Results:
+{results_text}
+
+Instructions:
+1. Evaluate each result's RELEVANCE to the original query
+2. Check the TITLE and SNIPPET - do they relate to the query?
+3. Consider source CREDIBILITY (prefer authoritative sources)
+4. Select 3-{max_urls} most relevant URLs that will provide comprehensive information
+5. Prioritize sources that directly answer the query
+6. Skip irrelevant or low-quality sources
+
+Return the selected URLs and your reasoning."""
+    
+    try:
+        if stream:
+            stream.emit_status("Analyzing search results to select pages for scraping...", step="analyze")
+        
+        structured_llm = llm.with_structured_output(URLSelection, method="function_calling")
+        result = await structured_llm.ainvoke([
+            SystemMessage(content="You are an expert at evaluating search results and selecting the most relevant sources for information gathering."),
+            HumanMessage(content=prompt)
+        ])
+        
+        selected_urls = result.selected_urls[:max_urls]  # Limit to max_urls
+        logger.info(f"URL selection completed", 
+                   selected_count=len(selected_urls),
+                   total_results=len(search_results),
+                   reasoning=result.reasoning[:200])
+        
+        if stream:
+            stream.emit_status(f"Selected {len(selected_urls)} URLs for scraping", step="analyze")
+        
+        return {
+            "selected_urls": selected_urls,
+            "reasoning": result.reasoning
+        }
+    except Exception as e:
+        logger.error(f"URL selection failed", error=str(e), exc_info=True)
+        # Fallback: return top results
+        return {
+            "selected_urls": [r.get("url", "") for r in search_results[:max_urls] if r.get("url")],
+            "reasoning": f"Fallback selection due to error: {str(e)}"
+        }
+
+
 # ==================== Action Registration ====================
 
 
@@ -358,21 +483,22 @@ def register_actions():
         description="Search the web for information. Provide up to 3 search queries. "
         "Write natural search queries as you would type in a browser. "
         "Keep queries targeted and specific to what you need. "
-        "Returns list of search results with title, URL, and snippet.",
+        "Returns list of search results with title, URL, and snippet. "
+        "CRITICAL: For balanced/quality modes, use max_results=10 for better coverage. For speed mode, max_results=5 is sufficient.",
         args_schema={
             "type": "object",
             "properties": {
                 "queries": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "List of 1-3 natural search queries (as you would type in a browser)",
+                    "description": "List of 1-3 natural search queries (as you would type in a browser). Use all 3 slots when possible to maximize information gathering.",
                     "minItems": 1,
                     "maxItems": 3,
                 },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum results per query",
-                    "default": 5,
+                    "description": "Maximum results per query. CRITICAL: For balanced/quality modes, use 10 for better coverage. For speed mode, 5 is sufficient.",
+                    "default": 10,  # Increased from 5 to 10 for better coverage
                 },
             },
             # Azure/OpenRouter require all properties to be in required array
@@ -421,6 +547,42 @@ def register_actions():
         },
         handler=reasoning_preamble_handler,
         enabled_condition=lambda ctx: ctx.get("mode") in ["balanced", "quality"],
+    )
+
+    # Select URLs to scrape (analyze search results and choose best URLs)
+    ActionRegistry.register(
+        name="select_urls_to_scrape",
+        description="Analyze search results (title + snippet) and select the most relevant URLs to scrape. "
+        "Use this AFTER web_search to intelligently choose which pages to scrape for comprehensive information. "
+        "This helps avoid scraping irrelevant pages and focuses on high-quality sources.",
+        args_schema={
+            "type": "object",
+            "properties": {
+                "search_results": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "url": {"type": "string"},
+                            "snippet": {"type": "string"}
+                        }
+                    },
+                    "description": "Search results from web_search to analyze",
+                },
+                "original_query": {
+                    "type": "string",
+                    "description": "Original user query to evaluate relevance against",
+                },
+                "max_urls": {
+                    "type": "integer",
+                    "description": "Maximum number of URLs to select (default: 5)",
+                    "default": 5,
+                },
+            },
+            "required": ["search_results", "original_query"],
+        },
+        handler=select_urls_to_scrape_handler,
     )
 
     # Done (signal completion)

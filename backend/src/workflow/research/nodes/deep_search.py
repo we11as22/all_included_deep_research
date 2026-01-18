@@ -180,6 +180,23 @@ class DeepSearchNode(ResearchNode):
                        result_length=len(synthesis_result.content) if synthesis_result.content else 0,
                        user_language=user_language)
             deep_search_result = synthesis_result.content
+            
+            # CRITICAL: Log formatting from LLM response (before any processing)
+            import re
+            if deep_search_result:
+                raw_newline_count = deep_search_result.count('\n')
+                raw_double_newline_count = deep_search_result.count('\n\n')
+                has_markdown_headings = bool(re.search(r'^#{2,}\s+', deep_search_result, re.MULTILINE))
+                
+                logger.info(
+                    "RAW LLM DEEP SEARCH RESPONSE (before any processing)",
+                    result_length=len(deep_search_result),
+                    newline_count=raw_newline_count,
+                    double_newline_count=raw_double_newline_count,
+                    has_markdown_headings=has_markdown_headings,
+                    first_200_chars=repr(deep_search_result[:200]),  # Use repr to see actual \n characters
+                    note="This is EXACTLY what LLM returned - no modifications yet"
+                )
         else:
             deep_search_result = (
                 f"Initial search for '{query}' found limited results. "
@@ -243,6 +260,16 @@ Provide a comprehensive summary (500-800 words) that:
 4. Notes any interesting patterns or findings
 
 CRITICAL: Write the ENTIRE summary in {user_language}. The user's query is in {user_language}, so your response MUST be in {user_language}.
+
+CRITICAL MARKDOWN FORMATTING REQUIREMENT:
+- Your response MUST be valid markdown with proper formatting - NOT plain text!
+- Use ## for main sections, ### for subsections
+- Use **bold** for emphasis, *italic* for subtle emphasis
+- Use proper markdown lists (- for unordered, 1. for ordered)
+- CRITICAL NEWLINE FORMATTING: Use TWO newlines (\\n\\n) between paragraphs and sections for proper markdown rendering!
+- Each paragraph must be separated by a blank line (two newlines: \\n\\n)!
+- Sections must be separated by blank lines!
+- This ensures proper markdown rendering on the frontend - without blank lines, paragraphs will merge together!
 
 Focus on providing useful context for deeper research, not a complete answer."""
 

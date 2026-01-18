@@ -56,11 +56,53 @@ Current date: {current_date}
 
 Your knowledge cutoff is early 2024. For ANY information after that date, you MUST use web search.
 
+**CRITICAL: YOU MUST CALL TOOLS TO GATHER INFORMATION!**
+- You CANNOT answer questions without using web_search first
+- You MUST call web_search tool to find information
+- If you don't call tools, you will have no information to answer with
+- ALWAYS start by calling web_search with relevant queries
+
+**CRITICAL: DO NOT WRITE TOOL NAMES AS TEXT - YOU MUST CALL THEM!**
+- **WRONG**: Writing "__reasoning_preamble: I think..." as text ❌
+- **RIGHT**: Calling __reasoning_preamble tool with reasoning parameter ✅
+- **WRONG**: Writing "web_search: I need to search..." as text ❌
+- **RIGHT**: Calling web_search tool with queries parameter ✅
+- If you write tool names as text, you are doing it WRONG - you must USE tool calling to CALL the tools!
+- The system will detect if you write tools as text and this will cause errors!
+
 When calling web_search tool:
 - Write natural search queries as you would type in a browser
 - Keep queries targeted and specific to what you need
 - You can provide up to 3 queries at a time
 - Use the same language as the user's query
+- **CRITICAL**: The original user query "{original_query}" is automatically added to your search queries, so you don't need to include it manually
+
+**MANDATORY WORKFLOW FOR BETTER RESULTS:**
+After EVERY web_search, you MUST:
+1. **MANDATORY**: Call select_urls_to_scrape tool with search_results from web_search to analyze and choose the best URLs
+2. **CRITICAL**: When calling select_urls_to_scrape, pass ALL results from web_search (all results_count), NOT just the first few!
+3. **CRITICAL**: The web_search returns results_count results - you MUST pass ALL of them to select_urls_to_scrape
+4. **MANDATORY**: Then call scrape_url tool with selected_urls from select_urls_to_scrape to get full content
+5. This ensures you scrape only relevant, high-quality sources (like ai.meta.com, huggingface.co), not just top-N by order
+6. **CRITICAL**: Do NOT skip select_urls_to_scrape - it's essential for choosing the best sources!
+
+**CRITICAL: HOW TO USE TOOLS - EXAMPLES:**
+
+✅ CORRECT - You CALL tools using tool calling:
+- Call __reasoning_preamble tool with reasoning parameter
+- Call web_search tool with queries parameter  
+- Call scrape_url tool with urls parameter
+
+❌ WRONG - You write tool names as text:
+- "__reasoning_preamble: I think..." (WRONG - this is text, not a tool call!)
+- "web_search: I need to search..." (WRONG - this is text, not a tool call!)
+
+**YOU MUST USE THE TOOL CALLING SYSTEM - DO NOT WRITE TOOL NAMES AS TEXT!**
+
+Example workflow (using tool calling):
+1. Call web_search tool with queries=["query1", "query2", "query3"]
+2. Call select_urls_to_scrape tool with search_results=ALL results from step 1 (all results_count, not just first few!)
+3. Call scrape_url tool with selected_urls from step 2
 """
 
     if mode == "speed":
@@ -71,16 +113,19 @@ Your goal: Get information quickly and efficiently.
 
 Strategy:
 1. Make 1-2 targeted web searches with specific queries (use all 3 query slots if possible!)
-2. Scrape 1-2 most promising URLs if needed
-3. Call 'done' once you have enough information
+2. **MANDATORY**: After each web_search, call select_urls_to_scrape to analyze results and choose best URLs
+3. **MANDATORY**: Then call scrape_url with selected URLs (1-2 most promising URLs)
+4. Call 'done' once you have enough information
 
 IMPORTANT:
+- **MANDATORY**: You MUST call web_search tool in your first response - you cannot answer without searching!
 - You only have {max_iterations} iterations total
 - Be concise and focused
 - Don't over-analyze - gather key info and finish
 - When calling web_search, provide up to 3 queries to maximize information gathering
 - Your queries should be SEO-friendly keywords, NOT full sentences
 - Example: ["сабля", "сабля история", "сабля виды"] ✅ NOT ["расскажи про саблю"] ❌
+- **CRITICAL**: If you don't call web_search, you will have NO information to answer with!
 
 Available actions: {list(ActionRegistry._actions.keys())}
 """
@@ -92,9 +137,10 @@ MODE: BALANCED (iteration {iteration+1}/{max_iterations})
 Your goal: Thorough research with good coverage. GO DEEP, NOT WIDE!
 
 Strategy:
-1. **MANDATORY**: Start with __reasoning_preamble explaining your thinking
-2. Make 2-3 web searches from different angles (preserve key terms from user query!)
-3. Scrape 2-3 most promising URLs
+1. **MANDATORY**: Start by CALLING __reasoning_preamble tool (NOT writing it as text!) explaining your thinking
+2. **MANDATORY**: Then CALL web_search tool (NOT writing it as text!) with 2-3 queries from different angles (preserve key terms from user query!)
+3. **MANDATORY**: After each web_search, call select_urls_to_scrape to analyze results and choose best URLs
+4. **MANDATORY**: Then call scrape_url with selected URLs (2-3 most promising URLs)
 4. **CRITICAL**: After initial search, dig deeper into specific aspects:
    - Technical details and specifications
    - Historical context and evolution
@@ -106,9 +152,12 @@ Strategy:
 6. Call 'done' when you have comprehensive information
 
 IMPORTANT:
-- EVERY response MUST start with __reasoning_preamble
+- **MANDATORY**: You MUST CALL web_search tool in your first response - you cannot answer without searching!
+- **CRITICAL**: You MUST CALL tools (web_search, __reasoning_preamble, etc.) - DO NOT write tool names as text!
+- EVERY response MUST start by CALLING __reasoning_preamble tool (NOT writing it as text!)
 - Explain: what you've learned, what gaps remain, next action
 - **DO NOT just ask basic questions - dig into specifics!**
+- **DO NOT write "__reasoning_preamble:" or "web_search:" as text - you must CALL the tools using tool calling!**
 - After getting overview, search for: "advanced features", "technical details", "expert analysis", "case studies"
 - Minimum 2 information-gathering calls (search/scrape)
 - When generating search queries, preserve the original query's key terms and language
@@ -116,19 +165,26 @@ IMPORTANT:
 - Start with broader queries, then narrow down based on results
 - Your queries should be SEO-friendly keywords, NOT full sentences
 - **Iteration {iteration+1}**: If iteration > 1, you should be searching for SPECIFIC details, not general info
+- **CRITICAL**: If you don't call web_search, you will have NO information to answer with!
 
 Available actions: {list(ActionRegistry._actions.keys())}
 
-Example flow:
-1. __reasoning_preamble: "Okay, the user wants to learn about X. I need to search for..."
-2. web_search: ["X overview", "X basics"]
-3. scrape_url: ["url1", "url2"]
-4. __reasoning_preamble: "I've found basic info. Now I need SPECIFIC details: technical specs, expert opinions..."
-5. web_search: ["X technical specifications", "X expert analysis", "X advanced features"]
-6. scrape_url: ["url3", "url4"]
-7. __reasoning_preamble: "I have comprehensive info. Let me check for case studies and real-world applications..."
-8. web_search: ["X case studies", "X real-world applications"]
-9. done: "Research completed with comprehensive coverage"
+Example flow (using tool calling - NOT text!):
+1. CALL __reasoning_preamble tool with reasoning="Okay, the user wants to learn about X. I need to search for..."
+2. CALL web_search tool with queries=["X overview", "X basics"]
+3. CALL select_urls_to_scrape tool with search_results from step 2
+4. CALL scrape_url tool with urls from step 3
+5. CALL __reasoning_preamble tool with reasoning="I've found basic info. Now I need SPECIFIC details: technical specs, expert opinions..."
+6. CALL web_search tool with queries=["X technical specifications", "X expert analysis", "X advanced features"]
+7. CALL select_urls_to_scrape tool with search_results from step 6
+8. CALL scrape_url tool with urls from step 7
+9. CALL __reasoning_preamble tool with reasoning="I have comprehensive info. Let me check for case studies and real-world applications..."
+10. CALL web_search tool with queries=["X case studies", "X real-world applications"]
+11. CALL select_urls_to_scrape tool with search_results from step 10
+12. CALL scrape_url tool with urls from step 11
+13. CALL done tool
+
+**REMEMBER: You MUST CALL tools, not write them as text!**
 """
 
     else:  # quality
@@ -156,11 +212,14 @@ Strategy:
    - Industry trends and future developments
    - Performance metrics and benchmarks
    - Best practices and recommendations
-4. Use 4-7 information-gathering calls (searches + scrapes)
-5. Cross-reference from multiple authoritative sources
-6. Call 'done' only when truly comprehensive (use most of your {max_iterations} iterations)
+4. **MANDATORY**: After each web_search, call select_urls_to_scrape to analyze results and choose best URLs
+5. **MANDATORY**: Then call scrape_url with selected URLs
+6. Use 4-7 information-gathering calls (searches + scrapes)
+6. Cross-reference from multiple authoritative sources
+7. Call 'done' only when truly comprehensive (use most of your {max_iterations} iterations)
 
 IMPORTANT:
+- **MANDATORY**: You MUST call web_search tool in your first response - you cannot answer without searching!
 - EVERY response MUST start with __reasoning_preamble
 - Think deeply: what's missing? what angles are unexplored?
 - **DO NOT just ask basic questions - dig into specifics!**
@@ -175,6 +234,7 @@ IMPORTANT:
 - Never stop before at least 5-6 iterations of searches unless the question is very simple
 - Your queries should be SEO-friendly keywords, NOT full sentences
 - **After iteration 2, your queries should target SPECIFIC aspects, not general info**
+- **CRITICAL**: If you don't call web_search, you will have NO information to answer with!
 
 Available actions: {list(ActionRegistry._actions.keys())}
 
@@ -261,6 +321,14 @@ async def research_agent(
         classification=query_type,
         context={}
     )
+    
+    # CRITICAL: Verify tools are available
+    if not tools:
+        logger.error(f"No tools available for research agent!", mode=mode, query_type=query_type, registered_actions=list(ActionRegistry._actions.keys()))
+        raise ValueError(f"No tools available for research agent in mode {mode}")
+    
+    tool_names = [t.get("function", {}).get("name") if isinstance(t, dict) else getattr(t, "name", "unknown") for t in tools]
+    logger.info(f"Tools available for research agent", tools_count=len(tools), tool_names=tool_names, mode=mode)
 
     # Track research state
     sources = []
@@ -406,17 +474,108 @@ async def research_agent(
                 stream.emit_status(f"Research iteration {iteration+1}/{max_iterations}", step="research")
 
             # Bind tools to LLM for tool calling
-            # Convert our tool definitions to format expected by bind_tools
-            # Most LangChain LLMs accept tool definitions directly
+            # CRITICAL: Convert dict-based tool definitions to StructuredTool objects
+            # LangChain bind_tools works better with StructuredTool objects than dicts
+            from langchain_core.tools import StructuredTool
+            from pydantic import create_model
+            from typing import Any as TypingAny
+            
+            structured_tools = []
             try:
-                if hasattr(llm, "bind_tools"):
-                    # Try binding tools directly with our definitions
-                    llm_with_tools = llm.bind_tools(tools)
+                for tool_def in tools:
+                    if isinstance(tool_def, dict):
+                        # Convert dict format to StructuredTool
+                        func_info = tool_def.get("function", {})
+                        tool_name = func_info.get("name")
+                        tool_description = func_info.get("description", "")
+                        tool_params = func_info.get("parameters", {})
+                        
+                        if not tool_name:
+                            logger.warning(f"Skipping tool definition without name", tool_def=tool_def)
+                            continue
+                        
+                        # Create Pydantic model for args
+                        field_definitions = {}
+                        properties = tool_params.get("properties", {})
+                        required = tool_params.get("required", [])
+                        
+                        for prop_name, prop_schema in properties.items():
+                            # Determine field type
+                            prop_type = prop_schema.get("type", "string")
+                            if prop_type == "integer":
+                                field_type = int
+                            elif prop_type == "array":
+                                items_type = prop_schema.get("items", {}).get("type", "string")
+                                if items_type == "string":
+                                    field_type = list[str]
+                                else:
+                                    field_type = list[TypingAny]
+                            elif prop_type == "boolean":
+                                field_type = bool
+                            else:
+                                field_type = str
+                            
+                            field_info = Field(
+                                description=prop_schema.get("description", ""),
+                                default=prop_schema.get("default") if prop_name not in required else ...
+                            )
+                            field_definitions[prop_name] = (field_type, field_info)
+                        
+                        # Create dynamic Pydantic model
+                        ArgsModel = create_model(f"{tool_name}Args", **field_definitions)
+                        
+                        # Create async handler that calls ActionRegistry.execute
+                        # CRITICAL: Use closure to capture tool_name properly
+                        def create_handler(action_name: str):
+                            async def handler(**kwargs):
+                                context = {
+                                    "search_provider": search_provider,
+                                    "scraper": scraper,
+                                    "stream": stream,
+                                    "llm": llm,
+                                    "mode": mode,
+                                    "agent_id": "researcher",
+                                    "original_query": query,
+                                }
+                                result = await ActionRegistry.execute(action_name, kwargs, context)
+                                # Convert result to string for ToolMessage
+                                if isinstance(result, dict):
+                                    return json.dumps(result, ensure_ascii=False)
+                                return str(result)
+                            return handler
+                        
+                        handler = create_handler(tool_name)
+                        
+                        # Create StructuredTool
+                        structured_tool = StructuredTool(
+                            name=tool_name,
+                            description=tool_description,
+                            args_schema=ArgsModel,
+                            func=handler,
+                            coroutine=handler,
+                        )
+                        structured_tools.append(structured_tool)
+                    elif hasattr(tool_def, "name"):
+                        # Already a StructuredTool or compatible object
+                        structured_tools.append(tool_def)
+                    else:
+                        logger.warning(f"Unknown tool format, skipping", tool_type=type(tool_def).__name__)
+                
+                logger.info(f"Converted {len(structured_tools)} tools to StructuredTool format", 
+                           tool_names=[t.name for t in structured_tools])
+                
+                # Bind StructuredTool objects to LLM
+                if hasattr(llm, "bind_tools") and structured_tools:
+                    llm_with_tools = llm.bind_tools(structured_tools)
+                    logger.info(f"Tools bound successfully as StructuredTool objects", tools_count=len(structured_tools))
                 else:
-                    # Fallback: some LLMs need tools in different format
+                    if not hasattr(llm, "bind_tools"):
+                        logger.warning(f"LLM does not support bind_tools, using LLM without tools")
+                    if not structured_tools:
+                        logger.warning(f"No structured tools available for binding")
                     llm_with_tools = llm
             except Exception as e:
-                logger.warning(f"Failed to bind tools, using LLM without tools", error=str(e))
+                logger.error(f"Failed to convert/bind tools, using LLM without tools", error=str(e), exc_info=True)
                 llm_with_tools = llm
             
             # Validate message order before sending to LLM
@@ -438,6 +597,10 @@ async def research_agent(
                                      following_tool_message_ids=following_tool_messages)
             
             # Get LLM response with tool calling
+            logger.info(f"Calling LLM with {len(messages)} messages", 
+                       has_tools=llm_with_tools != llm,
+                       tools_count=len(tools),
+                       system_prompt_length=len(system_prompt) if messages else 0)
             response = await llm_with_tools.ainvoke(messages)
 
             # Extract tool calls from LLM response
@@ -445,8 +608,27 @@ async def research_agent(
             tool_calls = []
             if hasattr(response, "tool_calls") and response.tool_calls:
                 tool_calls = response.tool_calls
-                logger.debug(f"Extracted {len(tool_calls)} tool calls from response", 
-                           tool_call_ids=[tc.id if hasattr(tc, "id") else getattr(tc, "get", lambda k, d: d)("id", "unknown") for tc in tool_calls])
+                logger.info(f"Extracted {len(tool_calls)} tool calls from response", 
+                           tool_call_ids=[tc.id if hasattr(tc, "id") else getattr(tc, "get", lambda k, d: d)("id", "unknown") for tc in tool_calls],
+                           tool_names=[tc.name if hasattr(tc, "name") else (tc.get("name") if isinstance(tc, dict) else "unknown") for tc in tool_calls])
+            else:
+                # CRITICAL: Check if LLM wrote reasoning as text instead of calling tools
+                response_content = response.content if hasattr(response, "content") else str(response)
+                
+                # Check if LLM wrote tool names as text (common mistake)
+                if response_content and ("__reasoning_preamble:" in response_content or "web_search:" in response_content or "__reasoning_preamble " in response_content):
+                    logger.error(f"LLM wrote tool names as TEXT instead of calling tools! This is WRONG!", 
+                               response_content_preview=response_content[:300],
+                               note="LLM must CALL tools, not write them as text. This indicates a prompt/LLM issue.")
+                
+                # CRITICAL: Log why no tool calls were returned
+                logger.warning(f"LLM returned NO tool calls", 
+                             response_type=type(response).__name__,
+                             has_tool_calls_attr=hasattr(response, "tool_calls"),
+                             response_content_preview=response_content[:200] if response_content else str(response)[:200],
+                             tools_were_bound=llm_with_tools != llm,
+                             tools_count=len(tools),
+                             wrote_tools_as_text=response_content and ("__reasoning_preamble:" in response_content or "web_search:" in response_content))
 
             # Check for done - support both formats:
             # 1. LangChain format: {"name": "...", "args": {...}}
@@ -470,7 +652,17 @@ async def research_agent(
 
             # CRITICAL: Exit conditions - prevent infinite loops
             if not tool_calls:
-                logger.info(f"Research completed at iteration {iteration+1} - no tool calls returned")
+                # CRITICAL: Log why no tool calls - this is a problem!
+                response_content = response.content if hasattr(response, "content") else str(response)[:500]
+                logger.warning(f"Research completed at iteration {iteration+1} - no tool calls returned", 
+                             response_type=type(response).__name__,
+                             response_content_preview=response_content,
+                             has_tool_calls_attr=hasattr(response, "tool_calls"),
+                             tools_were_bound=llm_with_tools != llm,
+                             tools_count=len(tools),
+                             tool_names=[t.get("function", {}).get("name") if isinstance(t, dict) else getattr(t, "name", "unknown") for t in tools])
+                # CRITICAL: Don't break immediately - maybe LLM needs a retry or different prompt
+                # But we can't loop forever, so break after warning
                 break
             
             if done:
@@ -601,7 +793,8 @@ async def research_agent(
                             "stream": stream,
                             "llm": llm,  # Required for content summarization!
                             "mode": mode,
-                            "agent_id": "researcher"
+                            "agent_id": "researcher",
+                            "original_query": original_query,  # CRITICAL: Pass original query for web_search to add it to queries
                         }
                     )
 
@@ -618,17 +811,21 @@ async def research_agent(
 
                     # Format result for LLM to see - make it readable
                     # For web_search, show titles and snippets so LLM can see what was found
+                    # CRITICAL: Show ALL results (up to 15) so agent can see ai.meta.com, huggingface.co, etc.
+                    # Not just top 5, because authoritative sources might be ranked lower
                     if tool_name == "web_search" and "results" in result:
+                        all_results = result.get("results", [])
                         formatted_output = {
-                            "results_count": len(result.get("results", [])),
+                            "results_count": len(all_results),
                             "results": [
                                 {
                                     "title": r.get("title", ""),
                                     "url": r.get("url", ""),
                                     "snippet": r.get("snippet", "")[:200]  # Truncate for readability
                                 }
-                                for r in result.get("results", [])[:5]  # Show top 5 results
-                            ]
+                                for r in all_results[:15]  # Show top 15 results so agent sees authoritative sources
+                            ],
+                            "note": f"Total {len(all_results)} results found. When calling select_urls_to_scrape, pass ALL {len(all_results)} results, not just the first few!"
                         }
                         output_str = json.dumps(formatted_output, ensure_ascii=False, indent=2)
                     else:

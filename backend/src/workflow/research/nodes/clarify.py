@@ -51,26 +51,73 @@ class ClarifyNode(ResearchNode):
         settings = self.deps.settings
 
         # CRITICAL: Check session_status to determine if clarification already sent
-        # Use session_status instead of text markers!
+        # Use session_status from DB session, NOT chat_history!
         if session_status == "waiting_clarification":
+            # CRITICAL: Work with session from DB, not chat_history!
+            # Check if user has already answered by checking session.clarification_answers
+            existing_answers = None
+            if session_manager:
+                try:
+                    session = await session_manager.get_session(session_id)
+                    if session:
+                        existing_answers = session.clarification_answers
+                        logger.info("Checked session from DB for clarification answers",
+                                   session_id=session_id,
+                                   has_existing_answers=bool(existing_answers),
+                                   existing_answers_preview=existing_answers[:100] if existing_answers else None)
+                except Exception as e:
+                    logger.warning("Failed to get session from DB", error=str(e), exc_info=True)
+            
             # Check if user has ANSWERED the clarification questions
             # User answered if:
-            # 1. Last message in chat_history is from user
-            # 2. AND it's NOT the original query (meaning it's a NEW message - the answer)
+            # 1. Last message in chat_history is from user (new message)
+            # 2. AND it's different from original_query (not the original query repeated)
+            # 3. AND either:
+            #    a) clarification_answers is empty/None in session (user just answered)
+            #    b) OR last_user_message is different from existing_answers (user updated answer)
+            
             if chat_history and chat_history[-1].get("role") == "user":
                 last_user_message = chat_history[-1].get("content", "").strip()
-                # If last user message is different from original query, user has answered
-                if last_user_message and last_user_message != original_query.strip():
-                    logger.info("User answered clarification questions, proceeding with research",
-                               session_id=session_id,
-                               answer_preview=last_user_message[:100])
-
-                    # Update session status to researching
+                
+                # Check if this is a new answer (different from original_query and substantial)
+                is_new_answer = (
+                    last_user_message and
+                    len(last_user_message) > 10 and  # Substantial answer
+                    last_user_message != original_query.strip()  # Not the original query
+                )
+                
+                # User answered if:
+                # 1. It's a new answer (different from original_query)
+                # 2. AND either no existing answers OR answer is different from existing
+                user_answered = False
+                if is_new_answer:
+                    if not existing_answers:
+                        # No existing answers - this is the first answer
+                        user_answered = True
+                        logger.info("✅ User answered clarification (first answer, no existing answers in session)",
+                                   session_id=session_id,
+                                   answer_preview=last_user_message[:100])
+                    elif last_user_message != existing_answers.strip():
+                        # Answer is different from existing - user updated/answered
+                        user_answered = True
+                        logger.info("✅ User answered clarification (new/different answer)",
+                                   session_id=session_id,
+                                   answer_preview=last_user_message[:100],
+                                   existing_answer_preview=existing_answers[:100] if existing_answers else None)
+                
+                if user_answered:
+                    # Save answers to session and update status
                     if session_manager:
                         try:
+                            # Save clarification answers to session
+                            await session_manager.save_clarification_answers(session_id, last_user_message)
+                            logger.info("✅ Saved clarification answers to session", session_id=session_id)
+                            
+                            # Update session status to researching
                             await session_manager.update_status(session_id, "researching")
+                            logger.info("✅ Session status updated to 'researching'", session_id=session_id)
                         except Exception as e:
-                            logger.warning("Failed to update session status", error=str(e))
+                            logger.error("Failed to save answers/update status", error=str(e), exc_info=True)
 
                     # Return with updated status and clarification_needed=False to proceed
                     return {
@@ -81,9 +128,12 @@ class ClarifyNode(ResearchNode):
                     }
 
             # If we reach here, user has NOT answered yet
-            logger.info("Clarification already sent, still waiting for user answers - will interrupt before analyze_query",
+            logger.info("⏸️ Clarification already sent, still waiting for user answers - will interrupt before analyze_query",
                        session_id=session_id,
-                       session_status=session_status)
+                       session_status=session_status,
+                       has_existing_answers=bool(existing_answers),
+                       last_message_role=chat_history[-1].get("role") if chat_history else None,
+                       chat_history_length=len(chat_history))
             # CRITICAL: Return state with flags so interrupt_before=["analyze_query"] stops the graph
             return {
                 "clarification_needed": True,

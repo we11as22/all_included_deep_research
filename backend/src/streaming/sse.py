@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import re
 import time
 from enum import Enum
 from typing import Any
@@ -349,13 +350,19 @@ class ResearchStreamingGenerator(StreamingGenerator):
 
     def emit_final_report(self, report: str) -> None:
         """Emit final report."""
+        # CRITICAL: Preserve all formatting including newlines - don't modify content!
+        # Report should already be in markdown format with proper \n characters
+        # Just pass it through without any processing that might lose formatting
+        
         self.add(
             self._create_event(
                 StreamEventType.FINAL_REPORT,
                 {
-                    "report": report,
+                    "report": report,  # CRITICAL: Preserve original content with all \n
                     "length": len(report),
                     "preview": report[:500] + "..." if len(report) > 500 else report,
+                    "has_newlines": "\n" in report,  # Debug: verify newlines are present
+                    "newline_count": report.count("\n"),  # Debug: count newlines
                 },
             )
         )
@@ -365,7 +372,9 @@ class ResearchStreamingGenerator(StreamingGenerator):
         # Mark that we saved final report to avoid duplicate saving in emit_done
         self._final_report_saved = True
         logger.info("Saving final report to DB via emit_final_report", 
-                   report_length=len(report), 
+                   report_length=len(report),
+                   newline_count=report.count("\n"),
+                   has_markdown_headings=bool(re.search(r'^#{2,}\s+', report, re.MULTILINE)) if hasattr(re, 'search') else False,
                    session_id=self.session_id,
                    has_chat_id=bool(self.app_state.get("chat_id")))
         asyncio.create_task(self._save_final_message_to_db(report))
@@ -376,6 +385,8 @@ class ResearchStreamingGenerator(StreamingGenerator):
         
         This is called for all final reports (chat, search, deep_search, deep_research).
         Works for ALL modes that use ResearchStreamingGenerator.
+        
+        CRITICAL: Preserves all formatting including newlines - content is saved as-is.
         """
         if not content or not content.strip():
             logger.warning("Cannot save final message to DB - content is empty")
@@ -393,9 +404,21 @@ class ResearchStreamingGenerator(StreamingGenerator):
             return
         
         # Use accumulated content if available, otherwise use provided content
+        # CRITICAL: Don't strip or modify content - preserve all formatting including \n
         final_content = getattr(self, "_accumulated_content", "") or content
         if not final_content.strip():
             return
+        
+        # CRITICAL: Log formatting preservation
+        import re
+        has_newlines = "\n" in final_content
+        newline_count = final_content.count("\n")
+        has_markdown = bool(re.search(r'^#{2,}\s+', final_content, re.MULTILINE))
+        logger.debug("Saving final message with formatting", 
+                    content_length=len(final_content),
+                    newline_count=newline_count,
+                    has_newlines=has_newlines,
+                    has_markdown_headings=has_markdown)
         
         # Generate unique message_id
         import time

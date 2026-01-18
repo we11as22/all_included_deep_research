@@ -1,17 +1,137 @@
 'use client';
 
-import React from 'react';
+import React, { useMemo } from 'react';
 import { LocalChatMessage } from '@/stores/chatStore';
+import { useChatStore } from '@/stores/chatStore';
 import { cn } from '@/lib/utils';
-import Markdown from 'markdown-to-jsx';
+import Markdown, { RuleType } from 'markdown-to-jsx';
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import { MessageDeliveryStatus } from './MessageDeliveryStatus';
+import Citation from './MessageRenderer/Citation';
+import CodeBlock from './MessageRenderer/CodeBlock';
 
 interface MessageItemProps {
   message: LocalChatMessage;
 }
 
+// Helper function to process content: LaTeX + Citations (like Perplexica)
+const processContent = (content: string, sources: Array<{ url?: string; title?: string }> = []): string => {
+  if (!content) return '';
+
+  // Step 1: Handle block formulas first: $$ formula $$
+  content = content.replace(
+    /\$\$([^$]+)\$\$/g,
+    (match, formula) => {
+      try {
+        const rendered = katex.renderToString(formula.trim(), { throwOnError: false, displayMode: true });
+        return `<div class="my-4 overflow-x-auto katex-block">${rendered}</div>`;
+      } catch (e) {
+        return match; // Return original if rendering fails
+      }
+    }
+  );
+  
+  // Step 2: Process citations BEFORE LaTeX (like Perplexica)
+  // Replace [1], [2], [1,2] with <citation> tags if sources available
+  // CRITICAL: Must process BEFORE markdown parsing to avoid conflicts with markdown links
+  if (sources.length > 0) {
+    // Match citations [1], [2], [1,2], [1, 2, 3] but NOT markdown links [text](url)
+    // Strategy: Use negative lookahead to skip markdown links [text](url)
+    // Also skip if content contains non-numeric characters (likely LaTeX or markdown link text)
+    const citationRegex = /\[([^\]]+)\](?!\()/g;
+    content = content.replace(citationRegex, (match, capturedContent: string, offset: number, string: string) => {
+      // Skip if followed by ( - it's a markdown link
+      const nextChar = string[offset + match.length];
+      if (nextChar === '(') {
+        return match;
+      }
+      
+      // Parse citation numbers (can be single or comma-separated: [1], [1,2], [1, 2, 3])
+      // Only process if content is purely numeric (with optional commas and spaces)
+      const trimmed = capturedContent.trim();
+      const isCitationPattern = /^(\d+)(\s*,\s*\d+)*$/.test(trimmed);
+      
+      if (!isCitationPattern) {
+        // Not a citation number pattern, might be LaTeX or markdown link text - leave it
+        return match;
+      }
+
+      const numbers = trimmed
+        .split(',')
+        .map((numStr: string) => numStr.trim())
+        .filter((numStr: string) => /^\d+$/.test(numStr));
+
+      if (numbers.length === 0) {
+        return match;
+      }
+
+      // Build citation HTML tags
+      const linksHtml = numbers
+        .map((numStr: string) => {
+          const number = parseInt(numStr);
+          if (isNaN(number) || number <= 0 || number > sources.length) {
+            return `[${numStr}]`; // Invalid citation number
+          }
+
+          const source = sources[number - 1];
+          const url = source?.url;
+
+          if (url) {
+            return `<citation href="${url}">${numStr}</citation>`;
+          } else {
+            return `[${numStr}]`; // No URL available
+          }
+        })
+        .join('');
+
+      return linksHtml || match;
+    });
+  }
+  
+  // Step 3: Handle inline LaTeX formulas: [ formula ] but not markdown links [text](url) or citations [1]
+  // Match [ formula ] where formula contains LaTeX operators
+  // More specific pattern to avoid conflicts with markdown and citations
+  content = content.replace(
+    /\[([^\]]*(?:\\text|\\cdot|\\norm|\\sum|\\int|\\frac|\\sqrt|\\alpha|\\beta|\\gamma|\\delta|\\epsilon|\\theta|\\lambda|\\mu|\\pi|\\sigma|\\phi|\\omega|\\Delta|\\Gamma|\\Lambda|\\Omega|\\Phi|\\Pi|\\Sigma|\\Theta|\\Xi|\\^|_|\\{|\\}|=|\+|\-|\*|\/)[^\]]*)\]/g,
+    (match, formula, offset, string) => {
+      // Skip if it looks like a markdown link [text](url) - check if followed by (
+      const nextChar = string[offset + match.length];
+      if (nextChar === '(') {
+        return match;
+      }
+      // Skip if it's just a citation number [1], [2], etc. (already processed)
+      if (/^\[\d+\]$/.test(match)) {
+        return match;
+      }
+      // Skip if it's a citation tag (already processed)
+      if (match.includes('<citation')) {
+        return match;
+      }
+      try {
+        const rendered = katex.renderToString(formula, { throwOnError: false, displayMode: false });
+        return `<span class="katex-inline">${rendered}</span>`;
+      } catch (e) {
+        return match; // Return original if rendering fails
+      }
+    }
+  );
+  
+  return content;
+};
+
 export const MessageItem = React.memo(
   ({ message }: MessageItemProps) => {
+    // Get sources from progress for citation processing (like Perplexica)
+    const progress = useChatStore((state) => state.progressByMessage[message.id]);
+    const sources = progress?.sources || [];
+
+    // Pre-process content: LaTeX + Citations (like Perplexica)
+    const processedContent = useMemo(() => {
+      if (!message.content) return '';
+      return processContent(message.content, sources);
+    }, [message.content, sources]);
+
     return (
       <div
         className={cn(
@@ -22,145 +142,70 @@ export const MessageItem = React.memo(
         )}
       >
         {message.content && (
-          <div className="prose prose-sm dark:prose-invert max-w-none
-                          prose-headings:font-semibold prose-headings:text-foreground prose-headings:mt-4 prose-headings:mb-2
-                          prose-h1:text-2xl prose-h1:font-bold prose-h1:mt-6 prose-h1:mb-3
-                          prose-h2:text-xl prose-h2:font-semibold prose-h2:mt-5 prose-h2:mb-2
-                          prose-h3:text-lg prose-h3:font-semibold prose-h3:mt-4 prose-h3:mb-2
-                          prose-p:text-foreground prose-p:leading-relaxed prose-p:my-3 prose-p:whitespace-pre-wrap
-                          prose-strong:text-foreground prose-strong:font-semibold
-                          prose-em:text-foreground prose-em:italic
-                          prose-ul:text-foreground prose-ul:my-3 prose-ul:pl-6
-                          prose-ol:text-foreground prose-ol:my-3 prose-ol:pl-6
-                          prose-li:text-foreground prose-li:my-1
-                          prose-code:text-foreground prose-code:bg-muted prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-sm prose-code:font-mono
-                          prose-pre:bg-muted prose-pre:text-foreground prose-pre:p-4 prose-pre:rounded-lg prose-pre:overflow-x-auto prose-pre:whitespace-pre-wrap
-                          prose-blockquote:border-l-4 prose-blockquote:border-primary prose-blockquote:pl-4 prose-blockquote:italic prose-blockquote:my-4 prose-blockquote:text-foreground/80
-                          prose-a:text-blue-600 dark:prose-a:text-blue-400 prose-a:no-underline hover:prose-a:underline prose-a:font-medium
-                          prose-hr:border-gray-300 dark:prose-hr:border-gray-600 prose-hr:my-6
-                          prose-table:w-full prose-table:my-4
-                          prose-th:border prose-th:border-border prose-th:px-4 prose-th:py-2 prose-th:bg-muted prose-th:font-semibold prose-th:text-foreground
-                          prose-td:border prose-td:border-border prose-td:px-4 prose-td:py-2 prose-td:text-foreground
-                          break-words">
+          <div className={cn(
+            'prose prose-sm dark:prose-invert max-w-none break-words',
+            'prose-h1:mb-3 prose-h1:mt-6 prose-h1:font-bold prose-h1:text-2xl',
+            'prose-h2:mb-2 prose-h2:mt-6 prose-h2:font-[800]',
+            'prose-h3:mt-4 prose-h3:mb-1.5 prose-h3:font-[600]',
+            'prose-p:leading-relaxed prose-p:whitespace-pre-wrap',
+            'prose-pre:p-0',
+            'text-black dark:text-white'
+          )}>
             <Markdown
               options={{
                 forceBlock: true,
                 forceInline: false,
                 wrapper: React.Fragment,
+                disableParsingRawHTML: false,
+                // CRITICAL: Use minimal overrides like Perplexica - let prose classes handle most styling
+                // Only override for special cases (code blocks, citations, LaTeX)
+                renderRule(next, node, renderChildren, state) {
+                  // Handle code blocks with syntax highlighting
+                  if (node.type === RuleType.codeBlock) {
+                    return (
+                      <CodeBlock key={state.key} language={node.lang || ''}>
+                        {node.text}
+                      </CodeBlock>
+                    );
+                  }
+                  // Handle inline code (let markdown handle it)
+                  if (node.type === RuleType.codeInline) {
+                    return next();
+                  }
+                  return next();
+                },
                 overrides: {
-                  a: {
+                  // Citation component (from Perplexica pattern)
+                  citation: {
                     component: ({ href, children, ...props }) => (
-                      <a
-                        href={href}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="text-blue-600 dark:text-blue-400 hover:underline font-medium"
-                        {...props}
-                      >
+                      <Citation href={href} {...props}>
                         {children}
-                      </a>
+                      </Citation>
                     ),
                   },
-                  h1: {
-                    component: ({ children, ...props }) => (
-                      <h1 className="text-2xl font-bold mt-6 mb-3 text-foreground" {...props}>
-                        {children}
-                      </h1>
-                    ),
+                  // Keep LaTeX rendering support
+                  div: {
+                    component: ({ className, children, ...props }) => {
+                      // Preserve LaTeX blocks
+                      if (className?.includes('katex-block')) {
+                        return <div className={className} dangerouslySetInnerHTML={{ __html: children as string }} {...props} />;
+                      }
+                      return <div className={className} {...props}>{children}</div>;
+                    },
                   },
-                  h2: {
-                    component: ({ children, ...props }) => (
-                      <h2 className="text-xl font-semibold mt-5 mb-2 text-foreground" {...props}>
-                        {children}
-                      </h2>
-                    ),
-                  },
-                  h3: {
-                    component: ({ children, ...props }) => (
-                      <h3 className="text-lg font-semibold mt-4 mb-2 text-foreground" {...props}>
-                        {children}
-                      </h3>
-                    ),
-                  },
-                  h4: {
-                    component: ({ children, ...props }) => (
-                      <h4 className="text-base font-semibold mt-3 mb-1 text-foreground" {...props}>
-                        {children}
-                      </h4>
-                    ),
-                  },
-                  p: {
-                    component: ({ children, ...props }) => (
-                      <p className="mb-3 leading-relaxed text-foreground whitespace-pre-wrap" {...props}>
-                        {children}
-                      </p>
-                    ),
-                  },
-                  strong: {
-                    component: ({ children, ...props }) => (
-                      <strong className="font-semibold text-foreground" {...props}>
-                        {children}
-                      </strong>
-                    ),
-                  },
-                  em: {
-                    component: ({ children, ...props }) => (
-                      <em className="italic text-foreground" {...props}>
-                        {children}
-                      </em>
-                    ),
-                  },
-                  ul: {
-                    component: ({ children, ...props }) => (
-                      <ul className="list-disc list-inside my-3 pl-6 text-foreground space-y-1" {...props}>
-                        {children}
-                      </ul>
-                    ),
-                  },
-                  ol: {
-                    component: ({ children, ...props }) => (
-                      <ol className="list-decimal list-inside my-3 pl-6 text-foreground space-y-1" {...props}>
-                        {children}
-                      </ol>
-                    ),
-                  },
-                  li: {
-                    component: ({ children, ...props }) => (
-                      <li className="text-foreground my-1" {...props}>
-                        {children}
-                      </li>
-                    ),
-                  },
-                  code: {
-                    component: ({ children, ...props }) => (
-                      <code className="bg-muted px-1.5 py-0.5 rounded text-sm font-mono text-foreground" {...props}>
-                        {children}
-                      </code>
-                    ),
-                  },
-                  pre: {
-                    component: ({ children, ...props }) => (
-                      <pre className="bg-muted p-4 rounded-lg overflow-x-auto my-4 text-foreground" {...props}>
-                        {children}
-                      </pre>
-                    ),
-                  },
-                  blockquote: {
-                    component: ({ children, ...props }) => (
-                      <blockquote className="border-l-4 border-primary pl-4 italic my-4 text-foreground/80" {...props}>
-                        {children}
-                      </blockquote>
-                    ),
-                  },
-                  hr: {
-                    component: ({ ...props }) => (
-                      <hr className="border-gray-300 dark:border-gray-600 my-6" {...props} />
-                    ),
+                  span: {
+                    component: ({ className, children, ...props }) => {
+                      // Preserve LaTeX inline
+                      if (className?.includes('katex-inline')) {
+                        return <span className={className} dangerouslySetInnerHTML={{ __html: children as string }} {...props} />;
+                      }
+                      return <span className={className} {...props}>{children}</span>;
+                    },
                   },
                 },
               }}
             >
-              {message.content || ''}
+              {processedContent || ''}
             </Markdown>
           </div>
         )}

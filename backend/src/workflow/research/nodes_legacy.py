@@ -208,83 +208,87 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
     """
     Run deep search to gather initial context before planning.
     
-    CRITICAL: If deep_search_result already exists and user has answered clarification,
-    skip deep search and return existing result. This prevents re-running deep search
-    after user answers clarification questions.
+    CRITICAL: Deep search result MUST be tied to the deep research SESSION, not chat_history!
+    Chat history may contain messages from other modes (deep search in chat), which should NOT be used.
+    
+    Logic:
+    1. First check if deep_search_result exists in the CURRENT SESSION (via SessionManager)
+    2. If exists in session - use it (it's already tied to this session and query)
+    3. If not in session - run new deep search and save to session
+    4. DO NOT check chat_history for deep search results - they may be from other modes!
     """
     query = state["query"]
-    chat_history = state.get("chat_history", [])
+    original_query = state.get("original_query", query)
+    session_id = state.get("session_id")
     
-    # CRITICAL: Check if deep search was already done and user answered clarification
-    # Proper sequence: deep search -> clarification questions -> user answer -> skip deep search
-    deep_search_done = False
-    deep_search_index = -1
-    clarification_index = -1
-    has_user_answer = False
-    found_clarification = False
+    # CRITICAL: Get the current query we're researching (use original_query if available)
+    current_research_query = original_query if original_query else query
+    logger.info("Running deep search node", 
+               query=query[:100], 
+               original_query=original_query[:100] if original_query else None,
+               current_research_query=current_research_query[:100],
+               session_id=session_id)
     
-    # Step 1: Find deep search result in chat history
-    for i, msg in enumerate(chat_history):
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "").lower()
-            # Check if this message contains deep search result
-            if "initial deep search context" in content or "deep search completed" in content:
-                deep_search_done = True
-                deep_search_index = i
-                logger.info("Found deep search result in chat history", message_index=i)
-                break
+    # CRITICAL: First check if deep_search_result exists in the CURRENT SESSION
+    # This is the PRIMARY source of truth - session is tied to this specific deep research run
+    session_deep_search_result = None
+    if session_id:
+        try:
+            # Get session_manager from stream.app_state or runtime deps
+            stream = state.get("stream")
+            session_manager = None
+            
+            if stream and hasattr(stream, "app_state"):
+                session_factory = stream.app_state.get("session_factory")
+                if session_factory:
+                    from src.workflow.research.session.manager import SessionManager
+                    session_manager = SessionManager(session_factory)
+            
+            if not session_manager:
+                # Try to get from runtime deps
+                deps = _get_runtime_deps()
+                session_factory = deps.get("session_factory")
+                if session_factory:
+                    from src.workflow.research.session.manager import SessionManager
+                    session_manager = SessionManager(session_factory)
+            
+            if session_manager:
+                session_data = await session_manager.get_session(session_id)
+                if session_data and session_data.deep_search_result:
+                    session_deep_search_result = session_data.deep_search_result
+                    logger.info("Found deep_search_result in session", 
+                               session_id=session_id,
+                               result_length=len(session_deep_search_result),
+                               session_query=session_data.original_query[:100] if session_data.original_query else None,
+                               current_query=current_research_query[:100],
+                               note="Deep search result is tied to this session")
+                    
+                    # CRITICAL: Verify that session query matches current query
+                    # If session was created for a different query, we should run new deep search
+                    session_query = session_data.original_query if session_data.original_query else None
+                    if session_query and session_query.strip() != current_research_query.strip():
+                        logger.warning("Session deep_search_result exists but for DIFFERENT query - will run new deep search",
+                                     session_id=session_id,
+                                     session_query=session_query[:100],
+                                     current_query=current_research_query[:100],
+                                     note="Session query doesn't match current query - running new deep search")
+                        session_deep_search_result = None  # Ignore it and run new deep search
+        except Exception as e:
+            logger.warning("Failed to check session for deep_search_result", 
+                         session_id=session_id,
+                         error=str(e),
+                         exc_info=True)
+            # Continue to run new deep search if session check fails
     
-    # Step 2: Find clarification questions (should come AFTER deep search OR in the same message)
-    if deep_search_done:
-        # CRITICAL: Check the same message first (in case deep search and clarification are combined)
-        if deep_search_index >= 0:
-            msg = chat_history[deep_search_index]
-            if msg.get("role") == "assistant":
-                content = msg.get("content", "").lower()
-                # Check if clarification is also in the same message (combined message)
-                if "clarification" in content or "🔍" in content or "clarify" in content:
-                    found_clarification = True
-                    clarification_index = deep_search_index
-                    logger.info("Found clarification questions in same message as deep search (combined message)", 
-                               message_index=deep_search_index, 
-                               note="Deep search and clarification are in one message")
-                    # Step 3: Check if user answered (next message should be from user)
-                    if deep_search_index + 1 < len(chat_history) and chat_history[deep_search_index + 1].get("role") == "user":
-                        has_user_answer = True
-                        logger.info("User answered clarification questions", 
-                                   answer_preview=chat_history[deep_search_index + 1].get("content", "")[:100])
-        
-        # Also check messages AFTER deep search (in case they were sent separately)
-        if not found_clarification:
-            for i in range(deep_search_index + 1, len(chat_history)):
-                msg = chat_history[i]
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "").lower()
-                    if "clarification" in content or "🔍" in content or "clarify" in content:
-                        found_clarification = True
-                        clarification_index = i
-                        logger.info("Found clarification questions in chat history", message_index=i, after_deep_search=True)
-                        # Step 3: Check if user answered (next message should be from user)
-                        if i + 1 < len(chat_history) and chat_history[i + 1].get("role") == "user":
-                            has_user_answer = True
-                            logger.info("User answered clarification questions", answer_preview=chat_history[i + 1].get("content", "")[:100])
-                            break
-    
-    # If deep search was done AND clarification was asked AND user answered, skip deep search
-    if deep_search_done and found_clarification and has_user_answer:
-        logger.info("CRITICAL: Skipping deep search - already completed, clarification asked, and user answered. Proceeding directly to research.")
-        # CRITICAL: Return the existing deep_search_result from state if available, otherwise return empty
-        # This ensures the result is preserved for the rest of the workflow
-        existing_result = state.get("deep_search_result", "")
-        if existing_result and not (isinstance(existing_result, dict) and existing_result.get("type") == "override" and existing_result.get("value") == ""):
-            logger.info("Using existing deep_search_result from state for continuation")
-            return {"deep_search_result": existing_result}
-        else:
-            # Return empty result - clarify node will use existing context, then proceed to research
-            return {"deep_search_result": {"type": "override", "value": ""}}
+    # If deep_search_result exists in session and matches current query, use it
+    if session_deep_search_result:
+        logger.info("Using deep_search_result from session - skipping deep search execution",
+                   session_id=session_id,
+                   result_length=len(session_deep_search_result))
+        return {"deep_search_result": {"type": "override", "value": session_deep_search_result}}
     
     # Also check if deep_search_result already exists in state (from checkpoint)
-    # This is CRITICAL for continuation after clarification
+    # This is for continuation within the same session after clarification
     deep_search_result_raw = state.get("deep_search_result", "")
     if deep_search_result_raw:
         # Extract actual value if it's a dict with "type": "override"
@@ -293,24 +297,13 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
         else:
             actual_result = deep_search_result_raw
         
-        # CRITICAL: If deep_search_result exists in state (from checkpoint), check if user answered clarification
-        # ONLY skip if user actually answered - otherwise we might loop
-        if actual_result or (isinstance(deep_search_result_raw, dict) and deep_search_result_raw.get("type") == "override"):
-            # CRITICAL: Only skip if user answered clarification - check both chat_history and state
-            # If user hasn't answered, we should NOT skip - let the graph wait for user input
-            if has_user_answer:
-                logger.info("CRITICAL: Skipping deep search - result exists in state (from checkpoint) and user answered clarification. Proceeding directly to research.")
-                return {"deep_search_result": deep_search_result_raw}
-            elif clarification_index >= 0:
-                # Clarification was asked but user hasn't answered yet
-                # CRITICAL: Return existing result to avoid re-running deep search, but don't skip node
-                # The graph will continue to clarify node, which will stop and wait for user input
-                logger.info("CRITICAL: Deep search result exists but user hasn't answered clarification yet. Returning existing result - graph will stop at clarify node and wait for user.")
-                # Return existing result - this prevents re-running deep search
-                # Graph will proceed to clarify node, which will detect no answer and stop (END)
-                # CRITICAL: Return empty override to signal that we should NOT re-run deep search
-                # but also NOT proceed to research (wait for user answer)
-                return {"deep_search_result": {"type": "override", "value": ""}}
+        # If result exists and is not empty, it's from checkpoint (same session continuation)
+        if actual_result and actual_result.strip():
+            logger.info("Using deep_search_result from state (checkpoint) - skipping deep search execution",
+                       session_id=session_id,
+                       result_length=len(actual_result),
+                       note="This is a continuation within the same session")
+            return {"deep_search_result": {"type": "override", "value": actual_result}}
     
     # Restore runtime dependencies if not in state
     state = _restore_runtime_deps(state)
@@ -372,12 +365,29 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
             scraper=scraper,
         )
 
+        # CRITICAL: Use current_research_query for deep search, not the potentially outdated query
+        # This ensures we search for the correct topic
+        deep_search_query = current_research_query
+        logger.info("Executing deep search with query", 
+                   query=deep_search_query[:100],
+                   original_query=original_query[:100] if original_query else None,
+                   note="Using current_research_query to ensure correct topic")
+        
+        # CRITICAL: In deep research mode, DO NOT pass chat_history from other modes!
+        # chat_history may contain deep search results from chat mode, which should NOT be used.
+        # Deep research should be isolated - only use session data, not chat history from other modes.
+        # Pass empty chat_history to ensure deep search doesn't use results from other modes.
+        chat_history_for_deep_search = []  # CRITICAL: Empty to prevent using chat history from other modes
+        logger.info("Using empty chat_history for deep search in deep research mode",
+                   session_id=session_id,
+                   note="Deep research is isolated from chat mode - no chat_history from other modes")
+        
         # Run deep search
         result = await search_service._answer_deep_search(
-            query=query,
+            query=deep_search_query,  # CRITICAL: Use current_research_query, not potentially outdated query
             classification=None,  # Will be created internally
             stream=stream,
-            chat_history=chat_history,
+            chat_history=chat_history_for_deep_search,  # CRITICAL: Empty to prevent using chat history from other modes
         )
 
         logger.info("Deep search completed", answer_length=len(result) if result else 0)
@@ -466,6 +476,45 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
                     await asyncio.sleep(0.1)
                 except Exception as e2:
                     logger.error("Failed to emit status after deep search", error=str(e2))
+
+        # CRITICAL: Save deep_search_result to SESSION, not just return it
+        # This ensures it's tied to this specific deep research session
+        session_id_for_save = state.get("session_id")
+        if session_id_for_save and result:
+            try:
+                # Get session_manager from stream.app_state or runtime deps
+                stream_for_save = state.get("stream")
+                session_manager = None
+                
+                if stream_for_save and hasattr(stream_for_save, "app_state"):
+                    session_factory = stream_for_save.app_state.get("session_factory")
+                    if session_factory:
+                        from src.workflow.research.session.manager import SessionManager
+                        session_manager = SessionManager(session_factory)
+                
+                if not session_manager:
+                    # Try to get from runtime deps
+                    deps = _get_runtime_deps()
+                    session_factory = deps.get("session_factory")
+                    if session_factory:
+                        from src.workflow.research.session.manager import SessionManager
+                        session_manager = SessionManager(session_factory)
+                
+                if session_manager:
+                    await session_manager.save_deep_search_result(session_id_for_save, result)
+                    logger.info("Saved deep_search_result to session", 
+                               session_id=session_id_for_save,
+                               result_length=len(result),
+                               note="Deep search result is now tied to this deep research session")
+                else:
+                    logger.warning("Cannot save deep_search_result to session - session_manager not available",
+                                 session_id=session_id_for_save)
+            except Exception as e:
+                logger.error("Failed to save deep_search_result to session", 
+                           session_id=session_id_for_save,
+                           error=str(e),
+                           exc_info=True)
+                # Continue anyway - result is still returned in state
 
         return {
             "deep_search_result": {"type": "override", "value": result},

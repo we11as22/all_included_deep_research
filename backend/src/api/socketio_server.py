@@ -182,13 +182,34 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                             for msg in messages
                         ]
 
-                # Determine original query (first user message)
-                original_query = message
-                if chat_history:
-                    for msg in chat_history:
-                        if msg['role'] == 'user':
-                            original_query = msg['content']
-                            break
+                # CRITICAL: For deep_research mode, use original_query from session (already set above)
+                # For other modes, determine original query from chat history
+                # Initialize original_query if not already set (for non-deep-research modes)
+                if 'original_query' not in locals() or original_query is None:
+                    original_query = message
+                
+                if mode not in ['deep_research', 'quality']:
+                    # Determine original query (first user message) for non-deep-research modes
+                    original_query = message
+                    if chat_history:
+                        for msg in chat_history:
+                            if msg['role'] == 'user':
+                                original_query = msg['content']
+                                break
+                else:
+                    # For deep_research mode, original_query should be already set from SessionManager above (line 126)
+                    # If not set (shouldn't happen, but safety check), use current message
+                    if original_query is None:
+                        logger.warning("⚠️ SocketIO: original_query not set from session, using current message as fallback",
+                                     session_id=session_id,
+                                     current_message=message[:100])
+                        original_query = message
+                    else:
+                        logger.info("🔍 SocketIO: Using original_query from deep_research session",
+                                   original_query=original_query[:100] if original_query else None,
+                                   current_message=message[:100],
+                                   session_id=session_id,
+                                   note="CRITICAL: original_query from session, NOT from chat_history!")
 
                 # Process based on mode
                 if mode == 'chat':
@@ -206,7 +227,17 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         stream=stream_generator,
                         messages=chat_history,
                     )
-                    await _emit_answer(stream_generator, result.answer)
+                    # CRITICAL: Log answer formatting before emitting
+                    import re
+                    answer = result.answer
+                    newline_count = answer.count("\n") if answer else 0
+                    has_newlines = "\n" in (answer or "")
+                    logger.info("Web search answer received", 
+                               answer_length=len(answer) if answer else 0,
+                               newline_count=newline_count,
+                               has_newlines=has_newlines,
+                               has_markdown_headings=bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE)) if answer else False)
+                    await _emit_answer(stream_generator, answer)
                 elif mode in ['deep_search', 'balanced']:
                     # Deep search with multiple iterations
                     result = await chat_service.answer_deep(
@@ -214,7 +245,17 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         stream=stream_generator,
                         messages=chat_history,
                     )
-                    await _emit_answer(stream_generator, result.answer)
+                    # CRITICAL: Log answer formatting before emitting
+                    import re
+                    answer = result.answer
+                    newline_count = answer.count("\n") if answer else 0
+                    has_newlines = "\n" in (answer or "")
+                    logger.info("Deep search answer received", 
+                               answer_length=len(answer) if answer else 0,
+                               newline_count=newline_count,
+                               has_newlines=has_newlines,
+                               has_markdown_headings=bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE)) if answer else False)
+                    await _emit_answer(stream_generator, answer)
                 elif mode in ['deep_research', 'quality']:
                     # Full research workflow using LangGraph
                     from src.workflow.research import run_research_graph
@@ -556,12 +597,26 @@ async def _emit_answer(stream_generator: SocketIOStreamingGenerator, answer: str
         await stream_generator.emit_error("No answer generated")
         return
 
+    # CRITICAL: Log formatting before emitting
+    import re
+    newline_count = answer.count("\n")
+    has_newlines = "\n" in answer
+    has_markdown = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+    logger.info("Emitting answer via SocketIO", 
+               answer_length=len(answer),
+               newline_count=newline_count,
+               has_newlines=has_newlines,
+               has_markdown_headings=has_markdown,
+               answer_preview=answer[:200])
+
     await stream_generator.emit_status("Finalizing answer...", step="answer")
     # CRITICAL: Send answer in chunks (same as deep research - 10000 chars per chunk)
     # This preserves markdown structure and ensures smooth streaming
+    # CRITICAL: _chunk_text preserves all formatting including \n
     for chunk in _chunk_text(answer, size=10000):
         await stream_generator.emit_report_chunk(chunk)
         await asyncio.sleep(0.02)
+    # CRITICAL: emit_final_report preserves all formatting including \n
     await stream_generator.emit_final_report(answer)
 
 
@@ -569,5 +624,10 @@ def _chunk_text(text: str, size: int = 10000) -> list[str]:
     """
     Split text into chunks (same as deep research - 10000 chars per chunk).
     This preserves markdown structure and ensures smooth streaming.
+    
+    CRITICAL: Preserves all formatting including newlines - chunks are just slices of original text.
     """
-    return [text[i : i + size] for i in range(0, len(text), size)]
+    # CRITICAL: Simple slicing preserves all formatting including \n
+    # No processing that could lose formatting
+    chunks = [text[i : i + size] for i in range(0, len(text), size)]
+    return chunks

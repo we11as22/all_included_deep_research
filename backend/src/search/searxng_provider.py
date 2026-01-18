@@ -42,9 +42,12 @@ class SearXNGSearchProvider(SearchProvider):
         """
         Improve query for better search engine results.
         
-        The problem: Search engines (especially Bing) inside SearXNG often
+        CRITICAL: Return query as-is - preserve full query with all words!
+        Do NOT truncate or split - this causes searches to work only by first word.
+        
+        The problem: Some search engines (especially Bing) inside SearXNG often
         ignore words after the first one in multi-word queries, especially
-        for non-English languages.
+        for non-English languages. But we've excluded Bing, so this shouldn't happen.
         
         Solution: Return query as-is - let LLM generate better queries.
         We rely on semantic reranking to filter irrelevant results.
@@ -52,7 +55,13 @@ class SearXNGSearchProvider(SearchProvider):
         if not query:
             return query
         
-        return query.strip()
+        # CRITICAL: Preserve full query - do NOT truncate or split!
+        # Log query length to ensure it's not being truncated
+        query_stripped = query.strip()
+        if len(query_stripped) != len(query):
+            logger.debug("Query had leading/trailing whitespace", original_length=len(query), stripped_length=len(query_stripped))
+        
+        return query_stripped
 
     def _detect_language(self, query: str) -> str:
         """
@@ -78,29 +87,54 @@ class SearXNGSearchProvider(SearchProvider):
         """
         Select appropriate engines based on query language.
         
-        For Russian queries, Bing often returns irrelevant results.
-        According to SearXNG docs and testing, we should exclude Bing
-        for Russian queries and use Google, DuckDuckGo, etc.
+        CRITICAL: Always exclude Bing - it has problems with multi-word queries,
+        especially for non-English languages. It often searches only by first word.
+        
+        Uses engines from configuration (self.engines) or engines_override,
+        but always excludes Bing.
         
         Args:
             query: Search query
             engines_override: Original engines override list
         
         Returns:
-            Modified engines list or None to use defaults
+            Modified engines list with Bing excluded, or None to use SearXNG defaults
         """
-        # If engines are explicitly provided, use them as-is
+        # Priority 1: If engines_override is explicitly provided, use it (but exclude problematic engines)
         if engines_override is not None:
-            return engines_override
+            # Remove Bing and Yahoo from the list if present
+            # Yahoo has problems with multi-word queries (searches only by first word)
+            filtered = [e for e in engines_override if e.lower() not in ["bing", "yahoo"]]
+            if len(filtered) != len(engines_override):
+                removed = [e for e in engines_override if e.lower() in ["bing", "yahoo"]]
+                logger.info("Removed problematic engines from engines override", original=engines_override, filtered=filtered, removed=removed)
+            return filtered if filtered else None
         
-        # For Russian queries, exclude Bing (it returns irrelevant results)
+        # Priority 2: Use engines from configuration (self.engines from settings)
+        # These come from searxng_engines setting or are empty
+        if self.engines:
+            # Remove Bing and Yahoo from configured engines if present
+            # Yahoo also has problems with multi-word queries (searches only by first word)
+            filtered = [e for e in self.engines if e.lower() not in ["bing", "yahoo"]]
+            if len(filtered) != len(self.engines):
+                removed = [e for e in self.engines if e.lower() in ["bing", "yahoo"]]
+                logger.info("Removed problematic engines from configured engines", original=self.engines, filtered=filtered, removed=removed)
+            logger.debug("Using configured engines (Bing and Yahoo excluded)", engines=filtered, query=query[:100])
+            return filtered if filtered else None
+        
+        # Priority 3: No engines specified - let SearXNG auto-select from enabled engines
+        # But for Russian queries, we should exclude Yahoo (it searches only by first word)
+        # Bing is already disabled in settings.yml, so it won't be used
         if self._contains_cyrillic(query):
-            # Don't specify engines - let SearXNG auto-select, but it will avoid Bing
-            # if we don't explicitly include it
-            # Actually, let SearXNG handle it - it will auto-select working engines
-            return None
+            # For Russian queries, Yahoo often searches only by first word
+            # We can't exclude it here (no engines specified), but we log a warning
+            logger.warning(
+                "Russian query without explicit engines - Yahoo may search only by first word",
+                query=query[:100],
+                note="Consider specifying engines in settings to exclude Yahoo for Russian queries"
+            )
         
-        # For other languages, use defaults
+        logger.debug("No engines specified - SearXNG will auto-select from enabled engines (Bing is disabled in config)", query=query[:100])
         return None
     
     def _build_params(self, query: str, engines_override: list[str] | None) -> dict[str, str | int]:
@@ -117,8 +151,18 @@ class SearXNGSearchProvider(SearchProvider):
         Returns:
             Dict with search parameters
         """
+        # CRITICAL: Preserve full query - do NOT truncate!
+        # Log full query to ensure it's not being truncated
+        logger.debug(
+            "Building SearXNG params with full query",
+            query_full=query,
+            query_length=len(query),
+            query_words=len(query.split()) if query else 0,
+            note="Full query is preserved and will be sent to SearXNG"
+        )
+        
         params: dict[str, str | int] = {
-            "q": query,
+            "q": query,  # CRITICAL: Full query, not truncated!
             "format": "json",
         }
         
@@ -138,23 +182,16 @@ class SearXNGSearchProvider(SearchProvider):
             params["categories"] = ",".join(self.categories)
         
         # Handle engines: select appropriate engines based on query language
-        # For Russian queries, exclude Bing (it returns irrelevant results)
+        # CRITICAL: Always exclude Bing - it has problems with multi-word queries
+        # Uses engines from config (self.engines) or engines_override, but always excludes Bing
         selected_engines = self._get_engines_for_language(query, engines_override)
         
-        if selected_engines is not None:
-            # Engines explicitly selected
-            if selected_engines:  # Non-empty list
-                params["engines"] = ",".join(selected_engines)
-            # If empty list, don't add engines param - SearXNG auto-selects
-        elif engines_override is not None:
-            # engines_override explicitly provided
-            if engines_override:  # Non-empty list
-                params["engines"] = ",".join(engines_override)
-            # If empty list, don't add engines param - SearXNG auto-selects
-        elif self.engines:
-            # Use configured engines from settings (if any)
-            params["engines"] = ",".join(self.engines)
-        # If no engines specified at all, SearXNG will auto-select
+        if selected_engines is not None and selected_engines:
+            # Engines explicitly selected (Bing already excluded by _get_engines_for_language)
+            params["engines"] = ",".join(selected_engines)
+            logger.debug("Using selected engines (Bing excluded)", engines=selected_engines, query=query[:100])
+        # If selected_engines is None or empty, don't add engines param - SearXNG will auto-select
+        # from enabled engines in settings.yml (Bing is already disabled there)
         
         return params
 
@@ -239,6 +276,25 @@ class SearXNGSearchProvider(SearchProvider):
 
                     if data.get("results") and len(data.get("results", [])) > 0:
                         first_result = data["results"][0]
+                        
+                        # CRITICAL: Collect all engines used in results to see which ones SearXNG selected
+                        engines_used = set()
+                        for r in data.get("results", []):
+                            if isinstance(r, dict):
+                                engine = r.get("engine", "unknown")
+                                if engine and engine != "unknown":
+                                    engines_used.add(engine)
+                        
+                        logger.info(
+                            "SearXNG engines used in results",
+                            query=query[:100],
+                            engines_used=sorted(list(engines_used)),
+                            engines_count=len(engines_used),
+                            total_results=len(data.get("results", [])),
+                            label=label,
+                            note="These are the engines that SearXNG actually used (auto-selected from enabled engines)"
+                        )
+                        
                         # Log first few results to debug relevance
                         top_3_results = []
                         for r in data.get("results", [])[:3]:

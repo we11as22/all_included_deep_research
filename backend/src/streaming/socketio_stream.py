@@ -1,6 +1,7 @@
 """Socket.IO streaming generator (replaces SSE)."""
 
 import asyncio
+import re
 import time
 from typing import Any, Dict, List, Optional
 import socketio
@@ -249,8 +250,163 @@ class SocketIOStreamingGenerator:
         return self._schedule(self._emit('stream:report_chunk', {'content': chunk}))
 
     def emit_final_report(self, report: str) -> asyncio.Task | None:
-        """Emit final report."""
-        return self._schedule(self._emit('stream:final_report', {'report': report}))
+        """Emit final report and save to DB.
+        
+        CRITICAL: Preserves all formatting including newlines - content is saved as-is.
+        """
+        # CRITICAL: Preserve all formatting including newlines - don't modify content!
+        # Report should already be in markdown format with proper \n characters
+        import re
+        has_newlines = "\n" in report
+        newline_count = report.count("\n")
+        has_markdown = bool(re.search(r'^#{2,}\s+', report, re.MULTILINE))
+        
+        logger.info("Emitting final report via SocketIO", 
+                   report_length=len(report),
+                   newline_count=newline_count,
+                   has_newlines=has_newlines,
+                   has_markdown_headings=has_markdown,
+                   message_id=self.message_id,
+                   chat_id=self.chat_id)
+        
+        # Emit to client
+        emit_task = self._schedule(self._emit('stream:final_report', {
+            'report': report,  # CRITICAL: Preserve original content with all \n
+            'length': len(report),
+            'has_newlines': has_newlines,
+            'newline_count': newline_count,
+        }))
+        
+        # CRITICAL: Save final report to DB immediately (same as SSE version)
+        # This ensures all assistant messages are persisted for ALL modes (chat, search, deep_search, deep_research)
+        asyncio.create_task(self._save_final_message_to_db(report))
+        
+        return emit_task
+    
+    async def _save_final_message_to_db(self, content: str) -> None:
+        """
+        Save final message to database asynchronously.
+        
+        This is called for all final reports (chat, search, deep_search, deep_research).
+        Works for ALL modes that use SocketIOStreamingGenerator.
+        
+        CRITICAL: Preserves all formatting including newlines - content is saved as-is.
+        """
+        if not content or not content.strip():
+            logger.warning("Cannot save final message to DB - content is empty")
+            return
+        
+        # Get chat_id and session_factory from app_state
+        chat_id = self.chat_id or self.app_state.get("chat_id")
+        session_factory = self.app_state.get("session_factory")
+        
+        if not chat_id or not session_factory:
+            logger.warning("Cannot save final message to DB - chat_id or session_factory missing",
+                          has_chat_id=bool(chat_id), 
+                          has_session_factory=bool(session_factory),
+                          app_state_keys=list(self.app_state.keys()) if self.app_state else [])
+            return
+        
+        # CRITICAL: Don't strip or modify content - preserve all formatting including \n
+        final_content = content
+        if not final_content.strip():
+            return
+        
+        # CRITICAL: Log formatting preservation
+        import re
+        has_newlines = "\n" in final_content
+        newline_count = final_content.count("\n")
+        has_markdown = bool(re.search(r'^#{2,}\s+', final_content, re.MULTILINE))
+        logger.debug("Saving final message with formatting via SocketIO", 
+                    content_length=len(final_content),
+                    newline_count=newline_count,
+                    has_newlines=has_newlines,
+                    has_markdown_headings=has_markdown,
+                    message_id=self.message_id,
+                    chat_id=chat_id)
+        
+        # Generate unique message_id if not set
+        import time
+        message_id = self.message_id or f"assistant_{self.session_id}_{int(time.time() * 1000)}"
+        
+        # Save with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                from src.database.schema import ChatMessageModel, ChatModel
+                from sqlalchemy import select
+                from datetime import datetime
+                
+                async with session_factory() as session:
+                    # Verify chat exists
+                    result = await session.execute(
+                        select(ChatModel).where(ChatModel.id == chat_id)
+                    )
+                    chat = result.scalar_one_or_none()
+                    
+                    if not chat:
+                        logger.warning("Chat not found for final message save", chat_id=chat_id)
+                        return
+                    
+                    # Check if message already exists
+                    existing_result = await session.execute(
+                        select(ChatMessageModel).where(ChatMessageModel.message_id == message_id)
+                    )
+                    existing_message = existing_result.scalar_one_or_none()
+                    
+                    # CRITICAL: Generate embedding for search functionality
+                    # This ensures ALL final messages (from all modes) are searchable
+                    embedding = None
+                    if final_content.strip():
+                        try:
+                            embedding_provider = self.app_state.get("embedding_provider")
+                            if embedding_provider:
+                                embedding_vector = await embedding_provider.embed_text(final_content)
+                                from src.database.schema import EMBEDDING_DIMENSION
+                                db_dimension = EMBEDDING_DIMENSION
+                                if len(embedding_vector) < db_dimension:
+                                    embedding_vector = list(embedding_vector) + [0.0] * (db_dimension - len(embedding_vector))
+                                elif len(embedding_vector) > db_dimension:
+                                    embedding_vector = embedding_vector[:db_dimension]
+                                embedding = embedding_vector
+                                logger.debug("Generated embedding for final message via SocketIO", message_id=message_id, embedding_dim=len(embedding_vector))
+                            else:
+                                logger.warning("No embedding_provider available - final message will not be searchable", message_id=message_id)
+                        except Exception as e:
+                            logger.warning("Failed to generate embedding for final message via SocketIO", error=str(e), message_id=message_id, exc_info=True)
+                    
+                    if existing_message:
+                        # Update existing message
+                        existing_message.content = final_content  # CRITICAL: Preserve all formatting including \n
+                        existing_message.role = "assistant"
+                        if embedding is not None:
+                            existing_message.embedding = embedding
+                        chat.updated_at = datetime.now()
+                        await session.commit()
+                        logger.info("Final message updated in DB via SocketIO", message_id=message_id, content_length=len(final_content), has_embedding=embedding is not None)
+                        return
+                    else:
+                        # Create new message
+                        message = ChatMessageModel(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            role="assistant",
+                            content=final_content,  # CRITICAL: Preserve all formatting including \n
+                            embedding=embedding,
+                        )
+                        session.add(message)
+                        chat.updated_at = datetime.now()
+                        await session.commit()
+                        logger.info("Final message saved to DB via SocketIO", message_id=message_id, content_length=len(final_content), has_embedding=embedding is not None)
+                        return
+                        
+            except Exception as e:
+                logger.error(f"Failed to save final message to DB via SocketIO (attempt {attempt + 1}/{max_retries})",
+                            error=str(e), message_id=message_id, exc_info=True)
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(0.5 * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error("Failed to save final message to DB via SocketIO after all retries", message_id=message_id)
 
     def emit_error(self, error: str, details: Optional[str] = None) -> asyncio.Task | None:
         """Emit error event."""

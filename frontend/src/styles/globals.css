@@ -126,6 +126,44 @@
   @apply border-l-4 border-primary pl-4 italic my-4;
 }
 
+/* KaTeX LaTeX formula styling */
+.katex-block {
+  @apply my-4 overflow-x-auto;
+  text-align: center;
+}
+
+.katex-inline {
+  @apply inline-block;
+  vertical-align: baseline;
+}
+
+/* Ensure KaTeX formulas are properly styled in dark mode */
+.dark .katex {
+  color: hsl(var(--foreground));
+}
+
+.dark .katex .base {
+  color: hsl(var(--foreground));
+}
+
+/* List markers styling */
+ul li::marker,
+ol li::marker {
+  color: hsl(var(--foreground));
+  font-weight: normal;
+}
+
+ul li::marker {
+  content: '•';
+}
+
+/* Ensure list markers are visible and properly styled */
+.prose ul li::marker,
+.prose ol li::marker {
+  color: hsl(var(--foreground));
+  opacity: 1;
+}
+
 /* Animations */
 @keyframes pulse-slow {
   0%, 100% {

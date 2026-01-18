@@ -355,8 +355,18 @@ CRITICAL INSTRUCTIONS FOR NOTES AND MEMORY:
 
 Available actions:
 - web_search(queries: list[str]): Search the web with natural queries (write as you would in a browser)
+- select_urls_to_scrape(search_results: list, original_query: str, max_urls: int): Analyze search results and select the most relevant URLs for scraping
 - scrape_url(urls: list[str]): Get full content from URLs
 - done(): Signal completion
+
+**MANDATORY WORKFLOW FOR BETTER RESULTS:**
+After EVERY web_search, you MUST:
+1. **MANDATORY**: Call select_urls_to_scrape tool with search_results from web_search to analyze and choose the best URLs
+2. **CRITICAL**: When calling select_urls_to_scrape, pass ALL results from web_search (all results_count), NOT just the first few!
+3. **CRITICAL**: The web_search returns results_count results - you MUST pass ALL of them to select_urls_to_scrape
+4. **MANDATORY**: Then call scrape_url tool with selected_urls from select_urls_to_scrape to get full content
+5. This ensures you scrape only relevant, high-quality sources (like ai.meta.com, huggingface.co), not just top-N by order
+6. **CRITICAL**: Do NOT skip select_urls_to_scrape - it's essential for choosing the best sources!
 
 **CRITICAL: Information Verification and Source Quality:**
 - **MANDATORY: Always verify information when in doubt** - If you have ANY doubt about the accuracy, reliability, or credibility of information, you MUST cross-check it with multiple independent sources
@@ -694,6 +704,23 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                         # Notes should only be created when agent finds IMPORTANT information
                         # The agent will decide what to save based on actual findings
                         # We only track sources here for the agent's context
+                        
+                        # CRITICAL: Format result for LLM to see ALL results (up to 15) so agent can see authoritative sources
+                        # Not just top 5, because authoritative sources like ai.meta.com might be ranked lower
+                        all_results = result.get("results", [])
+                        formatted_result = {
+                            "results_count": len(all_results),
+                            "results": [
+                                {
+                                    "title": r.get("title", ""),
+                                    "url": r.get("url", ""),
+                                    "snippet": r.get("snippet", "")[:200]  # Truncate for readability
+                                }
+                                for r in all_results[:15]  # Show top 15 results so agent sees authoritative sources
+                            ],
+                            "note": f"Total {len(all_results)} results found. When calling select_urls_to_scrape, pass ALL {len(all_results)} results, not just the first few!"
+                        }
+                        result = formatted_result
                     
                     # Handle scrape_url results - DO NOT automatically create notes
                     # The agent should analyze scraped content and decide what's important to save
@@ -753,6 +780,23 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                         # DO NOT automatically create notes for search results
                         # Agent should analyze results and decide what's important to save
                         # Notes should only be created when agent finds IMPORTANT information
+                        
+                        # CRITICAL: Format result for LLM to see ALL results (up to 15) so agent can see authoritative sources
+                        # Not just top 5, because authoritative sources like ai.meta.com might be ranked lower
+                        all_results = result.get("results", [])
+                        formatted_result = {
+                            "results_count": len(all_results),
+                            "results": [
+                                {
+                                    "title": r.get("title", ""),
+                                    "url": r.get("url", ""),
+                                    "snippet": r.get("snippet", "")[:200]  # Truncate for readability
+                                }
+                                for r in all_results[:15]  # Show top 15 results so agent sees authoritative sources
+                            ],
+                            "note": f"Total {len(all_results)} results found. When calling select_urls_to_scrape, pass ALL {len(all_results)} results, not just the first few!"
+                        }
+                        result = formatted_result
                     
                     # Handle scrape_url results - DO NOT automatically create notes
                     # Agent should analyze scraped content and decide what's important to save

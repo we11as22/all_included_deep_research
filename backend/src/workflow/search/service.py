@@ -154,17 +154,39 @@ IMPORTANT:
 
         messages.append(HumanMessage(content=query))
 
-        # Use structured output for chat response
-        from src.models.schemas import SynthesizedAnswer
+        # CRITICAL: Use simple LLM call WITHOUT structured output to preserve markdown formatting!
+        # Structured output (JSON) loses \n characters during JSON parsing
+        # Deep Research uses simple llm.ainvoke() and preserves formatting - we should do the same!
+        logger.info(
+            "Calling LLM for chat answer (simple call, no structured output)",
+            prompt_length=sum(len(str(m.content)) for m in messages),
+            note="Using simple llm.ainvoke() like DeepSearchNode to preserve markdown formatting"
+        )
         
-        structured_llm = self.classifier_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
-        response = await structured_llm.ainvoke(messages)
+        response = await self.classifier_llm.ainvoke(messages)
         
-        if isinstance(response, SynthesizedAnswer):
-            answer = response.answer.strip()
-        else:
-            # Fallback
-            answer = response.content.strip() if hasattr(response, "content") else str(response)
+        # CRITICAL: Get answer directly from LLM response (like DeepSearchNode)
+        answer = response.content if hasattr(response, 'content') else str(response)
+        
+        # CRITICAL: Log EXACTLY what LLM returned - BEFORE any processing
+        if answer:
+            import re
+            raw_newline_count = answer.count('\n')
+            raw_double_newline_count = answer.count('\n\n')
+            raw_triple_newline_count = answer.count('\n\n\n')
+            has_markdown_headings = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+            
+            logger.info(
+                "RAW LLM CHAT RESPONSE (before any processing)",
+                answer_length=len(answer),
+                newline_count=raw_newline_count,
+                double_newline_count=raw_double_newline_count,
+                triple_newline_count=raw_triple_newline_count,
+                has_markdown_headings=has_markdown_headings,
+                first_200_chars=repr(answer[:200]),  # Use repr to see actual \n characters
+                last_200_chars=repr(answer[-200:]) if len(answer) > 200 else repr(answer),
+                note="This is EXACTLY what LLM returned - no structured output, no JSON parsing"
+            )
 
         return answer
 

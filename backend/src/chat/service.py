@@ -138,25 +138,32 @@ class ChatSearchService:
         chat_history = format_chat_history(messages, self.settings.chat_history_limit) if messages else None
         current_date = get_current_date()
         
+        # CRITICAL: Use simple LLM call WITHOUT structured output to preserve markdown formatting!
+        # Structured output (JSON) loses \n characters during JSON parsing
+        # Deep Research uses simple llm.ainvoke() and preserves formatting - we should do the same!
         system_prompt = (
             f"You are a helpful AI assistant. Provide comprehensive, detailed, and accurate responses in markdown format. "
             f"Current date: {current_date} - always consider this when providing information about dates, events, or current affairs.\n\n"
             f"CRITICAL MARKDOWN FORMATTING REQUIREMENT:\n"
-            f"- Your answer field MUST be valid markdown with proper formatting\n"
+            f"- Your answer MUST be valid markdown with proper formatting - NOT plain text!\n"
             f"- Use ## for main sections (NOT # - start with ##)\n"
             f"- Use ### for subsections\n"
             f"- Use **bold** for emphasis, *italic* for subtle emphasis\n"
             f"- Use proper markdown lists (- for unordered, 1. for ordered)\n"
             f"- Use proper markdown links: [text](url)\n"
             f"- Structure with clear markdown sections - do NOT use plain text!\n"
-            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n\n"
+            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n"
+            f"- CRITICAL NEWLINE FORMATTING: Use TWO newlines (\\n\\n) between paragraphs and sections for proper markdown rendering!\n"
+            f"- Each paragraph must be separated by a blank line (two newlines: \\n\\n)!\n"
+            f"- Sections must be separated by blank lines!\n"
+            f"- This ensures proper markdown rendering on the frontend - without blank lines, paragraphs will merge together!\n\n"
             f"IMPORTANT:\n"
             f"- Provide comprehensive, detailed answers (800-1500 words minimum - be thorough!)\n"
             f"- Be thorough and complete - don't write brief summaries!\n"
             f"- Use proper markdown formatting throughout your response\n"
-            f"- CRITICAL: Your answer field MUST be in markdown format with proper headings (##), lists, and formatting!\n"
+            f"- CRITICAL: Your answer MUST be in markdown format with proper headings (##), lists, and formatting!\n"
             f"- Do NOT return plain text - always use markdown syntax!\n"
-            f"- Return JSON with fields reasoning, answer (MUST be valid markdown!), key_points"
+            f"- Return ONLY your answer in markdown format. Do NOT return JSON or any other format. Just the markdown answer."
         )
         
         # Format chat history to show actual messages from the chat
@@ -185,17 +192,51 @@ class ChatSearchService:
             f"- Use ### for subsections\n"
             f"- Use **bold**, *italic*, lists, headings - proper markdown syntax!\n"
             f"- Do NOT use plain text with large letters - use markdown headings!\n"
+            f"- CRITICAL NEWLINE FORMATTING: Use TWO newlines (\\n\\n) between paragraphs and sections!\n"
+            f"- Each paragraph must be separated by a blank line (two newlines)!\n"
             f"- Be comprehensive and detailed (600-1200 words minimum)\n"
             f"- Provide a helpful, accurate, and complete response based on the conversation context above.\n"
-            f"- Use proper markdown formatting throughout your response."
+            f"- Use proper markdown formatting throughout your response.\n\n"
+            f"Return ONLY your answer in markdown format. Do NOT return JSON or any other format. Just the markdown answer."
         )
         
-        structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
-        answer = await self._invoke_structured_answer(
-            structured_llm,
-            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
-            context="chat_simple",
+        # CRITICAL: Use simple LLM call (like DeepSearchNode) to preserve formatting!
+        # This avoids structured output JSON parsing which loses \n characters
+        logger.info(
+            "Calling LLM for chat answer (simple call, no structured output)",
+            prompt_length=len(user_prompt),
+            system_prompt_length=len(system_prompt),
+            note="Using simple llm.ainvoke() like DeepSearchNode to preserve markdown formatting"
         )
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        chat_result = await self.chat_llm.ainvoke([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ])
+        
+        # CRITICAL: Get answer directly from LLM response (like DeepSearchNode)
+        answer = chat_result.content if hasattr(chat_result, 'content') else str(chat_result)
+        
+        # CRITICAL: Log EXACTLY what LLM returned - BEFORE any processing
+        if answer:
+            import re
+            raw_newline_count = answer.count('\n')
+            raw_double_newline_count = answer.count('\n\n')
+            raw_triple_newline_count = answer.count('\n\n\n')
+            has_markdown_headings = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+            
+            logger.info(
+                "RAW LLM CHAT RESPONSE (before any processing)",
+                answer_length=len(answer),
+                newline_count=raw_newline_count,
+                double_newline_count=raw_double_newline_count,
+                triple_newline_count=raw_triple_newline_count,
+                has_markdown_headings=has_markdown_headings,
+                first_200_chars=repr(answer[:200]),  # Use repr to see actual \n characters
+                last_200_chars=repr(answer[-200:]) if len(answer) > 200 else repr(answer),
+                note="This is EXACTLY what LLM returned - no structured output, no JSON parsing"
+            )
 
         self._emit_status(stream, "Response generated", step="complete")
         
@@ -318,32 +359,16 @@ class ChatSearchService:
                 scraped_count=len(scraped_content)
             )
 
-            # Deduplication and reranking for better relevance
-            # Tavily already provides high-quality, relevant results with scores,
-            # so reranking is not needed for Tavily. For SearXNG (especially Bing),
-            # semantic reranking helps filter irrelevant results.
+            # Deduplication only - we trust the search provider's ranking
+            # Both Tavily and SearXNG provide their own ranking, so we don't rerank
             results = self._dedupe_results_simple(results)
             
             logger.info("Results after deduplication", 
                        query=query,
                        results_count=len(results),
-                       top_titles=[r.title[:50] for r in results[:5]])
-            
-            # Apply semantic reranking only for SearXNG (not for Tavily)
-            # Tavily already provides optimized, relevant results with scores
-            # SearXNG (especially Bing) may return irrelevant results for non-English queries
-            if (tuning.rerank_top_k and tuning.rerank_top_k > 0 and 
-                self.settings.search_provider == "searxng"):
-                results = await self._rerank_results(query, results, top_k=tuning.rerank_top_k)
-                logger.info("Results after reranking",
-                           query=query,
-                           results_count=len(results),
-                           top_titles=[r.title[:50] for r in results[:5]])
-            elif self.settings.search_provider == "tavily":
-                logger.info("Skipping reranking for Tavily (already optimized)",
-                           query=query,
-                           results_count=len(results),
-                           avg_score=sum(r.score for r in results) / len(results) if results else 0.0)
+                       top_titles=[r.title[:50] for r in results[:5]],
+                       search_provider=self.settings.search_provider,
+                       note="Using search provider's ranking, no reranking applied")
             
             self._emit_sources(stream, results, label=tuning.label)
 
@@ -370,8 +395,8 @@ class ChatSearchService:
                     else:
                         logger.warning(f"Unexpected scraped_content item type", item_type=type(item).__name__)
             else:
-                # Fallback: scrape top results
-                scraped = await self._scrape_results(results, tuning.scrape_top_n, stream=stream)
+                # Fallback: scrape top results with prioritization of authoritative sources
+                scraped = await self._scrape_results(results, tuning.scrape_top_n, stream=stream, query=query)
                 logger.info("Scraping completed", scraped_count=len(scraped), total_results=len(results))
                 summarized = await self._summarize_scraped(query, scraped, stream=stream)
                 logger.info("Summarization completed", summarized_count=len(summarized))
@@ -395,13 +420,32 @@ class ChatSearchService:
                 logger.error(
                     "Empty answer generated",
                     query=query,
-                    sources_count=len(results),
-                    scraped_count=len(summarized)
+                    sources_count=len(sources) if tuning.mode != "deep" else 0,
+                    scraped_count=len(scraped_content) if tuning.mode != "deep" else 0
                 )
                 answer = "I apologize, but I was unable to generate a comprehensive answer from the available sources. Please try rephrasing your question or try again later."
 
+            # For deep search mode, sources are already in answer with citations
+            # For web/search mode, convert sources to SearchResult format
+            if tuning.mode == "deep":
+                # Sources are already included in answer with citations
+                results = []
+            else:
+                results = sources if isinstance(sources, list) else []
+
+            # CRITICAL: Log formatting before returning
+            newline_count = answer.count("\n") if answer else 0
+            has_newlines = "\n" in (answer or "")
+            logger.info("Returning ChatSearchResult", 
+                       answer_length=len(answer),
+                       newline_count=newline_count,
+                       has_newlines=has_newlines,
+                       has_markdown_headings=bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE)) if answer else False,
+                       mode=tuning.mode)
+            
             self._emit_finding(stream, f"{tuning.mode}_search", answer)
             self._emit_status(stream, "Answer ready", "complete")
+            # CRITICAL: Return answer as-is - preserve all formatting including \n
             return ChatSearchResult(answer=answer, sources=results, memory_context=memory_context)
         except Exception as e:
             logger.error("Multi-query search failed", error=str(e), exc_info=True)
@@ -698,7 +742,30 @@ class ChatSearchService:
         results: list[SearchResult],
         top_n: int,
         stream: Any | None = None,
+        query: str | None = None,
     ) -> list[ScrapedContent]:
+        """
+        Scrape top results.
+        
+        Uses search provider's ranking - we trust the search engine's relevance ordering.
+        Simply scrape top N results as ranked by the search provider.
+        """
+        if not results:
+            return []
+        
+        # Trust search provider's ranking - scrape top N results as they are ordered
+        # Search providers (SearXNG, Tavily) already rank by relevance
+        selected_results = results[:top_n]
+        
+        logger.info(
+            "Selecting URLs for scraping",
+            total_results=len(results),
+            selected_total=len(selected_results),
+            top_n=top_n,
+            query=query[:100] if query else None,
+            selected_urls=[r.url for r in selected_results[:5]]
+        )
+        
         async def scrape_one(result: SearchResult) -> ScrapedContent | None:
             try:
                 if stream:
@@ -715,7 +782,7 @@ class ChatSearchService:
                 )
                 return None
 
-        tasks = [scrape_one(result) for result in results[:top_n]]
+        tasks = [scrape_one(result) for result in selected_results]
         # Use return_exceptions=True to continue even if some scrapes fail
         results_list = await asyncio.gather(*tasks, return_exceptions=True)
         scraped = [item for item in results_list if item and not isinstance(item, Exception)]
@@ -848,19 +915,28 @@ class ChatSearchService:
             f"- All text, headings, citations, and sources section must be in {user_language}\n"
             f"- Detect the language from the user's query and match it exactly\n"
             f"- Do NOT mix languages - use ONLY {user_language} throughout the entire answer\n\n"
-            f"CRITICAL MARKDOWN FORMATTING REQUIREMENT:\n"
-            f"- Your answer field MUST be valid markdown with proper formatting\n"
+            f"CRITICAL MARKDOWN FORMATTING REQUIREMENT (MANDATORY - NO EXCEPTIONS):\n"
+            f"- Your answer field MUST be valid markdown with proper formatting - NOT plain text!\n"
+            f"- You MUST use markdown syntax throughout the entire answer\n"
             f"- Use ## for main sections (NOT # - start with ##)\n"
             f"- Use ### for subsections\n"
             f"- Use **bold** for emphasis, *italic* for subtle emphasis\n"
             f"- Use proper markdown lists (- for unordered, 1. for ordered)\n"
             f"- Use proper markdown links: [text](url)\n"
             f"- Structure with clear markdown sections - do NOT use plain text!\n"
-            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n\n"
+            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n"
+            f"- FORBIDDEN: Do NOT write plain text without markdown formatting!\n"
+            f"- FORBIDDEN: Do NOT use large letters or bold text without markdown syntax!\n"
+            f"- EXAMPLE CORRECT FORMAT:\n"
+            f"  ## Main Section Title\n\n"
+            f"  This is a paragraph with **bold text** and *italic text*.\n\n"
+            f"  ### Subsection\n\n"
+            f"  - List item 1\n"
+            f"  - List item 2\n\n"
             f"CRITICAL INSTRUCTIONS:\n"
             f"1. Use ALL provided sources - each one has valuable information\n"
             f"2. Synthesize into a comprehensive, well-structured answer ({length_guide})\n"
-            f"3. CITE EVERY FACT with inline references [1], [2], etc.\n"
+            f"3. CITE EVERY FACT with inline references [1], [2], etc. in the text\n"
             f"4. Include specific details, data, and examples from sources\n"
             f"5. If sources provide different perspectives, present them all\n"
             f"6. Structure with clear sections using markdown (##, ###) - NOT plain text!\n"
@@ -868,7 +944,16 @@ class ChatSearchService:
             f"8. Use proper markdown formatting: **bold**, *italic*, lists, headings\n"
             f"9. Preserve all markdown formatting in your response\n"
             f"10. Be detailed and complete - don't write brief summaries!\n\n"
-            f"Return JSON with: reasoning (why sources support answer), answer (MUST be valid markdown with proper formatting!), key_points (list)"
+            f"CRITICAL SOURCES FORMATTING REQUIREMENT:\n"
+            f"- You MUST include inline citations [1], [2], [3], etc. in your answer text for every fact or claim\n"
+            f"- At the END of your answer, you MUST add a \"## Sources\" section with ALL sources used\n"
+            f"- Sources section format: Each source on a new line as \"- [Title](URL)\" (NOT \"[1] [Title](URL)\")\n"
+            f"- Example Sources section:\n"
+            f"  ## Sources\n\n"
+            f"  - [Source Title 1](https://example.com/1)\n"
+            f"  - [Source Title 2](https://example.com/2)\n"
+            f"- Include the Sources section directly in your answer field - it will be part of the markdown\n\n"
+            f"Return JSON with: reasoning (why sources support answer), answer (MUST be valid markdown with proper formatting including Sources section!), key_points (list)"
         )
         user_prompt = (
             f"User question: {query}\n"
@@ -877,54 +962,336 @@ class ChatSearchService:
             f"Current date: {current_date}\n\n"
             f"CRITICAL: Write your ENTIRE answer in {user_language} (the same language as the query above).\n"
             f"All text, headings, citations, and sources section must be in {user_language}.\n\n"
-            f"CRITICAL MARKDOWN FORMATTING:\n"
-            f"- Your answer MUST be valid markdown with proper formatting\n"
+            f"CRITICAL MARKDOWN FORMATTING (MANDATORY - NO EXCEPTIONS):\n"
+            f"- Your answer MUST be valid markdown with proper formatting - NOT plain text!\n"
+            f"- You MUST use markdown syntax throughout the entire answer\n"
             f"- Use ## for main sections (NOT # - start with ##)\n"
             f"- Use ### for subsections\n"
             f"- Use **bold**, *italic*, lists, headings - proper markdown syntax!\n"
-            f"- Do NOT use plain text with large letters - use markdown headings!\n\n"
+            f"- Do NOT use plain text with large letters - use markdown headings!\n"
+            f"- FORBIDDEN: Do NOT write plain text without markdown formatting!\n"
+            f"- FORBIDDEN: Do NOT use large letters or bold text without markdown syntax!\n\n"
             f"{history_block}\n\n"
             f"{memory_block}\n\n"
             f"Sources ({len(sources)} sources provided - USE THEM ALL):\n{sources_block}\n\n"
             f"Write a comprehensive, detailed answer using ALL sources above. Each source adds value - synthesize them together.\n"
-            f"Be thorough and complete - don't write brief summaries! Use proper markdown formatting throughout."
+            f"Be thorough and complete - don't write brief summaries! Use proper markdown formatting throughout.\n\n"
+            f"CRITICAL: Include inline citations [1], [2], [3] in your answer text for every fact.\n"
+            f"CRITICAL: At the END of your answer, you MUST add a \"## Sources\" section with ALL sources used.\n"
+            f"Sources section format: Each source on a new line as \"- [Title](URL)\" (NOT \"[1] [Title](URL)\").\n"
+            f"Example Sources section:\n"
+            f"  ## Sources\n\n"
+            f"  - [Source Title 1](https://example.com/1)\n"
+            f"  - [Source Title 2](https://example.com/2)\n"
+            f"The Sources section format matches deep_research draft_report format."
         )
 
-        structured_llm = self.chat_llm.with_structured_output(SynthesizedAnswer, method="function_calling")
+        # CRITICAL: Use simple LLM call WITHOUT structured output to preserve markdown formatting!
+        # Structured output (JSON) loses \n characters during JSON parsing
+        # Deep Research uses simple llm.ainvoke() and preserves formatting - we should do the same!
+        # 
+        # Build prompt that asks LLM to return ONLY the answer (not JSON)
+        # Remove JSON requirement from prompts
+        simple_system_prompt = (
+            f"You are an expert research assistant synthesizing information from multiple sources. "
+            f"Current date: {current_date}\n\n"
+            f"CRITICAL LANGUAGE REQUIREMENT:\n"
+            f"- Write your ENTIRE answer in {user_language} (the same language as the user's query)\n"
+            f"- All text, headings, citations, and sources section must be in {user_language}\n"
+            f"- Detect the language from the user's query and match it exactly\n"
+            f"- Do NOT mix languages - use ONLY {user_language} throughout the entire answer\n\n"
+            f"CRITICAL MARKDOWN FORMATTING REQUIREMENT (MANDATORY - NO EXCEPTIONS):\n"
+            f"- Your answer MUST be valid markdown with proper formatting - NOT plain text!\n"
+            f"- You MUST use markdown syntax throughout the entire answer\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold** for emphasis, *italic* for subtle emphasis\n"
+            f"- Use proper markdown lists (- for unordered, 1. for ordered)\n"
+            f"- Use proper markdown links: [text](url)\n"
+            f"- Structure with clear markdown sections - do NOT use plain text!\n"
+            f"- CRITICAL: Format your answer as markdown, not plain text with large letters!\n"
+            f"- FORBIDDEN: Do NOT write plain text without markdown formatting!\n"
+            f"- FORBIDDEN: Do NOT use large letters or bold text without markdown syntax!\n"
+            f"- CRITICAL NEWLINE FORMATTING: Use TWO newlines (\\n\\n) between paragraphs and sections for proper markdown rendering!\n"
+            f"- Each paragraph must be separated by a blank line (two newlines: \\n\\n)!\n"
+            f"- Sections must be separated by blank lines!\n"
+            f"- This ensures proper markdown rendering on the frontend - without blank lines, paragraphs will merge together!\n"
+            f"- EXAMPLE CORRECT FORMAT:\n"
+            f"  ## Main Section Title\n\n"
+            f"  This is a paragraph with **bold text** and *italic text*.\n\n"
+            f"  ### Subsection\n\n"
+            f"  - List item 1\n"
+            f"  - List item 2\n\n"
+            f"CRITICAL INSTRUCTIONS:\n"
+            f"1. Use ALL provided sources - each one has valuable information\n"
+            f"2. Synthesize into a comprehensive, well-structured answer ({length_guide})\n"
+            f"3. CITE EVERY FACT with inline references [1], [2], etc. in the text\n"
+            f"4. Include specific details, data, and examples from sources\n"
+            f"5. If sources provide different perspectives, present them all\n"
+            f"6. Structure with clear sections using markdown (##, ###) - NOT plain text!\n"
+            f"7. Be thorough and comprehensive - don't leave out important information\n"
+            f"8. Use proper markdown formatting: **bold**, *italic*, lists, headings\n"
+            f"9. Preserve all markdown formatting in your response\n"
+            f"10. Be detailed and complete - don't write brief summaries!\n\n"
+            f"CRITICAL SOURCES FORMATTING REQUIREMENT:\n"
+            f"- You MUST include inline citations [1], [2], [3], etc. in your answer text for every fact or claim\n"
+            f"- At the END of your answer, you MUST add a \"## Sources\" section with ALL sources used\n"
+            f"- Sources section format: Each source on a new line as \"- [Title](URL)\" (NOT \"[1] [Title](URL)\")\n"
+            f"- Example Sources section:\n"
+            f"  ## Sources\n\n"
+            f"  - [Source Title 1](https://example.com/1)\n"
+            f"  - [Source Title 2](https://example.com/2)\n"
+            f"- Include the Sources section directly in your answer - it will be part of the markdown\n\n"
+            f"IMPORTANT: Return ONLY your answer in markdown format. Do NOT return JSON or any other format. Just the markdown answer."
+        )
         
-        # CRITICAL: Log max_tokens to verify it's correct
-        max_tokens_value = None
-        if hasattr(self.chat_llm, "max_tokens"):
-            max_tokens_value = self.chat_llm.max_tokens
-        elif hasattr(structured_llm, "max_tokens"):
-            max_tokens_value = structured_llm.max_tokens
+        simple_user_prompt = (
+            f"User question: {query}\n"
+            f"Search query: {search_query}\n"
+            f"Mode: {mode}\n"
+            f"Current date: {current_date}\n\n"
+            f"CRITICAL: Write your ENTIRE answer in {user_language} (the same language as the query above).\n"
+            f"All text, headings, citations, and sources section must be in {user_language}.\n\n"
+            f"CRITICAL MARKDOWN FORMATTING (MANDATORY - NO EXCEPTIONS):\n"
+            f"- Your answer MUST be valid markdown with proper formatting - NOT plain text!\n"
+            f"- You MUST use markdown syntax throughout the entire answer\n"
+            f"- Use ## for main sections (NOT # - start with ##)\n"
+            f"- Use ### for subsections\n"
+            f"- Use **bold**, *italic*, lists, headings - proper markdown syntax!\n"
+            f"- Do NOT use plain text with large letters - use markdown headings!\n"
+            f"- FORBIDDEN: Do NOT write plain text without markdown formatting!\n"
+            f"- FORBIDDEN: Do NOT use large letters or bold text without markdown syntax!\n"
+            f"- CRITICAL NEWLINE FORMATTING: Use TWO newlines (\\n\\n) between paragraphs and sections!\n"
+            f"- Each paragraph must be separated by a blank line (two newlines)!\n\n"
+            f"{history_block}\n\n"
+            f"{memory_block}\n\n"
+            f"Sources ({len(sources)} sources provided - USE THEM ALL):\n{sources_block}\n\n"
+            f"Write a comprehensive, detailed answer using ALL sources above. Each source adds value - synthesize them together.\n"
+            f"Be thorough and complete - don't write brief summaries! Use proper markdown formatting throughout.\n\n"
+            f"CRITICAL: Include inline citations [1], [2], [3] in your answer text for every fact.\n"
+            f"CRITICAL: At the END of your answer, you MUST add a \"## Sources\" section with ALL sources used.\n"
+            f"Sources section format: Each source on a new line as \"- [Title](URL)\" (NOT \"[1] [Title](URL)\").\n"
+            f"Example Sources section:\n"
+            f"  ## Sources\n\n"
+            f"  - [Source Title 1](https://example.com/1)\n"
+            f"  - [Source Title 2](https://example.com/2)\n"
+            f"The Sources section format matches deep_research draft_report format.\n\n"
+            f"Return ONLY your answer in markdown format. Do NOT return JSON or any other format. Just the markdown answer."
+        )
         
-        # CRITICAL: Check if max_tokens is too low
-        if max_tokens_value and max_tokens_value < 4096:
-            logger.warning(
-                "max_tokens is very low for answer synthesis",
-                max_tokens=max_tokens_value,
-                config_value=self.settings.chat_model_max_tokens,
-                mode=mode,
-                prompt_length=len(user_prompt),
-            )
-        
+        # CRITICAL: Use simple LLM call (like DeepSearchNode) to preserve formatting!
+        # This avoids structured output JSON parsing which loses \n characters
         logger.info(
-            "Calling LLM for answer synthesis",
-            prompt_length=len(user_prompt),
-            system_prompt_length=len(system_prompt),
+            "Calling LLM for answer synthesis (simple call, no structured output)",
+            prompt_length=len(simple_user_prompt),
+            system_prompt_length=len(simple_system_prompt),
             sources_count=len(sources),
             scraped_count=len(scraped),
             mode=mode,
-            max_tokens=max_tokens_value,
-            chat_model_max_tokens_config=self.settings.chat_model_max_tokens,
+            note="Using simple llm.ainvoke() like DeepSearchNode to preserve markdown formatting"
         )
-        answer = await self._invoke_structured_answer(
-            structured_llm,
-            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)],
-            context="search_synthesis",
-        )
-        logger.info("Answer synthesis completed", answer_length=len(answer))
+        
+        from langchain_core.messages import SystemMessage, HumanMessage
+        synthesis_result = await self.chat_llm.ainvoke([
+            SystemMessage(content=simple_system_prompt),
+            HumanMessage(content=simple_user_prompt)
+        ])
+        
+        # CRITICAL: Get answer directly from LLM response (like DeepSearchNode)
+        answer = synthesis_result.content if hasattr(synthesis_result, 'content') else str(synthesis_result)
+        
+        # CRITICAL: Log EXACTLY what LLM returned - BEFORE any processing
+        if answer:
+            import re
+            raw_newline_count = answer.count('\n')
+            raw_double_newline_count = answer.count('\n\n')
+            raw_triple_newline_count = answer.count('\n\n\n')
+            has_markdown_headings = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+            
+            logger.info(
+                "RAW LLM SYNTHESIS RESPONSE (before any processing)",
+                answer_length=len(answer),
+                newline_count=raw_newline_count,
+                double_newline_count=raw_double_newline_count,
+                triple_newline_count=raw_triple_newline_count,
+                has_markdown_headings=has_markdown_headings,
+                first_200_chars=repr(answer[:200]),  # Use repr to see actual \n characters
+                last_200_chars=repr(answer[-200:]) if len(answer) > 200 else repr(answer),
+                note="This is EXACTLY what LLM returned - no structured output, no JSON parsing"
+            )
+        
+        # CRITICAL: Ensure Sources section is present and formatted correctly with numbered sources
+        # Format: [N] [Title](URL) where N matches the citation number in text [N]
+        import re
+        has_sources_section = "## Sources" in answer
+        sources_section_pattern = r'(##\s+Sources.*?)(?=\n\n##|\Z)'
+        
+        # Extract citation numbers from text (e.g., [1], [2], [3])
+        # Match [N] but not markdown links [text](url) or LaTeX formulas
+        citation_pattern = r'(?<!\[)\[(\d+)\](?!\()'
+        citations_found = re.findall(citation_pattern, answer)
+        citation_numbers = sorted(set(int(c) for c in citations_found))
+        
+        # Create mapping: citation number -> source (by order of appearance in text)
+        source_map = {}
+        source_index = 1
+        seen_urls = set()
+        
+        for source in sources:
+            url = source.url if hasattr(source, 'url') else source.get('url', '') if isinstance(source, dict) else ''
+            title = source.title if hasattr(source, 'title') else source.get('title', 'Unknown') if isinstance(source, dict) else 'Unknown'
+            # Deduplicate by URL
+            url_normalized = url.lower().rstrip('/') if url else ""
+            if url_normalized and url_normalized not in seen_urls:
+                seen_urls.add(url_normalized)
+                # Map to citation number if it exists in text, otherwise use sequential number
+                if source_index in citation_numbers:
+                    source_map[source_index] = {'title': title, 'url': url}
+                elif not source_map:  # If no citations found, use sequential numbering
+                    source_map[source_index] = {'title': title, 'url': url}
+                source_index += 1
+        
+        # If citations were found, ensure all cited sources are in the map
+        if citation_numbers:
+            # Fill in missing sources for cited numbers
+            for num in citation_numbers:
+                if num not in source_map and num <= len(sources):
+                    # Try to find source by index
+                    if num - 1 < len(sources):
+                        source = sources[num - 1]
+                        url = source.url if hasattr(source, 'url') else source.get('url', '') if isinstance(source, dict) else ''
+                        title = source.title if hasattr(source, 'title') else source.get('title', 'Unknown') if isinstance(source, dict) else 'Unknown'
+                        source_map[num] = {'title': title, 'url': url}
+        
+        if not has_sources_section and sources:
+            # Add Sources section if LLM didn't include it
+            # CRITICAL: Always include ALL sources, not just cited ones!
+            answer += "\n\n## Sources\n\n"
+            
+            # CRITICAL: Use ALL sources from source_map, not just citation_numbers!
+            all_source_numbers = sorted(source_map.keys()) if source_map else list(range(1, len(sources) + 1))
+            
+            # If source_map is empty, create it from sources
+            if not source_map and sources:
+                logger.warning("source_map is empty when adding Sources section - creating from sources", sources_count=len(sources))
+                for idx, source in enumerate(sources, 1):
+                    url = source.url if hasattr(source, 'url') else source.get('url', '') if isinstance(source, dict) else ''
+                    title = source.title if hasattr(source, 'title') else source.get('title', 'Unknown') if isinstance(source, dict) else 'Unknown'
+                    source_map[idx] = {'title': title, 'url': url}
+                all_source_numbers = sorted(source_map.keys())
+            
+            for num in all_source_numbers:
+                if num in source_map:
+                    source_info = source_map[num]
+                    if source_info.get('url'):
+                        answer += f"[{num}] [{source_info['title']}]({source_info['url']})\n"
+                    else:
+                        answer += f"[{num}] {source_info['title']}\n"
+            logger.info("Added all sources to Sources section", sources_added=len(all_source_numbers), total_sources=len(sources))
+        elif has_sources_section:
+            # LLM included Sources section - check if it has content and fix format if needed
+            match = re.search(sources_section_pattern, answer, re.DOTALL | re.IGNORECASE)
+            if match:
+                sources_section = match.group(1)
+                # Check if Sources section is empty or has no actual sources (only header)
+                sources_content = sources_section.replace("## Sources", "").strip()
+                has_sources_content = bool(re.search(r'\[.*?\]\(.*?\)|-\s+\[.*?\]', sources_content, re.IGNORECASE))
+                
+                if not has_sources_content and sources:
+                    # Sources section exists but is empty - replace it with proper numbered sources
+                    # CRITICAL: Always include ALL sources, not just cited ones!
+                    logger.info("Sources section is empty - adding ALL numbered sources", 
+                               sources_count=len(sources), 
+                               citation_numbers=citation_numbers,
+                               source_map_size=len(source_map))
+                    
+                    # CRITICAL: Use ALL sources from source_map, not just citation_numbers!
+                    all_source_numbers = sorted(source_map.keys()) if source_map else list(range(1, len(sources) + 1))
+                    
+                    # If source_map is empty, create it from sources
+                    if not source_map and sources:
+                        logger.warning("source_map is empty in Sources section replacement - creating from sources", sources_count=len(sources))
+                        for idx, source in enumerate(sources, 1):
+                            url = source.url if hasattr(source, 'url') else source.get('url', '') if isinstance(source, dict) else ''
+                            title = source.title if hasattr(source, 'title') else source.get('title', 'Unknown') if isinstance(source, dict) else 'Unknown'
+                            source_map[idx] = {'title': title, 'url': url}
+                        all_source_numbers = sorted(source_map.keys())
+                    
+                    sources_list = []
+                    for num in all_source_numbers:
+                        if num in source_map:
+                            source_info = source_map[num]
+                            if source_info.get('url'):
+                                sources_list.append(f"[{num}] [{source_info['title']}]({source_info['url']})")
+                            else:
+                                sources_list.append(f"[{num}] {source_info['title']}")
+                    
+                    # CRITICAL: Use \n\n between sources for proper markdown formatting (same as deep research)
+                    new_sources_section = f"## Sources\n\n" + "\n".join(sources_list) + "\n"
+                    answer = answer.replace(sources_section, new_sources_section)
+                    logger.info("Replaced empty Sources section with all sources", 
+                               sources_added=len(sources_list),
+                               total_sources=len(sources))
+                else:
+                    # Sources section has content - verify format and fix if needed
+                    # Check if it uses [1] format
+                    if re.search(r'\[\d+\]\s*\[', sources_section):
+                        # Replace [1] [Title](URL) with - [Title](URL)
+                        fixed_section = re.sub(r'\[\d+\]\s*', '- ', sources_section)
+                        answer = answer.replace(sources_section, fixed_section)
+                        logger.info("Fixed Sources section format from [1] [Title](URL) to - [Title](URL)")
+            elif sources:
+                # Sources section header exists but regex didn't match - add numbered sources after it
+                # CRITICAL: Always include ALL sources, not just cited ones!
+                logger.info("Sources section header found but no content - adding ALL numbered sources", 
+                           sources_count=len(sources), 
+                           citation_numbers=citation_numbers,
+                           source_map_size=len(source_map))
+                
+                # CRITICAL: Use ALL sources from source_map, not just citation_numbers!
+                all_source_numbers = sorted(source_map.keys()) if source_map else list(range(1, len(sources) + 1))
+                
+                # If source_map is empty, create it from sources
+                if not source_map and sources:
+                    logger.warning("source_map is empty in Sources section addition - creating from sources", sources_count=len(sources))
+                    for idx, source in enumerate(sources, 1):
+                        url = source.url if hasattr(source, 'url') else source.get('url', '') if isinstance(source, dict) else ''
+                        title = source.title if hasattr(source, 'title') else source.get('title', 'Unknown') if isinstance(source, dict) else 'Unknown'
+                        source_map[idx] = {'title': title, 'url': url}
+                    all_source_numbers = sorted(source_map.keys())
+                
+                sources_list = []
+                for num in all_source_numbers:
+                    if num in source_map:
+                        source_info = source_map[num]
+                        if source_info.get('url'):
+                            sources_list.append(f"[{num}] [{source_info['title']}]({source_info['url']})")
+                        else:
+                            sources_list.append(f"[{num}] {source_info['title']}")
+                
+                # Find position of "## Sources" and add sources after it
+                sources_header_pos = answer.rfind("## Sources")
+                if sources_header_pos != -1:
+                    # Find end of line after "## Sources"
+                    end_of_line = answer.find("\n", sources_header_pos)
+                    if end_of_line != -1:
+                        # CRITICAL: Use \n\n between sources for proper markdown formatting
+                        answer = answer[:end_of_line+1] + "\n" + "\n".join(sources_list) + "\n" + answer[end_of_line+1:]
+                    else:
+                        answer += "\n\n" + "\n".join(sources_list) + "\n"
+                logger.info("Added all sources to Sources section", sources_added=len(sources_list), total_sources=len(sources))
+        
+        # CRITICAL: Log formatting preservation before returning
+        newline_count = answer.count("\n") if answer else 0
+        has_newlines = "\n" in (answer or "")
+        logger.info("Answer synthesis completed", 
+                   answer_length=len(answer), 
+                   has_sources_section="## Sources" in answer,
+                   newline_count=newline_count,
+                   has_newlines=has_newlines,
+                   has_markdown_headings=bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE)) if answer else False,
+                   answer_preview=answer[:200] if answer else "")
+        # CRITICAL: Return answer as-is - preserve all formatting including \n
         return answer
 
     def _format_sources(self, sources: list[SearchResult], scraped: list[ScrapedContent]) -> str:
@@ -1073,16 +1440,76 @@ class ChatSearchService:
                     raise ValueError("LLM returned None response")
                 
                 synthesized = self._coerce_synthesized_answer(response)
-                answer = synthesized.answer.strip()
-                if not answer:
+                # CRITICAL: Don't use .strip() - it removes leading/trailing newlines which are important for markdown formatting!
+                # Only strip if answer is truly empty (all whitespace)
+                answer = synthesized.answer
+                
+                # CRITICAL: Log EXACTLY what structured output returned - BEFORE any processing
+                if answer:
+                    raw_newline_count = answer.count('\n')
+                    raw_double_newline_count = answer.count('\n\n')
+                    raw_triple_newline_count = answer.count('\n\n\n')
+                    has_markdown_headings = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+                    
+                    logger.info(
+                        "RAW STRUCTURED OUTPUT RESPONSE (before any processing)",
+                        context=context,
+                        attempt=attempt,
+                        answer_length=len(answer),
+                        newline_count=raw_newline_count,
+                        double_newline_count=raw_double_newline_count,
+                        triple_newline_count=raw_triple_newline_count,
+                        has_markdown_headings=has_markdown_headings,
+                        first_200_chars=repr(answer[:200]),  # Use repr to see actual \n characters
+                        last_200_chars=repr(answer[-200:]) if len(answer) > 200 else repr(answer),
+                        note="This is EXACTLY what structured output returned - no modifications yet"
+                    )
+                    
+                    # Show sample of actual content with newlines visible
+                    sample_lines = answer.split('\n')[:10]
+                    logger.debug(
+                        "First 10 lines of raw structured output response (showing actual newlines)",
+                        context=context,
+                        lines=[repr(line) for line in sample_lines],
+                        note="Use repr() to see actual \\n characters"
+                    )
+                
+                if not answer or not answer.strip():
                     logger.warning("Synthesized answer is empty", context=context, attempt=attempt)
                     raise ValueError("Structured answer was empty")
+                
+                # CRITICAL: Check if answer contains markdown formatting
+                has_markdown_headings = bool(re.search(r'^#{2,}\s+', answer, re.MULTILINE))
+                has_markdown_bold = bool(re.search(r'\*\*.*?\*\*', answer))
+                has_markdown_lists = bool(re.search(r'^[-*+]\s+', answer, re.MULTILINE))
+                has_markdown = has_markdown_headings or has_markdown_bold or has_markdown_lists
+                
+                if not has_markdown:
+                    logger.warning(
+                        "Answer appears to lack markdown formatting",
+                        context=context,
+                        attempt=attempt,
+                        answer_preview=answer[:500],
+                        has_headings=has_markdown_headings,
+                        has_bold=has_markdown_bold,
+                        has_lists=has_markdown_lists,
+                    )
+                else:
+                    logger.info(
+                        "Answer contains markdown formatting",
+                        context=context,
+                        attempt=attempt,
+                        has_headings=has_markdown_headings,
+                        has_bold=has_markdown_bold,
+                        has_lists=has_markdown_lists,
+                    )
                 
                 logger.info(
                     "Structured answer generated successfully",
                     context=context,
                     attempt=attempt,
                     answer_length=len(answer),
+                    has_markdown=has_markdown,
                 )
                 return answer
             except Exception as exc:

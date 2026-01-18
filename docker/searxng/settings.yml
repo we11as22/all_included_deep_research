@@ -45,10 +45,11 @@ engines:
     disabled: false
     timeout: 15.0
   
-  # Yahoo - Classic search engine (works directly)
-  # Tested: 5/5 relevant for Russian and English queries
+  # Yahoo - DISABLED: Has problems with multi-word queries, especially for Russian
+  # Searches only by first word (e.g., "расскажи про обучение" -> searches only "расскажи")
+  # Tested: Returns irrelevant results for multi-word Russian queries
   - name: yahoo
-    disabled: false
+    disabled: true
     timeout: 15.0
   
   # MWMBL - Decentralized search engine
