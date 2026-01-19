@@ -23,7 +23,7 @@ from src.llm.factory import create_chat_model
 # Import routers
 from src.api.routes import (
     chat_router,
-    chat_stream_router,
+    search_router,
     chats_router,
     config_router,
     health_router,
@@ -219,7 +219,7 @@ def create_app() -> FastAPI:
     # Include routers
     app.include_router(health_router)
     app.include_router(chat_router)
-    app.include_router(chat_stream_router)
+    app.include_router(search_router)
     app.include_router(chats_router)
     app.include_router(memory_router)
     app.include_router(config_router)

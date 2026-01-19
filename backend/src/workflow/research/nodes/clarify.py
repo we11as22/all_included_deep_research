@@ -50,6 +50,30 @@ class ClarifyNode(ResearchNode):
         session_manager = self.deps.session_manager
         settings = self.deps.settings
 
+        # CRITICAL: Use session state as source of truth, not chat_history
+        # Method 1: Check if session_status is already "researching" (user answered, status updated)
+        if session_status == "researching":
+            logger.info("Session status is 'researching' - user already answered clarification, proceeding with research",
+                       session_id=session_id)
+            return {"clarification_needed": False}
+        
+        # Method 2: Check clarification_answers from session state (loaded from DB in create_initial_state)
+        clarification_answers_from_state = state.get("clarification_answers", "")
+        if clarification_answers_from_state and clarification_answers_from_state.strip():
+            logger.info("Clarification already answered (from session state) - proceeding with research",
+                       session_id=session_id,
+                       answers_length=len(clarification_answers_from_state),
+                       note="Using clarification_answers from session state, not chat_history")
+            # Ensure session status is updated
+            if session_manager and session_status != "researching":
+                try:
+                    await session_manager.update_status(session_id, "researching")
+                    logger.info("Updated session status to 'researching' after detecting answers in state",
+                               session_id=session_id)
+                except Exception as e:
+                    logger.warning("Failed to update session status", error=str(e), exc_info=True)
+            return {"clarification_needed": False, "session_status": "researching"}
+
         # CRITICAL: Check session_status to determine if clarification already sent
         # Use session_status from DB session, NOT chat_history!
         if session_status == "waiting_clarification":
@@ -68,14 +92,17 @@ class ClarifyNode(ResearchNode):
                 except Exception as e:
                     logger.warning("Failed to get session from DB", error=str(e), exc_info=True)
             
-            # Check if user has ANSWERED the clarification questions
+            # CRITICAL: Check if user has ANSWERED the clarification questions
+            # Use chat_history only as fallback to detect NEW answers (when user just sent message)
+            # But use session.clarification_answers as source of truth
             # User answered if:
-            # 1. Last message in chat_history is from user (new message)
+            # 1. Last message in chat_history is from user (new message just received)
             # 2. AND it's different from original_query (not the original query repeated)
             # 3. AND either:
             #    a) clarification_answers is empty/None in session (user just answered)
             #    b) OR last_user_message is different from existing_answers (user updated answer)
             
+            # Check for new user message in chat_history (fallback detection)
             if chat_history and chat_history[-1].get("role") == "user":
                 last_user_message = chat_history[-1].get("content", "").strip()
                 
@@ -96,22 +123,26 @@ class ClarifyNode(ResearchNode):
                         user_answered = True
                         logger.info("✅ User answered clarification (first answer, no existing answers in session)",
                                    session_id=session_id,
-                                   answer_preview=last_user_message[:100])
+                                   answer_preview=last_user_message[:100],
+                                   note="Detected from chat_history, saving to session")
                     elif last_user_message != existing_answers.strip():
                         # Answer is different from existing - user updated/answered
                         user_answered = True
                         logger.info("✅ User answered clarification (new/different answer)",
                                    session_id=session_id,
                                    answer_preview=last_user_message[:100],
-                                   existing_answer_preview=existing_answers[:100] if existing_answers else None)
+                                   existing_answer_preview=existing_answers[:100] if existing_answers else None,
+                                   note="Detected from chat_history, updating session")
                 
                 if user_answered:
-                    # Save answers to session and update status
+                    # CRITICAL: Save answers to session - this is the source of truth
                     if session_manager:
                         try:
                             # Save clarification answers to session
                             await session_manager.save_clarification_answers(session_id, last_user_message)
-                            logger.info("✅ Saved clarification answers to session", session_id=session_id)
+                            logger.info("✅ Saved clarification answers to session", 
+                                       session_id=session_id,
+                                       note="clarification_answers is now source of truth, not chat_history")
                             
                             # Update session status to researching
                             await session_manager.update_status(session_id, "researching")
@@ -120,25 +151,29 @@ class ClarifyNode(ResearchNode):
                             logger.error("Failed to save answers/update status", error=str(e), exc_info=True)
 
                     # Return with updated status and clarification_needed=False to proceed
+                    # CRITICAL: Return clarification_answers so it's available in state
                     return {
                         "clarification_needed": False,
                         "session_status": "researching",
                         "clarification_just_sent": False,
-                        "clarification_answers": last_user_message  # Save the answers
+                        "clarification_answers": last_user_message  # Save the answers to state
                     }
 
             # If we reach here, user has NOT answered yet
+            # CRITICAL: Clarification was already sent, combined message already exists in DB
+            # Do NOT send it again - it's already loaded from chat_history
             logger.info("⏸️ Clarification already sent, still waiting for user answers - will interrupt before analyze_query",
                        session_id=session_id,
                        session_status=session_status,
                        has_existing_answers=bool(existing_answers),
                        last_message_role=chat_history[-1].get("role") if chat_history else None,
-                       chat_history_length=len(chat_history))
+                       chat_history_length=len(chat_history),
+                       note="Combined message already exists in DB, not sending again")
             # CRITICAL: Return state with flags so interrupt_before=["analyze_query"] stops the graph
             return {
                 "clarification_needed": True,
                 "session_status": "waiting_clarification",
-                "clarification_just_sent": True
+                "clarification_just_sent": False  # CRITICAL: Set to False - clarification was sent in previous run, not now
             }
 
         if stream:
@@ -206,28 +241,208 @@ CRITICAL REQUIREMENTS:
             # Send questions to user via stream
             if questions_to_send and stream:
                 clarification_message = self._format_clarification_message(questions_to_send)
-
-                # Emit as report chunk
+                
+                # CRITICAL: Check if combined message already exists in DB (session-based check)
+                # This prevents double sending on continuation/reload
+                # Use SESSION-BASED check, NOT chat_history (chat_history is unreliable for deep research sessions)
+                # Also check session_status - if already "waiting_clarification", combined message was already sent
+                combined_message_exists_in_db = False
+                if session_status == "waiting_clarification":
+                    # Session status indicates clarification was already sent
+                    # Check DB to confirm combined message exists
+                    if session_manager and session_id:
+                        try:
+                            from src.database.schema import ChatMessageModel
+                            from sqlalchemy import select
+                            
+                            app_state = stream.app_state if stream else {}
+                            chat_id = app_state.get("chat_id")
+                            session_factory = app_state.get("session_factory")
+                            
+                            if chat_id and session_factory:
+                                async with session_factory() as db:
+                                    # Check for combined message (deep_search + clarification) in DB
+                                    result = await db.execute(
+                                        select(ChatMessageModel)
+                                        .where(
+                                            ChatMessageModel.chat_id == chat_id,
+                                            ChatMessageModel.role == "assistant",
+                                            ChatMessageModel.content.like("%🔍 Initial Deep Search%"),
+                                            ChatMessageModel.content.like("%Clarification Needed%")
+                                        )
+                                        .order_by(ChatMessageModel.created_at.desc())
+                                        .limit(1)
+                                    )
+                                    existing_combined = result.scalar_one_or_none()
+                                    if existing_combined:
+                                        combined_message_exists_in_db = True
+                                        logger.info("Combined deep_search + clarification already exists in DB (session_status=waiting_clarification)",
+                                                   session_id=session_id,
+                                                   message_id=existing_combined.message_id,
+                                                   note="Combined message exists and was already sent, skipping send to frontend")
+                                    else:
+                                        logger.warning("Session status is waiting_clarification but combined message not found in DB",
+                                                      session_id=session_id,
+                                                      note="Will send combined message anyway to ensure it's saved")
+                        except Exception as e:
+                            logger.warning("Failed to check DB for existing combined message",
+                                          session_id=session_id,
+                                          error=str(e))
+                else:
+                    # First time sending - check if combined message exists (shouldn't, but check anyway)
+                    if session_manager and session_id:
+                        try:
+                            from src.database.schema import ChatMessageModel
+                            from sqlalchemy import select
+                            
+                            app_state = stream.app_state if stream else {}
+                            chat_id = app_state.get("chat_id")
+                            session_factory = app_state.get("session_factory")
+                            
+                            if chat_id and session_factory:
+                                async with session_factory() as db:
+                                    # Check for combined message (deep_search + clarification) in DB
+                                    result = await db.execute(
+                                        select(ChatMessageModel)
+                                        .where(
+                                            ChatMessageModel.chat_id == chat_id,
+                                            ChatMessageModel.role == "assistant",
+                                            ChatMessageModel.content.like("%🔍 Initial Deep Search%"),
+                                            ChatMessageModel.content.like("%Clarification Needed%")
+                                        )
+                                        .order_by(ChatMessageModel.created_at.desc())
+                                        .limit(1)
+                                    )
+                                    existing_combined = result.scalar_one_or_none()
+                                    if existing_combined:
+                                        combined_message_exists_in_db = True
+                                        logger.info("Combined deep_search + clarification already exists in DB (unexpected - first time)",
+                                                   session_id=session_id,
+                                                   message_id=existing_combined.message_id,
+                                                   note="Combined message exists, skipping send to frontend")
+                        except Exception as e:
+                            logger.warning("Failed to check DB for existing combined message",
+                                          session_id=session_id,
+                                          error=str(e))
+                
+                # CRITICAL: Send COMBINED message (deep_search + clarification) to frontend
+                # In workflow logic they are separate entities, but on frontend/DB they are combined
+                # Build combined message for frontend and DB
+                combined_message = ""
+                if deep_search_result and len(deep_search_result.strip()) > 0:
+                    normalized_result = deep_search_result.rstrip()
+                    combined_message = f"## 🔍 Initial Deep Search\n\n{normalized_result}\n\n---\n\n"
+                combined_message += clarification_message
+                
                 try:
-                    stream.emit_report_chunk(clarification_message)
-                    logger.info("Clarification questions emitted",
-                               message_length=len(clarification_message),
-                               questions_count=len(questions_to_send))
-
-                    # Save clarification questions to DB
-                    message_id = f"clarification_{session_id}_{int(time.time() * 1000)}"
-                    await self._save_message_to_db(
+                    # CRITICAL: Only send to frontend if:
+                    # 1. Combined message doesn't exist in DB
+                    # 2. AND session_status is NOT "waiting_clarification" (if waiting_clarification, it was already sent)
+                    # This prevents double sending on continuation
+                    should_send_to_frontend = not combined_message_exists_in_db and session_status != "waiting_clarification"
+                    
+                    if should_send_to_frontend:
+                        # Send COMBINED message to frontend
+                        chunk_size = 10000
+                        chunks = [combined_message[i:i+chunk_size] for i in range(0, len(combined_message), chunk_size)]
+                        for i, chunk in enumerate(chunks):
+                            stream.emit_report_chunk(chunk)
+                            if i < len(chunks) - 1:
+                                await asyncio.sleep(0.03)
+                        
+                        logger.info("Combined deep_search + clarification sent to frontend",
+                                   combined_length=len(combined_message),
+                                   deep_search_length=len(deep_search_result) if deep_search_result else 0,
+                                   clarification_length=len(clarification_message),
+                                   questions_count=len(questions_to_send),
+                                   chunks_count=len(chunks),
+                                   session_status=session_status,
+                                   note="Sent as unified message to frontend (workflow logic: separate, frontend/DB: combined)")
+                    else:
+                        skip_reason = "combined message exists in DB" if combined_message_exists_in_db else f"session_status={session_status} (already sent)"
+                        logger.info("Skipping send to frontend",
+                                   session_id=session_id,
+                                   session_status=session_status,
+                                   combined_message_exists_in_db=combined_message_exists_in_db,
+                                   skip_reason=skip_reason,
+                                   note="Combined message already sent or exists in DB, will be loaded from chat_history on page reload")
+                    
+                    # CRITICAL: Always save/update COMBINED message (deep_search + clarification) to DB
+                    # This ensures both are persisted together and won't be lost on page reload
+                    # Check if combined message already exists - update or create
+                    message_id = None
+                    if combined_message_exists_in_db and chat_id and session_factory:
+                        try:
+                            async with session_factory() as db:
+                                result = await db.execute(
+                                    select(ChatMessageModel)
+                                    .where(
+                                        ChatMessageModel.chat_id == chat_id,
+                                        ChatMessageModel.role == "assistant",
+                                        ChatMessageModel.content.like("%🔍 Initial Deep Search%"),
+                                        ChatMessageModel.content.like("%Clarification Needed%")
+                                    )
+                                    .order_by(ChatMessageModel.created_at.desc())
+                                    .limit(1)
+                                )
+                                existing = result.scalar_one_or_none()
+                                if existing:
+                                    message_id = existing.message_id
+                                    logger.info("Updating existing combined message in DB",
+                                               message_id=message_id,
+                                               session_id=session_id,
+                                               note="Updating existing combined message with latest clarification")
+                        except Exception as e:
+                            logger.warning("Failed to find existing combined message for update", error=str(e))
+                    
+                    if not message_id:
+                        # CRITICAL: message_id must be <= 64 chars (DB constraint)
+                        # Use short prefix + session_id hash + timestamp
+                        import hashlib
+                        session_hash = hashlib.md5(session_id.encode()).hexdigest()[:8] if session_id else "unknown"
+                        timestamp = int(time.time() * 1000) % 1000000000  # 9 digits max
+                        message_id = f"ds_clr_{session_hash}_{timestamp}"
+                        # Ensure it's <= 64 chars: "ds_clr_" (7) + hash (8) + "_" (1) + timestamp (9) = 25 chars
+                        if len(message_id) > 64:
+                            message_id = message_id[:64]
+                    
+                    # Save or update combined message in DB
+                    # CRITICAL: Save message BEFORE updating status to ensure consistency
+                    message_saved = await self._save_message_to_db(
                         stream=stream,
                         role="assistant",
-                        content=clarification_message,
+                        content=combined_message,  # Save combined message to DB
                         message_id=message_id,
                     )
+                    if message_saved:
+                        logger.info("Combined message saved/updated in DB",
+                                   message_id=message_id,
+                                   combined_length=len(combined_message),
+                                   deep_search_included=bool(deep_search_result),
+                                   was_update=combined_message_exists_in_db,
+                                   note="Combined message saved to DB for persistence and page reload")
+                    else:
+                        logger.error("CRITICAL: Failed to save combined message to DB",
+                                   message_id=message_id,
+                                   note="Message not saved - status will not be updated to prevent inconsistency")
+                        # Don't update status if message save failed - this prevents inconsistent state
+                        # The error is logged, but workflow continues (message might be saved on retry)
 
-                    # Update session status to waiting_clarification
-                    if session_manager:
-                        await session_manager.update_status(session_id, "waiting_clarification")
-                        logger.info("Session status updated to waiting_clarification",
-                                   session_id=session_id)
+                    # CRITICAL: Update session status to waiting_clarification ONLY if message was saved
+                    # This ensures consistency: if message is in DB, status is waiting_clarification
+                    if message_saved and session_manager:
+                        try:
+                            await session_manager.update_status(session_id, "waiting_clarification")
+                            logger.info("Session status updated to waiting_clarification",
+                                       session_id=session_id,
+                                       message_saved=message_saved,
+                                       note="Status updated after successful message save")
+                        except Exception as status_error:
+                            logger.error("Failed to update session status after message save",
+                                       session_id=session_id,
+                                       error=str(status_error),
+                                       exc_info=True,
+                                       note="Message saved but status update failed - may cause inconsistency")
 
                 except Exception as e:
                     logger.error("Failed to emit/save clarification questions",
@@ -341,43 +556,79 @@ Before starting the research, I need to clarify a few points:
 Research will proceed after you provide your answers.*
 """
 
-    async def _save_message_to_db(self, stream: Any, role: str, content: str, message_id: str) -> None:
-        """Save message to database.
+    async def _save_message_to_db(self, stream: Any, role: str, content: str, message_id: str) -> bool:
+        """Save or update message in database.
 
         Args:
             stream: Stream object with app_state
             role: Message role (user/assistant)
             content: Message content
             message_id: Unique message ID
+
+        Returns:
+            True if message was saved successfully, False otherwise
         """
         try:
             from src.database.schema import ChatMessageModel
+            from sqlalchemy import select
 
             app_state = getattr(stream, "app_state", {})
             chat_id = app_state.get("chat_id")
             session_factory = app_state.get("session_factory")
 
             if not chat_id or not session_factory:
-                logger.warning("Cannot save message - missing chat_id or session_factory")
-                return
+                logger.warning("Cannot save message - missing chat_id or session_factory",
+                              has_chat_id=bool(chat_id),
+                              has_session_factory=bool(session_factory))
+                return False
 
             async with session_factory() as session:
-                new_message = ChatMessageModel(
-                    chat_id=chat_id,
-                    message_id=message_id,  # This is the message_id column, NOT id (which is auto-generated)
-                    role=role,
-                    content=content,
+                # CRITICAL: Check if message already exists (by message_id)
+                result = await session.execute(
+                    select(ChatMessageModel).where(ChatMessageModel.message_id == message_id)
                 )
-                session.add(new_message)
-                await session.commit()
-
-                logger.info("Message saved to DB",
-                           message_id=message_id,
-                           chat_id=chat_id,
-                           role=role,
-                           content_length=len(content))
+                existing_message = result.scalar_one_or_none()
+                
+                if existing_message:
+                    # Update existing message
+                    existing_message.content = content
+                    existing_message.role = role
+                    # Ensure chat_id is correct (in case it changed)
+                    if existing_message.chat_id != chat_id:
+                        existing_message.chat_id = chat_id
+                    await session.commit()
+                    logger.info("Message updated in DB",
+                               message_id=message_id,
+                               chat_id=chat_id,
+                               role=role,
+                               content_length=len(content),
+                               note="Updated existing message")
+                    return True
+                else:
+                    # Create new message
+                    new_message = ChatMessageModel(
+                        chat_id=chat_id,
+                        message_id=message_id,  # This is the message_id column, NOT id (which is auto-generated)
+                        role=role,
+                        content=content,
+                    )
+                    session.add(new_message)
+                    await session.commit()
+                    logger.info("Message saved to DB",
+                               message_id=message_id,
+                               chat_id=chat_id,
+                               role=role,
+                               content_length=len(content),
+                               note="Created new message")
+                    return True
         except Exception as e:
-            logger.error("Failed to save message to DB", error=str(e), exc_info=True)
+            logger.error("Failed to save message to DB", 
+                        message_id=message_id,
+                        chat_id=chat_id,
+                        role=role,
+                        error=str(e), 
+                        exc_info=True)
+            return False
 
 
 # Legacy function wrapper for backward compatibility

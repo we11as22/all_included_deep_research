@@ -245,17 +245,40 @@ class SessionManager:
     async def save_deep_search_result(self, session_id: str, result: str) -> None:
         """Save deep search result to session.
 
+        CRITICAL: This must be atomic and synchronous to prevent race conditions.
+        The result is saved and committed immediately, then verified.
+
         Args:
             session_id: Session identifier
             result: Deep search result text
         """
         async with self.session_factory() as session:
+            # CRITICAL: Save result and commit immediately
             await session.execute(
                 update(ResearchSessionModel)
                 .where(ResearchSessionModel.id == session_id)
                 .values(deep_search_result=result, updated_at=datetime.now())
             )
             await session.commit()
+            
+            # CRITICAL: Verify that result was saved by reading it back in a NEW transaction
+            # This ensures the save was successful and visible to other transactions
+            async with self.session_factory() as verify_session:
+                verification = await verify_session.execute(
+                    select(ResearchSessionModel.deep_search_result)
+                    .where(ResearchSessionModel.id == session_id)
+                )
+                verified_result = verification.scalar_one_or_none()
+                if verified_result:
+                    logger.warning("✅ save_deep_search_result: Result saved and VERIFIED in separate transaction",
+                                 session_id=session_id,
+                                 result_length=len(result),
+                                 verified_length=len(verified_result),
+                                 note="CRITICAL: Result is now in DB and visible to other transactions. This prevents double execution.")
+                else:
+                    logger.error("❌ save_deep_search_result: Result NOT found after save!",
+                               session_id=session_id,
+                               note="CRITICAL ERROR: Save may have failed or transaction not committed properly")
 
     async def save_clarification_answers(
         self, session_id: str, answers: str
@@ -288,6 +311,23 @@ class SessionManager:
                 .values(draft_report=draft, updated_at=datetime.now())
             )
             await session.commit()
+
+    async def save_final_report(self, session_id: str, final_report: str) -> None:
+        """Save final report to session.
+
+        Args:
+            session_id: Session identifier
+            final_report: Final report text
+        """
+        async with self.session_factory() as session:
+            await session.execute(
+                update(ResearchSessionModel)
+                .where(ResearchSessionModel.id == session_id)
+                .values(final_report=final_report, updated_at=datetime.now())
+            )
+            await session.commit()
+
+            logger.info("Final report saved to session", session_id=session_id)
 
     async def supersede_active_sessions(self, chat_id: str, reason: str) -> int:
         """Mark all active sessions for chat as superseded.

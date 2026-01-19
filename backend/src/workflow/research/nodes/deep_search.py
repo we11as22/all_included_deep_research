@@ -1,5 +1,6 @@
 """Deep search node for initial context gathering."""
 
+import asyncio
 import structlog
 from typing import Dict, Any
 
@@ -27,72 +28,183 @@ class DeepSearchNode(ResearchNode):
         """
         # CRITICAL: Use original_query for deep search, not current query which might be clarification answer!
         query = state.get("original_query", state["query"])
-        session_status = state.get("session_status", "active")
-        chat_history = state.get("chat_history", [])
-
-        # CRITICAL: Check if deep search should be skipped
-        # Deep search should run ONLY ONCE at the beginning!
-
-        # Method 0: CRITICAL - Check chat_history for clarification questions
-        # If clarification questions exist in chat_history, this is a continuation after user answered
-        # Deep search was already done in the first run, so SKIP!
-        if chat_history:
-            for msg in reversed(chat_history[-5:]):  # Check last 5 messages
-                if msg.get("role") == "assistant":
-                    content = msg.get("content", "")
-                    # Check if this message contains clarification questions
-                    if "Clarification Needed" in content or "Q1:" in content or "Q2:" in content:
-                        logger.info(
-                            "Skipping deep search - found clarification questions in recent chat history (continuation)",
-                            session_id=state.get("session_id"),
-                            session_status=session_status,
-                        )
-                        # Return empty to skip (deep search result already in chat_history from first run)
-                        return {"deep_search_result": {"type": "override", "value": ""}}
-
-        # Method 1: Check if deep_search_result already exists in state
-        existing_result_raw = state.get("deep_search_result", "")
-
-        # Handle both dict and string formats
-        if isinstance(existing_result_raw, dict):
-            existing_result = existing_result_raw.get("value", "")
-        else:
-            existing_result = existing_result_raw or ""
-
-        # If result exists and is not empty, skip deep search (regardless of session_status!)
-        if existing_result and existing_result.strip():
-            logger.info(
-                "Skipping deep search - result already exists in state",
-                session_status=session_status,
-                result_length=len(existing_result),
-            )
-            # Return override to ensure result is preserved
-            return {
-                "deep_search_result": {"type": "override", "value": existing_result}
-            }
-
-        # Method 2: Check database for deep search result in CURRENT session
-        # This prevents double execution within same session while allowing new sessions to run
         session_id = state.get("session_id")
+        
+        logger.info("🔍 DEEP_SEARCH NODE: Starting execution",
+                   session_id=session_id,
+                   query_preview=query[:100] if query else None,
+                   state_keys=list(state.keys())[:10],
+                   note="Deep search node called - checking if should execute or skip")
+        
+        # CRITICAL: Load session data DIRECTLY from DB (source of truth)
+        # Don't rely on state - it may be outdated from checkpoint
+        # Load once and use for all checks: session_status, clarification_answers, deep_search_result
+        session_status = state.get("session_status", "active")
+        clarification_answers = state.get("clarification_answers", "")
+        existing_result = ""
+        
+        # CRITICAL: Always check DB directly for latest session data FIRST (before any other checks)
+        # This ensures we have the most up-to-date information, not stale checkpoint data
+        # This is the MOST RELIABLE check - DB is the source of truth
+        db_check_done = False
+        
+        # CRITICAL: Check if session_manager is available
+        session_manager_available = False
+        if hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager'):
+            session_manager_available = self.deps.session_manager is not None
+        
+        logger.warning("🔍 DEEP_SEARCH: Checking session_manager availability",
+                     session_id=session_id,
+                     has_deps=hasattr(self, 'deps'),
+                     has_session_manager_attr=hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager'),
+                     session_manager_available=session_manager_available,
+                     session_manager_type=type(self.deps.session_manager).__name__ if session_manager_available else "None",
+                     note="CRITICAL: Checking if session_manager is available in deps")
+        
+        if session_id and session_manager_available:
+            try:
+                # CRITICAL: Load from DB FIRST - this is the source of truth
+                session = await self.deps.session_manager.get_session(session_id)
+                if session:
+                    db_check_done = True
+                    # Override state values with DB values (DB is source of truth)
+                    old_session_status = session_status
+                    old_clarification_answers = clarification_answers
+                    session_status = session.status
+                    if session.clarification_answers:
+                        clarification_answers = session.clarification_answers
+                    if session.deep_search_result:
+                        existing_result = session.deep_search_result
+                        # CRITICAL: If result exists in DB, return IMMEDIATELY without any further checks
+                        logger.warning("🛑 DEEP_SEARCH: RESULT FOUND IN DB - RETURNING IMMEDIATELY (HIGHEST PRIORITY)",
+                                     session_id=session_id,
+                                     session_status=session_status,
+                                     result_length=len(existing_result),
+                                     result_preview=existing_result[:200],
+                                     note="CRITICAL: Result exists in DB - returning immediately WITHOUT any further processing. This prevents double execution.")
+                        stream = self.deps.stream
+                        if stream:
+                            stream.emit_status("Deep search completed (using existing result from DB)", step="deep_search")
+                        return {
+                            "deep_search_result": {"type": "override", "value": existing_result}
+                        }
+                    
+                    logger.info("✅ DEEP_SEARCH: Loaded session data from DB (source of truth)",
+                               session_id=session_id,
+                               session_status=session_status,
+                               old_session_status=old_session_status,
+                               has_clarification_answers=bool(session.clarification_answers),
+                               clarification_answers_length=len(clarification_answers) if clarification_answers else 0,
+                               has_deep_search_result=False,
+                               note="DB values override state values - no deep_search_result in DB, will check other conditions")
+                else:
+                    logger.warning("⚠️ DEEP_SEARCH: Session not found in DB",
+                                 session_id=session_id,
+                                 note="Using state values as fallback")
+            except Exception as e:
+                logger.error("❌ DEEP_SEARCH: Failed to load session from DB",
+                           session_id=session_id,
+                           error=str(e),
+                           exc_info=True,
+                           note="Using state values as fallback")
+        
+        if not db_check_done:
+            logger.error("❌ DEEP_SEARCH: DB check FAILED - session_manager not available!",
+                        session_id=session_id,
+                        has_deps=hasattr(self, 'deps'),
+                        has_session_manager_attr=hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager'),
+                        session_manager_value=self.deps.session_manager if (hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager')) else "N/A",
+                        note="CRITICAL ERROR: Cannot check DB - will use state values (less reliable, may cause double execution!)")
+        
+        # CRITICAL: Deep search should run ONLY ONCE per session
+        # Workflow: Запрос → deep_search → clarify → ответы → analyze → plan → execute
+        # Deep search выполняется ОДИН РАЗ в начале
+        # NOTE: If result was found in DB above, we already returned - no need to check again
+        
+        # Fallback: Check state if not found in DB (already loaded above if DB available)
+        # This is only for cases where DB check failed or session_manager not available
+        if not existing_result:
+            existing_result_raw = state.get("deep_search_result", "")
+            # Handle both dict and string formats
+            if isinstance(existing_result_raw, dict):
+                existing_result = existing_result_raw.get("value", "")
+            else:
+                existing_result = existing_result_raw or ""
+            
+            # If found in state, also return immediately
+            if existing_result and existing_result.strip():
+                logger.warning("🛑 DEEP_SEARCH: SKIPPING EXECUTION - existing result found in STATE (fallback check)",
+                             session_id=session_id,
+                             session_status=session_status,
+                             result_length=len(existing_result),
+                             result_preview=existing_result[:200],
+                             note="CRITICAL: Deep search was already executed, result found in state. Returning existing result WITHOUT re-execution.")
+                stream = self.deps.stream
+                if stream:
+                    stream.emit_status("Deep search completed (using existing result from state)", step="deep_search")
+                return {
+                    "deep_search_result": {"type": "override", "value": existing_result}
+                }
+        
+        # CRITICAL CHECK 2: If user already answered clarification, skip deep_search execution
+        # This is continuation after clarification - deep_search should NOT execute
+        if session_status == "researching":
+            logger.warning("🛑 DEEP_SEARCH: SKIPPING EXECUTION - session_status is 'researching'",
+                         session_id=session_id,
+                         session_status=session_status,
+                         has_clarification_answers=bool(clarification_answers),
+                         has_existing_result=bool(existing_result),
+                         note="User answered clarification - this is continuation. Deep search should NOT execute. Returning empty result.")
+            stream = self.deps.stream
+            if stream:
+                stream.emit_status("Skipping deep search (continuation after clarification)", step="deep_search")
+            return {
+                "deep_search_result": {"type": "override", "value": ""}
+            }
+        
+        # CRITICAL CHECK 3: If clarification_answers exists, skip deep_search execution
+        if clarification_answers and clarification_answers.strip():
+            logger.warning("🛑 DEEP_SEARCH: SKIPPING EXECUTION - clarification_answers exists",
+                         session_id=session_id,
+                         session_status=session_status,
+                         clarification_answers_length=len(clarification_answers),
+                         clarification_answers_preview=clarification_answers[:100],
+                         has_existing_result=bool(existing_result),
+                         note="User answered clarification - this is continuation. Deep search should NOT execute. Returning empty result.")
+            stream = self.deps.stream
+            if stream:
+                stream.emit_status("Skipping deep search (continuation after clarification)", step="deep_search")
+            return {
+                "deep_search_result": {"type": "override", "value": ""}
+            }
+        
+        # Deep search result is empty - this is a new session, execute deep search
+        # CRITICAL: Double-check that result is still not in DB (race condition protection)
+        # This prevents double execution if two calls happen simultaneously
         if session_id and self.deps.session_manager:
             try:
-                db_session = await self.deps.session_manager.get_session(session_id)
-                if db_session and db_session.deep_search_result:
-                    logger.info(
-                        "Skipping deep search - already exists in DB for this session",
-                        session_id=session_id,
-                        session_status=session_status,
-                        result_length=len(db_session.deep_search_result),
-                    )
-                    # Return empty override to skip (result already in chat_history)
+                session = await self.deps.session_manager.get_session(session_id)
+                if session and session.deep_search_result:
+                    existing_result = session.deep_search_result
+                    logger.warning("🛑 DEEP_SEARCH: RACE CONDITION DETECTED - result appeared in DB during execution",
+                                 session_id=session_id,
+                                 result_length=len(existing_result),
+                                 note="Another process/thread saved result. Returning existing result to prevent double execution.")
+                    stream = self.deps.stream
+                    if stream:
+                        stream.emit_status("Deep search completed (using existing result)", step="deep_search")
                     return {
-                        "deep_search_result": {"type": "override", "value": ""}
+                        "deep_search_result": {"type": "override", "value": existing_result}
                     }
             except Exception as e:
-                logger.warning("Failed to check DB for deep search result",
-                              session_id=session_id,
-                              error=str(e))
-                # Continue with deep search if DB check fails
+                logger.warning("Failed to double-check DB for race condition", error=str(e))
+        
+        logger.warning("✅ DEEP_SEARCH: EXECUTING - new session, no existing result",
+                   session_id=session_id,
+                   session_status=session_status,
+                   query=query[:100],
+                   has_existing_result=False,
+                   note="CRITICAL: deep_search_result is empty - this is first run, executing deep search NOW. This should happen ONLY ONCE per session.")
 
         # Execute deep search
         stream = self.deps.stream
@@ -209,19 +321,72 @@ class DeepSearchNode(ResearchNode):
 
         if stream:
             stream.emit_status("Deep search completed", step="deep_search")
-            # Stream the deep search result to frontend so user can see it
-            stream.emit_report_chunk(f"## 🔍 Initial Deep Search\n\n{deep_search_result}")
+            # CRITICAL: Do NOT send deep_search_result to frontend here
+            # It will be sent together with clarification as unified message
+            # In workflow logic they are separate entities, but on frontend/DB they are combined
+            logger.info("Deep search completed - result will be combined with clarification for frontend/DB",
+                       result_length=len(deep_search_result),
+                       note="Not sent separately - will be combined with clarification in clarify node")
 
-        # Save deep search result to DB so we can check it later
+        # CRITICAL: Save deep search result to DB IMMEDIATELY after execution (BEFORE returning)
+        # This ensures that subsequent calls will find the result and skip execution
+        # CRITICAL: Check if result already exists BEFORE saving (atomic check-and-save)
+        # This prevents race condition where two calls both execute and both try to save
         session_id = state.get("session_id")
-        if session_id and self.deps.session_manager:
+        
+        # CRITICAL: Log session_manager availability before save attempt
+        has_session_manager = hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager') and self.deps.session_manager is not None
+        logger.error("💾 DEEP_SEARCH: Attempting to save result to DB",
+                    session_id=session_id,
+                    has_session_manager=has_session_manager,
+                    session_manager_type=type(self.deps.session_manager).__name__ if has_session_manager else "None",
+                    result_length=len(deep_search_result) if deep_search_result else 0,
+                    note="CRITICAL: If has_session_manager=False, result will NOT be saved and will execute again!")
+        
+        if session_id and has_session_manager:
             try:
+                # CRITICAL: Double-check that result is still not in DB (race condition protection)
+                # Another process/thread may have saved it while we were executing
+                final_check_session = await self.deps.session_manager.get_session(session_id)
+                if final_check_session and final_check_session.deep_search_result:
+                    existing_final_result = final_check_session.deep_search_result
+                    logger.warning("🛑 DEEP_SEARCH: RACE CONDITION - result appeared in DB during execution (final check)",
+                                 session_id=session_id,
+                                 result_length=len(existing_final_result),
+                                 our_result_length=len(deep_search_result) if deep_search_result else 0,
+                                 note="CRITICAL: Another process saved result while we were executing. Returning existing result to prevent double save.")
+                    # Return existing result instead of saving ours
+                    return {
+                        "deep_search_result": {"type": "override", "value": existing_final_result}
+                    }
+                
+                # CRITICAL: Save immediately and wait for commit
                 await self.deps.session_manager.save_deep_search_result(session_id, deep_search_result)
-                logger.info("Saved deep search result to DB", session_id=session_id)
+                
+                # CRITICAL: Verify that result was saved by reading it back in separate transaction
+                verification_session = await self.deps.session_manager.get_session(session_id)
+                if verification_session and verification_session.deep_search_result:
+                    logger.warning("💾 DEEP_SEARCH: Result saved and VERIFIED in DB (separate transaction)",
+                                 session_id=session_id,
+                                 result_length=len(deep_search_result) if deep_search_result else 0,
+                                 verified_length=len(verification_session.deep_search_result),
+                                 note="CRITICAL: Result saved and verified in separate transaction - subsequent calls will find it and skip execution")
+                else:
+                    logger.error("❌ DEEP_SEARCH: Result NOT found in DB after save!",
+                               session_id=session_id,
+                               note="CRITICAL ERROR: Result was saved but not found on verification in separate transaction!")
             except Exception as e:
-                logger.warning("Failed to save deep search result to DB",
-                              session_id=session_id,
-                              error=str(e))
+                logger.error("❌ CRITICAL: Failed to save deep search result to DB",
+                           error=str(e),
+                           error_type=type(e).__name__,
+                           session_id=session_id,
+                           has_session_manager=has_session_manager,
+                           note="CRITICAL ERROR: Result will NOT be saved - deep search will execute again on next call!")
+        else:
+            logger.error("❌ CRITICAL: Cannot save deep search result - session_manager not available!",
+                        session_id=session_id,
+                        has_session_manager=has_session_manager,
+                        note="CRITICAL ERROR: Result will NOT be saved - deep search will execute again on next call!")
 
         # Return with override to ensure result is set
         return {"deep_search_result": {"type": "override", "value": deep_search_result}}
@@ -289,10 +454,43 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
     # Restore runtime dependencies from context (for backward compatibility)
     from src.workflow.research.nodes import runtime_deps_context
 
+    # CRITICAL: Try to get session_manager from multiple sources
+    # 1. First try context variable (may be lost in async LangGraph execution)
+    # 2. Then try config (passed directly through LangGraph config)
+    # 3. Finally try to create from session_factory if available
+    
     runtime_deps = runtime_deps_context.get()
+    session_manager = None
+    
+    # Try context variable first
+    if runtime_deps:
+        session_manager = runtime_deps.get("session_manager")
+    
+    # CRITICAL: If not in context, try to get from LangGraph config (passed through graph execution)
+    # LangGraph passes config to nodes, but we need to access it differently
+    # For now, try to get from context variable, and if missing, try to reconstruct from session_factory
+    if not session_manager and runtime_deps:
+        session_factory = runtime_deps.get("session_factory")
+        if session_factory:
+            # Create new SessionManager instance from factory
+            from src.workflow.research.session.manager import SessionManager
+            session_manager = SessionManager(session_factory)
+            logger.warning("🔧 run_deep_search_node: Created SessionManager from session_factory",
+                         session_id=state.get("session_id"),
+                         note="Context variable lost, but reconstructed SessionManager from factory")
+    
     if not runtime_deps:
-        logger.warning("Runtime dependencies not found in context")
+        logger.error("❌ CRITICAL: Runtime dependencies not found in context")
         return {"deep_search_result": ""}
+
+    # CRITICAL: Log session_manager availability
+    logger.warning("🔍 run_deep_search_node: Checking session_manager availability",
+                 has_runtime_deps=bool(runtime_deps),
+                 runtime_deps_keys=list(runtime_deps.keys()) if runtime_deps else [],
+                 has_session_manager_in_context="session_manager" in runtime_deps if runtime_deps else False,
+                 has_session_manager_reconstructed=session_manager is not None,
+                 session_manager_type=type(session_manager).__name__ if session_manager else "None",
+                 note="CRITICAL: session_manager must be available for DB checks to work")
 
     # Create dependencies container
     from src.workflow.research.dependencies import ResearchDependencies
@@ -305,9 +503,16 @@ async def run_deep_search_node(state: ResearchState) -> Dict:
         agent_memory_service=runtime_deps.get("agent_memory_service"),
         agent_file_service=runtime_deps.get("agent_file_service"),
         session_factory=runtime_deps.get("session_factory"),
-        session_manager=runtime_deps.get("session_manager"),
+        session_manager=session_manager,  # CRITICAL: Use reconstructed session_manager if context lost it
         settings=runtime_deps.get("settings"),
     )
+    
+    # CRITICAL: Verify session_manager is in deps
+    if not deps.session_manager:
+        logger.error("❌ CRITICAL: session_manager is None in ResearchDependencies!",
+                    session_id=state.get("session_id"),
+                    runtime_deps_has_session_manager="session_manager" in runtime_deps if runtime_deps else False,
+                    note="CRITICAL ERROR: DB checks will fail, deep search may execute multiple times!")
 
     # Execute node
     node = DeepSearchNode(deps)

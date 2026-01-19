@@ -18,6 +18,8 @@ COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
 # Build Next.js app
+# Clear any existing build artifacts to avoid stale Server Actions
+RUN rm -rf .next .next/cache
 RUN npm run build
 
 # Production image, copy all the files and run next
@@ -32,8 +34,8 @@ RUN adduser --system --uid 1001 nextjs
 COPY --from=builder /app/public ./public
 
 # Set the correct permission for prerender cache
-RUN mkdir .next
-RUN chown nextjs:nodejs .next
+# Don't create empty .next directory - it will be copied from builder
+RUN chown -R nextjs:nodejs .next 2>/dev/null || true
 
 # Automatically leverage output traces to reduce image size
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./

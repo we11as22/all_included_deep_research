@@ -151,6 +151,7 @@ class ResearchSessionModel(Base):
 
     # Relationships
     chat = relationship("ChatModel", back_populates="research_sessions")
+    research_memories = relationship("ResearchMemoryModel", back_populates="session", cascade="all, delete-orphan")
 
     __table_args__ = (
         Index("idx_research_sessions_chat_id", "chat_id"),
@@ -175,6 +176,92 @@ class ResearchSessionModel(Base):
             "draft_report": self.draft_report,
             "final_report": self.final_report,
             "metadata": self.session_metadata or {},
+        }
+
+
+class ResearchMemoryModel(Base):
+    """Research memory model for vector search of notes and findings.
+    
+    Stores agent notes and findings with embeddings for semantic search.
+    Used to find relevant context for researchers based on task descriptions.
+    """
+
+    __tablename__ = "research_memories"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(String(64), ForeignKey("research_sessions.id", ondelete="CASCADE"), nullable=False, index=True)
+    agent_id = Column(String(128), nullable=True, index=True)  # Agent who created this memory
+    memory_type = Column(String(32), nullable=False, index=True)  # 'note' or 'finding'
+    
+    # Content fields
+    title = Column(String(512), nullable=False)
+    content = Column(Text, nullable=False)  # Full content (note summary or finding summary)
+    embedding = Column(Vector(EMBEDDING_DIMENSION))  # Embedding for vector search
+    
+    # Metadata
+    memory_metadata = Column("metadata", JSONB, default=dict)  # Additional metadata (urls, tags, sources, etc.)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Relationships
+    session = relationship("ResearchSessionModel", back_populates="research_memories")
+    chunks = relationship("ResearchMemoryChunkModel", back_populates="memory", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        Index("idx_research_memories_session_id", "session_id"),
+        Index("idx_research_memories_agent_id", "agent_id"),
+        Index("idx_research_memories_type", "memory_type"),
+        Index("idx_research_memories_embedding", "embedding", postgresql_using="ivfflat"),
+        Index("idx_research_memories_created", "created_at"),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "session_id": self.session_id,
+            "agent_id": self.agent_id,
+            "memory_type": self.memory_type,
+            "title": self.title,
+            "content": self.content,
+            "metadata": self.memory_metadata or {},
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ResearchMemoryChunkModel(Base):
+    """Research memory chunk model for vector search of note/finding chunks.
+    
+    Stores chunks of notes and findings with embeddings for semantic search.
+    Allows finding relevant parts of memories based on task descriptions.
+    """
+
+    __tablename__ = "research_memory_chunks"
+
+    id = Column(Integer, primary_key=True, index=True)
+    memory_id = Column(Integer, ForeignKey("research_memories.id", ondelete="CASCADE"), nullable=False, index=True)
+    chunk_index = Column(Integer, nullable=False)  # Order of chunk within memory
+    content = Column(Text, nullable=False)  # Chunk content
+    content_hash = Column(String(64), nullable=False)  # Hash for deduplication
+    embedding = Column(Vector(EMBEDDING_DIMENSION))  # Embedding for vector search
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Relationships
+    memory = relationship("ResearchMemoryModel", back_populates="chunks")
+
+    __table_args__ = (
+        Index("idx_research_memory_chunks_memory_id", "memory_id"),
+        Index("idx_research_memory_chunks_embedding", "embedding", postgresql_using="ivfflat"),
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "memory_id": self.memory_id,
+            "chunk_index": self.chunk_index,
+            "content": self.content,
+            "content_hash": self.content_hash,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 

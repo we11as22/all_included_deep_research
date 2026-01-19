@@ -1,11 +1,12 @@
 """Planning node for research planning."""
 
+import asyncio
 import structlog
 from typing import Dict, Any
 
 from src.workflow.research.state import ResearchState
 from src.workflow.research.nodes.base import ResearchNode
-from src.workflow.research.models import ResearchPlan
+from src.workflow.research.models import ResearchPlan, ResearchTopic
 from src.workflow.research.prompts.planning import PlanningPromptBuilder
 
 logger = structlog.get_logger(__name__)
@@ -27,6 +28,7 @@ class PlanResearchNode(ResearchNode):
             State updates with research_plan
         """
         query = state.get("query", "")
+        # CRITICAL: Use original_query for planning, not current query which might be clarification answer!
         original_query = state.get("original_query", query)
         query_analysis = state.get("query_analysis", {})
         mode = state.get("mode", "quality")
@@ -74,23 +76,56 @@ class PlanResearchNode(ResearchNode):
         if stream:
             stream.emit_status("Creating research plan...", step="planning")
 
+        # CRITICAL: Log all context data before planning (лизонинг)
+        logger.info("🔍 PLANNING: Context data check",
+                   session_id=session_id,
+                   original_query=original_query[:100] if original_query else None,
+                   query=query[:100] if query else None,
+                   has_deep_search_result="deep_search_result" in state,
+                   chat_history_length=len(chat_history),
+                   note="Verifying all context data is available for planning")
+        
         # Get deep_search_result for context
         deep_search_result_raw = state.get("deep_search_result", "")
         if isinstance(deep_search_result_raw, dict):
             deep_search_result = deep_search_result_raw.get("value", "")
         else:
             deep_search_result = deep_search_result_raw or ""
+        
+        logger.info("🔍 PLANNING: Deep search result",
+                   session_id=session_id,
+                   result_length=len(deep_search_result) if deep_search_result else 0,
+                   result_preview=deep_search_result[:200] if deep_search_result else None,
+                   note="Deep search result loaded for planning")
 
-        # Extract clarification answers
-        clarification_answers = self._extract_clarification_answers(chat_history)
+        # CRITICAL: Use clarification_answers from session state (loaded from DB), not chat_history
+        # clarification_answers is the source of truth, loaded from session in create_initial_state
+        clarification_answers = state.get("clarification_answers", "")
+        
+        # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
+        if not clarification_answers:
+            clarification_answers = self._extract_clarification_answers(chat_history)
+            if clarification_answers:
+                logger.warning("Using clarification_answers from chat_history (fallback) - should be in session state",
+                             session_id=session_id,
+                             note="This should not happen in normal flow - clarification_answers should be in session")
+        
+        logger.info("🔍 PLANNING: Clarification answers",
+                   session_id=session_id,
+                   has_clarification_answers=bool(clarification_answers),
+                   clarification_preview=clarification_answers[:200] if clarification_answers else None,
+                   source="session_state" if state.get("clarification_answers") else "chat_history_fallback",
+                   note="Clarification answers from session state (source of truth)")
 
         # Build prompt using prompt builder
+        # CRITICAL: Use original_query for planning, not query (which might be clarification answer)
+        # Planning should be about the ORIGINAL research topic, not the clarification answers
         prompt_builder = PlanningPromptBuilder()
         prompt = prompt_builder.build_planning_prompt(
-            query=original_query,
+            query=original_query,  # CRITICAL: Use original_query - research is about the original topic
             query_analysis=query_analysis,
             deep_search_result=deep_search_result,
-            clarification_answers=clarification_answers,
+            clarification_answers=clarification_answers,  # Clarification answers refine the approach, but topic is original_query
             mode=mode
         )
         
@@ -99,7 +134,7 @@ class PlanResearchNode(ResearchNode):
         prompt_length = len(prompt)
         logger.info("Planning prompt built",
                    prompt_length=prompt_length,
-                   query_length=len(original_query),
+                   query_length=len(query),
                    deep_search_length=len(deep_search_result),
                    clarification_length=len(clarification_answers),
                    session_id=session_id,
@@ -110,10 +145,27 @@ class PlanResearchNode(ResearchNode):
 
 CRITICAL: All topics must relate to the original query. Include query context in topic descriptions."""
 
-            plan = await llm.with_structured_output(ResearchPlan).ainvoke([
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prompt}
-            ])
+            # CRITICAL: Add timeout to prevent hanging (120 seconds for planning)
+            # This prevents the workflow from hanging indefinitely if LLM is slow or unresponsive
+            logger.info("Calling LLM for research planning", 
+                       prompt_length=prompt_length,
+                       session_id=session_id,
+                       note="Using 120s timeout to prevent hanging")
+            
+            try:
+                plan = await asyncio.wait_for(
+                    llm.with_structured_output(ResearchPlan).ainvoke([
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ]),
+                    timeout=120.0  # 120 seconds timeout
+                )
+            except asyncio.TimeoutError:
+                logger.error("LLM call timed out after 120 seconds",
+                           session_id=session_id,
+                           prompt_length=prompt_length,
+                           note="Planning LLM call exceeded timeout - this may indicate API issues")
+                raise TimeoutError("Research planning LLM call timed out after 120 seconds")
 
             logger.info("Research plan created",
                        topics_count=len(plan.topics) if hasattr(plan, "topics") else 0,
@@ -124,10 +176,92 @@ CRITICAL: All topics must relate to the original query. Include query context in
             if hasattr(plan, "topics") and plan.topics:
                 topics = plan.topics
 
+            # CRITICAL: Build research_plan_dict matching original format
+            # Original returned: {"reasoning": ..., "research_depth": ..., "coordination_strategy": ...}
+            # ResearchPlan model has research_depth and coordination_strategy fields, so access them directly
+            research_plan_dict = {
+                "reasoning": plan.reasoning,
+                "research_depth": plan.research_depth,  # Direct access as in original backup
+                "coordination_strategy": plan.coordination_strategy  # Direct access as in original backup
+            }
+            
+            # CRITICAL: Save research plan to main.md for persistence and supervisor editing
+            # This matches the original implementation
+            # Original uses stream.app_state.get("agent_memory_service") directly
+            agent_memory_service = stream.app_state.get("agent_memory_service") if stream else None
+            if agent_memory_service:
+                try:
+                    from datetime import datetime
+                    # Read current main.md
+                    try:
+                        main_content = await agent_memory_service.file_manager.read_file("main.md")
+                    except FileNotFoundError:
+                        main_content = ""
+                    
+                    # Format research plan for main.md
+                    topics_text = "\n".join([
+                        f"- **{topic.topic}**: {topic.description} (Priority: {topic.priority}, Estimated sources: {topic.estimated_sources})"
+                        for topic in topics
+                    ])
+                    
+                    research_plan_section = f"""## Research Plan
+
+**Created:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+**Research Depth:** {plan.research_depth}
+**Coordination Strategy:** {plan.coordination_strategy}
+
+### Strategy
+
+{plan.reasoning}
+
+### Research Topics
+
+{topics_text}
+
+---
+**Note:** This research plan can be updated by the supervisor as research progresses.
+"""
+                    
+                    # Append research plan to main.md (or create if empty)
+                    if main_content:
+                        # Check if research plan section already exists
+                        if "## Research Plan" in main_content:
+                            # Replace existing research plan section
+                            import re
+                            pattern = r"## Research Plan.*?(?=\n## |\Z)"
+                            main_content = re.sub(pattern, research_plan_section.strip(), main_content, flags=re.DOTALL)
+                        else:
+                            # Append research plan section
+                            main_content = main_content + "\n\n" + research_plan_section
+                    else:
+                        # Create new main.md with research plan
+                        main_content = f"""# Research Session - Main Index
+
+**Query:** {query}
+**Started:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+{research_plan_section}
+
+## Key Insights
+
+<!-- Supervisor will add key insights here as research progresses -->
+
+## Notes
+
+<!-- Additional notes and context -->
+"""
+                    
+                    await agent_memory_service.file_manager.write_file("main.md", main_content)
+                    logger.info("Research plan saved to main.md", 
+                               topics_count=len(topics),
+                               session_id=session_id)
+                except Exception as e:
+                    logger.warning("Failed to save research plan to main.md", error=str(e), exc_info=True)
+
+            # CRITICAL: Return format must match original - use "research_topics" not "topics"
             return {
-                "research_plan": plan.dict() if hasattr(plan, "dict") else plan,
-                "topics": [t.dict() if hasattr(t, "dict") else t for t in topics],
-                "coordination_notes": plan.reasoning if hasattr(plan, "reasoning") else ""
+                "research_plan": research_plan_dict,
+                "research_topics": [t.dict() if hasattr(t, "dict") else t for t in topics]
             }
 
         except Exception as e:
@@ -162,32 +296,38 @@ CRITICAL: All topics must relate to the original query. Include query context in
                 else:
                     stream.emit_status("⚠️ Planning error - using fallback plan", step="planning")
             
-            # Fallback: create basic plan
-            fallback_topics = self._create_fallback_topics(original_query, query_analysis)
+            # Fallback: create basic plan matching original format
+            # CRITICAL: Original creates ResearchTopic object, not dict
+            fallback_topic = ResearchTopic(
+                topic=query,
+                description=f"Research: {query}",
+                priority="high",
+                estimated_sources=5  # Default estimate for fallback
+            )
             
             # Create fallback reasoning based on error type
             if is_permission_error:
-                fallback_reasoning = "Fallback plan created due to API access restrictions. Research will continue with basic topics."
+                fallback_reasoning = "Fallback plan due to planning error"
             elif is_rate_limit:
-                fallback_reasoning = "Fallback plan created due to API rate limiting. Research will continue with basic topics."
+                fallback_reasoning = "Fallback plan due to planning error"
             elif is_timeout:
-                fallback_reasoning = "Fallback plan created due to API timeout. Research will continue with basic topics."
+                fallback_reasoning = "Fallback plan due to planning error"
             else:
-                fallback_reasoning = f"Fallback plan created due to error: {error_type}. Research will continue with basic topics."
+                fallback_reasoning = "Fallback plan due to planning error"
 
             logger.info("Using fallback research plan",
-                       topics_count=len(fallback_topics),
                        session_id=session_id,
                        note="Research will continue despite planning error")
 
+            # CRITICAL: Return format must match original - use "research_topics" not "topics"
+            # Original returns ResearchTopic.dict(), not list of dicts
             return {
                 "research_plan": {
                     "reasoning": fallback_reasoning,
-                    "topics": fallback_topics,
-                    "stop": False  # CRITICAL: Don't stop research, continue with fallback plan
+                    "research_depth": "standard",
+                    "coordination_strategy": "Parallel research"
                 },
-                "topics": fallback_topics,
-                "coordination_notes": "Basic fallback plan - research will continue"
+                "research_topics": [fallback_topic.dict()]
             }
 
     def _extract_clarification_answers(self, chat_history: list) -> str:

@@ -102,11 +102,29 @@ class GenerateReportNode(ResearchNode):
                     logger.info("Report saved to session in DB", session_id=session_id)
                 except Exception as e:
                     logger.error("Failed to save report to session", error=str(e))
+            
+            # CRITICAL: Clear research memories at the end of deep research
+            if stream and hasattr(stream, "app_state"):
+                app_state = stream.app_state
+                if isinstance(app_state, dict):
+                    research_memory_service = app_state.get("research_memory_service") or app_state.get("_research_memory_service")
+                else:
+                    research_memory_service = getattr(app_state, "research_memory_service", None) or getattr(app_state, "_research_memory_service", None)
+                
+                if research_memory_service:
+                    try:
+                        deleted_count = await research_memory_service.clear_session_memories(session_id)
+                        logger.info("Cleared research memories at end of deep research",
+                                   session_id=session_id,
+                                   deleted_count=deleted_count)
+                    except Exception as e:
+                        logger.warning("Failed to clear research memories at end", error=str(e))
 
+            # CRITICAL: Return format must match original - only final_report and confidence
+            # Draft report is substantial (>= 1000 chars), so confidence is high
             return {
                 "final_report": formatted_report,
-                "report_generated": True,
-                "should_continue": False
+                "confidence": "high"  # Draft report is substantial, written by supervisor throughout research
             }
 
         # Draft report is too short or missing - generate report using draft_report + findings summaries
@@ -119,8 +137,18 @@ class GenerateReportNode(ResearchNode):
         # Get user language from state (detected in create_initial_state)
         user_language = state.get("user_language", "English")
 
-        # Extract clarification context
-        clarification_context = self._extract_clarification_context(chat_history)
+        # CRITICAL: Use clarification_answers from session state (loaded from DB), not chat_history
+        # clarification_answers is the source of truth, loaded from session in create_initial_state
+        clarification_answers_from_state = state.get("clarification_answers", "")
+        clarification_context = clarification_answers_from_state if clarification_answers_from_state else ""
+        
+        # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
+        if not clarification_context:
+            clarification_context = self._extract_clarification_context(chat_history)
+            if clarification_context:
+                logger.warning("Using clarification_answers from chat_history (fallback) - should be in session state",
+                             session_id=session_id,
+                             note="This should not happen in normal flow - clarification_answers should be in session")
 
         # Combine draft_report (if exists) with findings summaries for generation
         if draft_report and len(draft_report.strip()) > 0:
@@ -194,11 +222,29 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
                     logger.info("Report saved to session in DB", session_id=session_id)
                 except Exception as e:
                     logger.error("Failed to save report to session", error=str(e))
+            
+            # CRITICAL: Clear research memories at the end of deep research
+            if stream and hasattr(stream, "app_state"):
+                app_state = stream.app_state
+                if isinstance(app_state, dict):
+                    research_memory_service = app_state.get("research_memory_service") or app_state.get("_research_memory_service")
+                else:
+                    research_memory_service = getattr(app_state, "research_memory_service", None) or getattr(app_state, "_research_memory_service", None)
+                
+                if research_memory_service:
+                    try:
+                        deleted_count = await research_memory_service.clear_session_memories(session_id)
+                        logger.info("Cleared research memories at end of deep research",
+                                   session_id=session_id,
+                                   deleted_count=deleted_count)
+                    except Exception as e:
+                        logger.warning("Failed to clear research memories at end", error=str(e))
 
+            # CRITICAL: Return format must match original - only final_report and confidence
+            # Original backup returns: {"final_report": ..., "confidence": report.confidence_level}
             return {
                 "final_report": formatted_report,
-                "report_generated": True,
-                "should_continue": False
+                "confidence": report.confidence_level if hasattr(report, "confidence_level") else ("medium" if draft_report_for_prompt else "low")
             }
 
         except Exception as e:
@@ -213,10 +259,11 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
                        fallback_length=len(fallback_report),
                        session_id=session_id)
 
+            # CRITICAL: Return format must match original - only final_report and confidence
+            # Original backup returns: {"final_report": ..., "confidence": "medium" if draft_report else "low"}
             return {
                 "final_report": fallback_report,
-                "report_generated": True,
-                "should_continue": False
+                "confidence": "medium" if draft_report_for_prompt else "low"
             }
 
     async def _read_draft_report(self, agent_memory_service: Any, findings: list, query: str) -> str:
@@ -524,10 +571,10 @@ async def generate_final_report_enhanced_node(state: ResearchState) -> Dict:
     runtime_deps = runtime_deps_context.get()
     if not runtime_deps:
         logger.warning("Runtime dependencies not found in context")
+        # CRITICAL: Return format must match original - only final_report and confidence
         return {
             "final_report": "Error: No runtime dependencies available",
-            "report_generated": False,
-            "should_continue": False
+            "confidence": "low"
         }
 
     # Create dependencies container

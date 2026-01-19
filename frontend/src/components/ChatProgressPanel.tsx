@@ -297,7 +297,32 @@ export function ChatProgressPanel({ progress }: { progress: ProgressState }) {
         <div className="mt-3">
           <div className="text-xs font-semibold text-foreground">Agent Tasks</div>
           <div className="mt-2 space-y-2">
-            {Object.entries(agentTodos).map(([agentId, todos]) => {
+            {Object.entries(agentTodos)
+              .sort(([agentIdA], [agentIdB]) => {
+                // Sort agents by number: agent_1, agent_2, agent_3, etc.
+                // Also handles formats like agent_r0_0, agent_r1_0, etc.
+                const extractNumber = (id: string) => {
+                  // Try agent_1, agent_2 format first
+                  let match = id.match(/agent[_\s](\d+)/i);
+                  if (match) {
+                    return parseInt(match[1], 10);
+                  }
+                  // Try agent_r0_0, agent_r1_0 format
+                  match = id.match(/agent_r(\d+)_\d+/i);
+                  if (match) {
+                    return parseInt(match[1], 10);
+                  }
+                  // Try agent1, agent2 format
+                  match = id.match(/agent(\d+)/i);
+                  if (match) {
+                    return parseInt(match[1], 10);
+                  }
+                  // If no number found, put at the end
+                  return Infinity;
+                };
+                return extractNumber(agentIdA) - extractNumber(agentIdB);
+              })
+              .map(([agentId, todos]) => {
               const notes = agentNotes[agentId] || [];
               const pending = todos.filter((item) => item.status !== 'done');
               const inProgress = todos.filter((item) => item.status === 'in_progress');

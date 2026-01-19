@@ -135,10 +135,23 @@ class PlanningPromptBuilder(PromptBuilder):
         output = """Generate research plan with this structure:
 
 {
-  "reasoning": "Overall research strategy explanation",
+  "reasoning": "**CRITICAL: Before creating the plan, think about and document in reasoning:**
+  1. **Original Query Analysis**: What is the user asking for? What is the core topic?
+  2. **Deep Search Context**: What did the initial deep search reveal? What key aspects were found?
+  3. **Clarification Answers**: If clarification was provided, what did the user specify? How does it refine the original query?
+  4. **Integration**: How do deep search results and clarification answers relate to the original query?
+  5. **Research Strategy**: Based on all context, what research approach will be most effective?
+  
+  Document your thinking process in the reasoning field before listing topics.",
   "topics": [
     {
-      "reasoning": "Why this topic is important",
+      "reasoning": "**Before defining this topic, think about:**
+      1. How does this topic relate to the original query?
+      2. What aspect of deep search context does it address?
+      3. How does it incorporate clarification answers (if provided)?
+      4. Why is this specific topic important for comprehensive research?
+      
+      Document your thinking in reasoning before defining the topic.",
       "topic": "Topic title",
       "description": "Detailed description of what to research",
       "priority": "high/medium/low"

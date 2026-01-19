@@ -34,16 +34,21 @@ class AgentMemoryService:
         note: AgentNote,
         agent_id: str,
         agent_file_service: Any = None,
+        research_memory_service: Any = None,
+        session_id: str = None,
     ) -> str:
         """
         Save agent note to items/ directory.
         
         Also adds note to agent's personal file (agents/{agent_id}.md) Notes section.
+        If research_memory_service is provided, also saves to research_memories table with embedding.
 
         Args:
             note: Agent note to save
             agent_id: Agent ID for filename and personal file update
             agent_file_service: Optional agent file service to update agent's personal file
+            research_memory_service: Optional research memory service for vector search
+            session_id: Optional session ID for research memory service
 
         Returns:
             File path of saved note
@@ -119,6 +124,36 @@ class AgentMemoryService:
         # Don't update main.md - items stay in items/ directory
         # Main.md should only contain key insights from supervisor
         await self._update_main_file(file_path, note.title, note.summary, note.tags)
+        
+        # CRITICAL: Save note to research_memory_service for vector search if available
+        if research_memory_service and session_id and note.summary and len(note.summary) > 200:
+            try:
+                # Only save informative notes (not metadata)
+                note_summary_lower = (note.summary or "").lower()
+                is_metadata_only = any([
+                    "found" in note_summary_lower and "sources" in note_summary_lower and "query" in note_summary_lower,
+                    "search:" in (note.title or "").lower() and len(note.summary or "") < 100,
+                    note_summary_lower.count("found") > 0 and "relevant sources" in note_summary_lower,
+                    "key sources:" in note_summary_lower and len(note.summary or "") < 150,
+                ])
+                
+                if not is_metadata_only:
+                    await research_memory_service.save_note(
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        title=note.title,
+                        content=note.summary,  # Full content, not truncated
+                        metadata={
+                            "urls": note.urls or [],
+                            "tags": note.tags or [],
+                        }
+                    )
+                    logger.info("Agent note saved to research_memory_service",
+                               session_id=session_id,
+                               agent_id=agent_id,
+                               title=note.title[:100])
+            except Exception as e:
+                logger.warning("Failed to save note to research_memory_service", error=str(e))
 
         logger.info("Agent note saved", file_path=file_path, agent_id=agent_id)
         return file_path

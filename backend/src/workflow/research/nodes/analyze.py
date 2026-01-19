@@ -43,15 +43,25 @@ class AnalyzeQueryNode(ResearchNode):
         clarification_needed = state.get("clarification_needed", False)
 
         if clarification_needed and session_status == "waiting_clarification":
-            # Check if user has answered (new user message after clarification)
-            # Look at chat_history to see if there's a new user message
-            has_user_answer = len(chat_history) > 0 and chat_history[-1].get("role") == "user"
+            # CRITICAL: Check clarification_answers from session state, not chat_history
+            # clarification_answers is loaded from DB session in create_initial_state
+            clarification_answers_from_state = state.get("clarification_answers", "")
+            has_user_answer = bool(clarification_answers_from_state and clarification_answers_from_state.strip())
+            
+            # Fallback: check chat_history only if clarification_answers not in state
+            if not has_user_answer and chat_history:
+                has_user_answer = len(chat_history) > 0 and chat_history[-1].get("role") == "user"
+                if has_user_answer:
+                    logger.warning("Using chat_history to detect user answer (fallback) - clarification_answers should be in session",
+                                 session_id=session_id)
 
             if not has_user_answer:
                 # User hasn't answered yet - stop graph execution
                 logger.info("Clarification needed but user hasn't answered - STOPPING GRAPH",
                            session_id=session_id,
-                           session_status=session_status)
+                           session_status=session_status,
+                           has_clarification_answers_in_state=bool(clarification_answers_from_state),
+                           note="Checking clarification_answers from session state, not chat_history")
                 if stream:
                     stream.emit_status("⏸️ Waiting for your clarification answers before proceeding...",
                                      step="clarification")
@@ -62,7 +72,8 @@ class AnalyzeQueryNode(ResearchNode):
                 }
 
             logger.info("User answered clarification, proceeding with analysis",
-                       session_id=session_id)
+                       session_id=session_id,
+                       answers_source="session_state" if clarification_answers_from_state else "chat_history_fallback")
 
         if stream:
             stream.emit_status("Analyzing query complexity...", step="analysis")
@@ -74,8 +85,18 @@ class AnalyzeQueryNode(ResearchNode):
         else:
             deep_search_result = deep_search_result_raw or ""
 
-        # Extract clarification answers from chat history if available
-        clarification_context = self._extract_clarification_answers(chat_history)
+        # CRITICAL: Use clarification_answers from session state (loaded from DB), not chat_history
+        # clarification_answers is the source of truth, loaded from session in create_initial_state
+        clarification_answers_from_state = state.get("clarification_answers", "")
+        clarification_context = clarification_answers_from_state if clarification_answers_from_state else ""
+        
+        # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
+        if not clarification_context:
+            clarification_context = self._extract_clarification_answers(chat_history)
+            if clarification_context:
+                logger.warning("Using clarification_answers from chat_history (fallback) - should be in session state",
+                             session_id=session_id,
+                             note="This should not happen in normal flow - clarification_answers should be in session")
 
         # Build prompt using prompt builder
         prompt_builder = AnalysisPromptBuilder()
@@ -89,6 +110,10 @@ class AnalyzeQueryNode(ResearchNode):
         # Add clarification context if available
         if clarification_context:
             prompt += f"\n\n**USER CLARIFICATION ANSWERS (CRITICAL - MUST BE CONSIDERED):**\n{clarification_context}\n\nThese answers refine the research scope. Use them when analyzing the query."
+            logger.info("Using clarification_answers in analysis",
+                       session_id=session_id,
+                       answers_length=len(clarification_context),
+                       source="session_state" if clarification_answers_from_state else "chat_history_fallback")
 
         try:
             system_prompt = "You are an expert research planner. Analyze queries to determine the best research approach."
@@ -110,8 +135,10 @@ class AnalyzeQueryNode(ResearchNode):
             elif isinstance(analysis.complexity, dict):
                 estimated_agent_count = analysis.complexity.get("estimated_agents", 4)
 
+            # CRITICAL: Return format must match original - include requires_deep_search
             return {
                 "query_analysis": analysis.dict() if hasattr(analysis, "dict") else analysis,
+                "requires_deep_search": getattr(analysis, "requires_deep_search", True),  # Original backup: analysis.requires_deep_search
                 "estimated_agent_count": estimated_agent_count
             }
 
@@ -119,15 +146,16 @@ class AnalyzeQueryNode(ResearchNode):
             logger.error("Query analysis failed", error=str(e), exc_info=True,
                         session_id=session_id)
 
-            # Fallback
+            # Fallback - must match original format
             return {
                 "query_analysis": {
-                    "reasoning": f"Fallback analysis due to error: {str(e)}",
-                    "key_aspects": [original_query],
-                    "complexity": {"level": "medium", "reasoning": "Default complexity", "estimated_agents": 4},
-                    "research_strategy": "Comprehensive research approach",
-                    "requires_clarification": False
+                    "reasoning": "Fallback analysis due to error",
+                    "topics": [query],  # Original backup uses "topics", not "key_aspects"
+                    "complexity": "moderate",  # Original backup uses string, not dict
+                    "requires_deep_search": True,
+                    "estimated_agent_count": 4
                 },
+                "requires_deep_search": True,  # Original backup includes this in fallback
                 "estimated_agent_count": 4
             }
 

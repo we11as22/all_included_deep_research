@@ -98,16 +98,17 @@ Provide structured output with:
                        key_insights_count=len(result.key_insights) if hasattr(result, "key_insights") else 0,
                        session_id=session_id)
 
-            # Format compressed research
-            compressed = self._format_compressed_findings(result)
-
-            return {"compressed_research": compressed}
+            # CRITICAL: Return format must match original - use override format
+            # Original backup: {"compressed_research": {"type": "override", "value": result.compressed_summary}}
+            return {
+                "compressed_research": {"type": "override", "value": result.compressed_summary}
+            }
 
         except Exception as e:
             logger.error("Findings compression failed", error=str(e), exc_info=True,
                         session_id=session_id)
 
-            # Fallback: simple concatenation
+            # Fallback: simple concatenation - must use override format
             fallback = f"""# Research Findings for: {original_query}
 
 ## All Findings
@@ -118,7 +119,8 @@ Provide structured output with:
 
 *Note: This is a fallback summary due to compression error: {str(e)}*
 """
-            return {"compressed_research": fallback}
+            # CRITICAL: Return format must match original - use override format
+            return {"compressed_research": {"type": "override", "value": fallback}}
 
     def _format_compressed_findings(self, result: CompressedFindings) -> str:
         """Format compressed findings into markdown.

@@ -39,10 +39,25 @@ class WebScraper:
             max_scrolls: Maximum number of scroll operations
         """
         self.timeout = aiohttp.ClientTimeout(total=timeout)
+        # Use realistic browser User-Agent to avoid 403 Forbidden errors
         self.user_agent = user_agent or (
-            "Mozilla/5.0 (compatible; DeepResearchBot/1.0; +https://github.com)"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
-        self.headers = {"User-Agent": self.user_agent}
+        # Use realistic browser headers to avoid bot detection
+        self.headers = {
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "none",
+            "Sec-Fetch-User": "?1",
+            "Cache-Control": "max-age=0",
+        }
         self.use_playwright = use_playwright
         self.scroll_enabled = scroll_enabled
         self.scroll_pause = scroll_pause
@@ -100,6 +115,15 @@ class WebScraper:
                     viewport={"width": 1920, "height": 1080},
                     # Increase timeouts for slow connections
                     navigation_timeout=60000,
+                    # Add realistic browser headers to avoid bot detection
+                    extra_http_headers={
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                        "Accept-Language": "en-US,en;q=0.9",
+                        "Accept-Encoding": "gzip, deflate, br",
+                        "DNT": "1",
+                        "Connection": "keep-alive",
+                        "Upgrade-Insecure-Requests": "1",
+                    }
                 )
                 page = await context.new_page()
 

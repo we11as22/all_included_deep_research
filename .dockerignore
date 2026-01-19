@@ -1,1 +1,5 @@
 backend/src/workflow/legacy
+
+# Backup directories
+backup_nodes_*/
+backup_workflow_*/

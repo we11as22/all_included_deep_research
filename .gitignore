@@ -215,3 +215,7 @@ __pycache__/
 *.pyc
 archive/
 cursor_docs/
+
+# Backup directories
+backup_nodes_*/
+backup_workflow_*/

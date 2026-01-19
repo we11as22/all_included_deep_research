@@ -5,12 +5,16 @@ Legacy wrappers are provided for backward compatibility during migration.
 """
 
 import contextvars
+from typing import Any, Dict
 
 # Context variable for runtime dependencies (legacy support during migration)
 runtime_deps_context = contextvars.ContextVar('runtime_deps', default=None)
 
-# Import legacy helper function from nodes_legacy.py
-from src.workflow.research.nodes_legacy import _get_runtime_deps
+
+def _get_runtime_deps() -> Dict[str, Any]:
+    """Get runtime dependencies from context variable."""
+    deps = runtime_deps_context.get()
+    return deps or {}
 
 # Import node classes
 from src.workflow.research.nodes.base import ResearchNode

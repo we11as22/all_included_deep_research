@@ -82,6 +82,7 @@ async def _run_researcher_agent_impl(
     # First try to get from state (if passed directly)
     agent_memory_service = state.get("agent_memory_service")
     agent_file_service = state.get("agent_file_service")
+    research_memory_service = state.get("research_memory_service")
     
     # If not in state, try to get from runtime deps via contextvars
     if not agent_memory_service or not agent_file_service:
@@ -89,6 +90,7 @@ async def _run_researcher_agent_impl(
         runtime_deps = _get_runtime_deps()
         agent_memory_service = runtime_deps.get("agent_memory_service")
         agent_file_service = runtime_deps.get("agent_file_service")
+        research_memory_service = runtime_deps.get("research_memory_service")
     
     # Last resort: try to get from stream.app_state
     if (not agent_memory_service or not agent_file_service) and stream:
@@ -97,9 +99,11 @@ async def _run_researcher_agent_impl(
             if isinstance(app_state, dict):
                 agent_memory_service = agent_memory_service or app_state.get("agent_memory_service") or app_state.get("_agent_memory_service")
                 agent_file_service = agent_file_service or app_state.get("agent_file_service") or app_state.get("_agent_file_service")
+                research_memory_service = research_memory_service or app_state.get("research_memory_service") or app_state.get("_research_memory_service")
             else:
                 agent_memory_service = agent_memory_service or getattr(app_state, "agent_memory_service", None) or getattr(app_state, "_agent_memory_service", None)
                 agent_file_service = agent_file_service or getattr(app_state, "agent_file_service", None) or getattr(app_state, "_agent_file_service", None)
+                research_memory_service = research_memory_service or getattr(app_state, "research_memory_service", None) or getattr(app_state, "_research_memory_service", None)
 
     if not agent_memory_service or not agent_file_service:
         logger.error(
@@ -116,34 +120,136 @@ async def _run_researcher_agent_impl(
 
     # Load agent file
     agent_file = await agent_file_service.read_agent_file(agent_id)
-    # CRITICAL: Only truncate character if extremely long (over 2000 chars) - don't break normal usage
-    raw_character = agent_file.get("character", "")
-    max_character_length = 2000  # Only truncate if extremely long
-    character = raw_character[:max_character_length] + "..." if len(raw_character) > max_character_length else raw_character
+    # CRITICAL: Do NOT truncate character - keep it full for proper agent behavior
+    character = agent_file.get("character", "")
     preferences = agent_file.get("preferences", "")
     todos = agent_file.get("todos", [])
     
-    # Get recent notes - LIMIT to prevent context bloat
-    # Only include last 10 most recent important notes in context
-    all_notes = agent_file.get("notes", [])
-    # Notes are already limited to 20 in read_agent_file, but we limit further for context
-    recent_notes = all_notes[-10:] if len(all_notes) > 10 else all_notes
-    # CRITICAL: Only truncate notes if they're extremely long (over 1000 chars) - don't break normal usage
-    max_note_length = 1000  # Only truncate if extremely long
-    truncated_notes = [note[:max_note_length] + "..." if len(note) > max_note_length else note for note in recent_notes]
-    notes_context = "\n".join([f"- {note}" for note in truncated_notes]) if truncated_notes else "No previous notes."
-    
-    # Log note count for debugging
-    if all_notes:
-        logger.debug(f"Agent {agent_id} notes", total=agent_file.get("all_notes_count", len(all_notes)), in_context=len(recent_notes))
+    # CRITICAL: Use vector search to find relevant notes and findings instead of just recent notes
+    # Search for top 5 most relevant memories (notes + findings) based on task description
+    notes_context = "No previous notes or findings."
+    session_id = state.get("session_id")
+    if research_memory_service and session_id:
+        try:
+            # Build search query from task description
+            current_task = None
+            in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+            if in_progress_tasks:
+                current_task = in_progress_tasks[0]
+            else:
+                pending_tasks = [t for t in todos if t.status == "pending"]
+                if pending_tasks:
+                    current_task = pending_tasks[0]
+            
+            if current_task:
+                # Use task title + objective + guidance as search query
+                # CRITICAL: Limit query length for embedding generation performance (most embedding models have token limits)
+                # Take first 2000 characters to ensure fast embedding generation while keeping key information
+                task_title = current_task.title or ""
+                task_objective = current_task.objective or ""
+                task_note = current_task.note if hasattr(current_task, 'note') and current_task.note else ""
+                
+                # Build search query prioritizing title and objective (most important)
+                search_query_parts = []
+                if task_title:
+                    search_query_parts.append(task_title)
+                if task_objective:
+                    search_query_parts.append(task_objective)
+                if task_note:
+                    search_query_parts.append(task_note)
+                
+                search_query = "\n".join(search_query_parts)
+                
+                # Limit to 2000 chars for fast embedding generation (most models handle this well)
+                if len(search_query) > 2000:
+                    # Prioritize title and objective, truncate note if needed
+                    if len(task_title + "\n" + task_objective) <= 2000:
+                        search_query = f"{task_title}\n{task_objective}\n{task_note[:2000 - len(task_title) - len(task_objective) - 2]}"
+                    else:
+                        # If even title+objective is too long, just use title (most important)
+                        search_query = task_title[:2000]
+                
+                # Only search if we have a non-empty query
+                if search_query and search_query.strip():
+                    # Search for top 5 relevant memories (both notes and findings)
+                    relevant_memories = await research_memory_service.search_memories(
+                        session_id=session_id,
+                        query=search_query,
+                        memory_types=None,  # Search both notes and findings
+                        limit=5
+                    )
+                else:
+                    relevant_memories = []
+                    logger.debug(f"Agent {agent_id} empty search query, skipping vector search", task=current_task.title if current_task else "no task")
+                
+                if relevant_memories:
+                    # Format memories for context (full content, not truncated)
+                    memory_parts = []
+                    for mem in relevant_memories:
+                        mem_type_label = "Note" if mem["memory_type"] == "note" else "Finding"
+                        agent_label = f" (from {mem['agent_id']})" if mem.get("agent_id") else ""
+                        memory_parts.append(
+                            f"**{mem_type_label}{agent_label}**: {mem['title']}\n{mem['content']}"
+                        )
+                    notes_context = "\n\n".join(memory_parts)
+                    # Log similarity for debugging/monitoring
+                    avg_similarity = sum(m.get("similarity", 0.0) for m in relevant_memories) / len(relevant_memories) if relevant_memories else 0.0
+                    logger.info(f"Agent {agent_id} found relevant memories via vector search",
+                               memories_count=len(relevant_memories),
+                               task=current_task.title,
+                               avg_similarity=avg_similarity,
+                               min_similarity=min((m.get("similarity", 0.0) for m in relevant_memories), default=0.0),
+                               max_similarity=max((m.get("similarity", 0.0) for m in relevant_memories), default=0.0),
+                               note="Using vector search instead of recent notes")
+                else:
+                    logger.debug(f"Agent {agent_id} no relevant memories found via vector search", task=current_task.title if current_task else "no task")
+        except Exception as e:
+            logger.warning(f"Agent {agent_id} vector search failed, using fallback", error=str(e))
+            # Fallback to recent notes if vector search fails
+            all_notes = agent_file.get("notes", [])
+            recent_notes = all_notes[-5:] if len(all_notes) > 5 else all_notes
+            notes_context = "\n".join([f"- {note}" for note in recent_notes]) if recent_notes else "No previous notes."
+    else:
+        # Fallback: use recent notes if research_memory_service not available
+        all_notes = agent_file.get("notes", [])
+        recent_notes = all_notes[-5:] if len(all_notes) > 5 else all_notes
+        notes_context = "\n".join([f"- {note}" for note in recent_notes]) if recent_notes else "No previous notes."
+        if not research_memory_service:
+            logger.debug(f"Agent {agent_id} research_memory_service not available, using recent notes fallback")
 
     # Get agent characteristics from state
-    agent_characteristics = state.get("agent_characteristics", {}).get(agent_id, {})
-    role = agent_characteristics.get("role", f"Research Agent {agent_id}")
-    expertise = agent_characteristics.get("expertise", "general research")
-    personality = agent_characteristics.get("personality", "thorough and analytical")
+    agent_characteristics = state.get("agent_characteristics", {})
+    role = agent_characteristics.get(agent_id, {}).get("role", f"Research Agent {agent_id}")
+    expertise = agent_characteristics.get(agent_id, {}).get("expertise", "general research")
+    personality = agent_characteristics.get(agent_id, {}).get("personality", "thorough and analytical")
 
-    logger.info(f"Agent {agent_id} loaded", role=role, expertise=expertise, todos_count=len(todos))
+    # Get tasks from other agents to help with note creation
+    other_agents_tasks = []
+    if agent_file_service:
+        try:
+            # Get all agent IDs from characteristics (typically agent_1, agent_2, agent_3)
+            all_agent_ids = list(agent_characteristics.keys())
+            for other_agent_id in all_agent_ids:
+                if other_agent_id != agent_id:
+                    try:
+                        other_agent_file = await agent_file_service.read_agent_file(other_agent_id)
+                        other_todos = other_agent_file.get("todos", [])
+                        # Get pending and in_progress tasks
+                        other_active_tasks = [
+                            t for t in other_todos 
+                            if t.status in ["pending", "in_progress"]
+                        ]
+                        if other_active_tasks:
+                            other_agents_tasks.append({
+                                "agent_id": other_agent_id,
+                                "tasks": other_active_tasks
+                            })
+                    except Exception as e:
+                        logger.debug(f"Could not load tasks from {other_agent_id}", error=str(e))
+        except Exception as e:
+            logger.warning(f"Failed to load other agents' tasks", error=str(e))
+
+    logger.info(f"Agent {agent_id} loaded", role=role, expertise=expertise, todos_count=len(todos), other_agents_tasks_count=sum(len(ot["tasks"]) for ot in other_agents_tasks))
 
     # ENFORCE: Only one task at a time
     in_progress_tasks = [t for t in todos if t.status == "in_progress"]
@@ -290,6 +396,25 @@ Create a BRIEF, actionable research plan for completing this task.
     notes = []
     agent_history = []
 
+    # Format other agents' tasks for context
+    other_agents_tasks_context = "No other agents have active tasks."
+    if other_agents_tasks:
+        task_parts = []
+        for agent_info in other_agents_tasks:
+            agent_id_other = agent_info["agent_id"]
+            tasks_list = agent_info["tasks"]
+            task_lines = []
+            for task in tasks_list:
+                status_icon = "⏸️" if task.status == "in_progress" else "⬜"
+                task_lines.append(f"  {status_icon} {task.title}")
+                if hasattr(task, "objective") and task.objective:
+                    task_lines.append(f"    Objective: {task.objective[:150]}")
+            if task_lines:
+                task_parts.append(f"**{agent_id_other}**:\n" + "\n".join(task_lines))
+        if task_parts:
+            other_agents_tasks_context = "\n\n".join(task_parts)
+            other_agents_tasks_context = f"**Use this information to create notes that might be relevant to other agents' research:**\n\n{other_agents_tasks_context}"
+
     # Get user language from state (needed for response language)
     user_language = state.get("user_language", "English")
     # NOTE: We don't extract original_query, deep_search_result, or clarification_context here
@@ -312,10 +437,12 @@ Current task: {current_task.title}
 Objective: {current_task.objective}
 Guidance: {current_task.note if hasattr(current_task, 'note') and current_task.note else 'No specific guidance provided'}
 
-**CRITICAL: READ THE TASK OBJECTIVE AND GUIDANCE CAREFULLY!**
-- The task objective and guidance contain the user's original query and what you need to research
-- If the task mentions "The user asked: ...", that is the specific topic you must focus on
-- Do NOT research generic topics - research exactly what is described in the task!
+**CRITICAL: YOU MUST WORK STRICTLY ON YOUR CURRENT TASK!**
+- **MANDATORY**: Your research MUST be focused EXACTLY on the task objective and guidance above
+- **MANDATORY**: The task description is your PRIMARY source of what to research - follow it strictly
+- **FORBIDDEN**: Do NOT deviate from the task topic - research exactly what is described in the task!
+- **FORBIDDEN**: Do NOT research topics from notes or other agents' tasks unless they DIRECTLY relate to YOUR current task
+- If the task mentions "The user asked: ...", that is the SPECIFIC topic you must focus on - nothing else!
 - The task description is self-contained and contains all context you need
 
 Research plan:
@@ -329,121 +456,32 @@ Strategy: {plan.search_strategy}
 - Provide full context, not just "found X sources"
 - Your findings should be self-contained and informative
 
-Your previous notes (recent important findings):
+**CRITICAL: UNDERSTANDING NOTES AND OTHER AGENTS' TASKS:**
+- The notes below are from other agents or your previous work - they are for COORDINATION ONLY
+- **MANDATORY**: You must work on YOUR task topic, NOT on topics from notes
+- **MANDATORY**: Notes are shown so you can see what other agents need and write helpful notes for them
+- **MANDATORY**: When you find information relevant to OTHER agents' tasks (shown below), write detailed notes about it
+- **MANDATORY**: Your notes should help other agents find information they need for THEIR tasks
+- **FORBIDDEN**: Do NOT switch your research focus to topics from notes - stay on YOUR task!
+
+Your previous notes (for coordination - see what others might need):
 {notes_context}
 
-CRITICAL INSTRUCTIONS FOR NOTES AND MEMORY:
-- **DO NOT save notes automatically** - you must THINK and decide what's truly important
-- **ONLY save notes when you have SUBSTANTIAL, ACTIONABLE INFORMATION**:
-  1. Key discoveries, important facts, or significant insights that answer the research question
-  2. Critical information that directly relates to your current task objective
-  3. Important patterns, trends, or conclusions you've identified
-  4. Gaps or limitations that need further investigation
-  5. Research directions or questions that are critical for completing the task
-- **NEVER save routine notes** like:
-  - "Found X sources" (this is not information, just metadata)
-  - "Search: query" (this is not a finding)
-  - Lists of URLs without context (this is not useful)
-  - Generic summaries without specific facts
-- **When you DO save a note, it must contain**:
-  - Specific facts, data, or insights (not just "found sources")
-  - Clear explanation of WHY this information is important
-  - How it relates to the research objective
-  - Clickable links (URLs) to all sources
-- **Your notes should help guide future research** - they must be informative and actionable
-- **Think before saving**: "Does this note contain valuable information that will help complete the research?" If not, don't save it.
+**OTHER AGENTS' ACTIVE TASKS (use this to write helpful notes for them):**
+{other_agents_tasks_context}
 
-Available actions:
-- web_search(queries: list[str]): Search the web with natural queries (write as you would in a browser)
-- select_urls_to_scrape(search_results: list, original_query: str, max_urls: int): Analyze search results and select the most relevant URLs for scraping
-- scrape_url(urls: list[str]): Get full content from URLs
-- done(): Signal completion
+**CRITICAL: NOTES FOR COORDINATION - READ CAREFULLY:**
+- Use save_note to write detailed notes when you find information relevant to OTHER agents' tasks
+- **MANDATORY**: When you find something that relates to other agents' research, write a comprehensive note about it
+- **MANDATORY**: Your notes help other agents find information for THEIR tasks - write them clearly and in detail
+- **MANDATORY**: Your notes are searchable by other agents - write them so they can find and understand the information
+- **FORBIDDEN**: Do NOT use notes to change your research topic - work on YOUR task, write notes for OTHERS
 
-**MANDATORY WORKFLOW FOR BETTER RESULTS:**
-After EVERY web_search, you MUST:
-1. **MANDATORY**: Call select_urls_to_scrape tool with search_results from web_search to analyze and choose the best URLs
-2. **CRITICAL**: When calling select_urls_to_scrape, pass ALL results from web_search (all results_count), NOT just the first few!
-3. **CRITICAL**: The web_search returns results_count results - you MUST pass ALL of them to select_urls_to_scrape
-4. **MANDATORY**: Then call scrape_url tool with selected_urls from select_urls_to_scrape to get full content
-5. This ensures you scrape only relevant, high-quality sources (like ai.meta.com, huggingface.co), not just top-N by order
-6. **CRITICAL**: Do NOT skip select_urls_to_scrape - it's essential for choosing the best sources!
-
-**CRITICAL: Information Verification and Source Quality:**
-- **MANDATORY: Always verify information when in doubt** - If you have ANY doubt about the accuracy, reliability, or credibility of information, you MUST cross-check it with multiple independent sources
-- **MANDATORY: Do NOT trust questionable or biased sources** - Be critical of sources that:
-  * Show clear bias, agenda, or conflict of interest
-  * Lack proper citations or references
-  * Come from unverified or unknown publishers
-  * Contain sensationalist, exaggerated, or unsubstantiated claims
-  * Are from sources with known political, commercial, or ideological agendas
-- **MANDATORY: Prefer authoritative sources** - Prioritize:
-  * Academic publications, peer-reviewed research
-  * Official government or institutional sources
-  * Established news organizations with editorial standards
-  * Expert-authored content from recognized authorities
-  * Primary sources over secondary interpretations
-- **MANDATORY: Cross-verify critical claims** - For important facts, statistics, or claims:
-  * Find the same information in at least 2-3 independent sources
-  * Check if sources cite their data or provide references
-  * Look for conflicting information and investigate discrepancies
-  * If sources contradict each other, note this in your findings
-- **MANDATORY: Question suspicious information** - If information seems:
-  * Too good to be true
-  * Contradicts established knowledge without explanation
-  * Comes from a single source without verification
-  * Has obvious bias or agenda
-  * Then you MUST search for additional sources to verify or refute it
-- **MANDATORY: Report source quality** - In your findings, note:
-  * The reliability and authority of sources used
-  * Any concerns about bias or credibility
-  * Whether information was verified across multiple sources
-  * Any discrepancies or contradictions found
-
-**CRITICAL: Evaluating search results before scraping:**
-- When you receive search results, CAREFULLY evaluate each result's RELEVANCE AND CREDIBILITY
-- Look at the TITLE, SNIPPET, and SOURCE DOMAIN - do they relate to your task AND appear credible?
-- Only scrape URLs that are CLEARLY relevant to your task AND from trustworthy sources
-- If a result's title/snippet doesn't match your task OR comes from a questionable source, SKIP it
-- Example: If your task is "ВВС Германии техника", skip results about "ВВС США" or "техника вообще" or from unreliable sources
-- Focus on scraping sources that directly help answer your specific task AND are from authoritative, credible sources
-
-**CRITICAL: Query reformulation strategy (to avoid getting stuck):**
-- If your search results are NOT relevant to your task, you MUST try DIFFERENT search queries
-- Don't repeat the same query multiple times - reformulate it with different keywords or phrasing
-- Try different angles: synonyms, related terms, more specific or more general queries
-- Example: If "ВВС Германии" gives irrelevant results, try "Luftwaffe техника", "немецкая военная авиация", "современные самолеты Германии"
-- You have up to {max_steps} steps - use them ALL to thoroughly investigate the topic from multiple angles
-- **MANDATORY**: Use your full step limit to dig DEEP - don't stop after finding basic information
-
-**CRITICAL: VERIFICATION AND DEEP RESEARCH REQUIREMENTS:**
-- **MANDATORY**: All important claims, facts, and data MUST be verified in MULTIPLE independent sources
-- Never rely on a single source - always cross-reference important information
-- If you find a key fact or claim, search for it in different sources to verify accuracy
-- **DIG DEEP**: Don't stop at surface-level information - investigate:
-  * Technical specifications and detailed parameters
-  * Expert opinions and critical analysis from multiple perspectives
-  * Historical context and evolution
-  * Real-world case studies and practical applications
-  * Comparative analysis with alternatives
-  * Controversial aspects and different viewpoints
-- **VERIFICATION STRATEGY**: For each important finding:
-  1. Find the information in the first source
-  2. Search for the same information in 2-3 additional independent sources
-  3. Compare findings - note any discrepancies or different perspectives
-  4. Document all sources that confirm or contradict the finding
-- **DEEP DIVE**: When you find interesting information, don't just note it - investigate related aspects:
-  * If you find technical specs, also find expert analysis of those specs
-  * If you find historical info, also find current state and future trends
-  * If you find one perspective, also find alternative or critical viewpoints
-  * If you find general info, dig into specific examples and case studies
-- **USE ALL YOUR STEPS**: You have {max_steps} steps - use them to thoroughly research, verify, and cross-reference information
-- Only signal done() when you have:
-  * Verified important claims in multiple sources
-  * Explored the topic from multiple angles
-  * Found specific examples, case studies, and detailed information
-  * Cross-referenced key findings across different sources
-
-Be thorough, cite sources with links, verify everything in multiple sources, and fulfill the objective. Go DEEP, not just surface-level!
+**CRITICAL: READ TOOL DESCRIPTIONS CAREFULLY:**
+- All detailed instructions for verification, source quality, deep research, and completion requirements are in the tool descriptions
+- Read web_search, scrape_url, and done tool descriptions for complete guidance on verification and deep research
+- You have up to {max_steps} steps - use EVERY SINGLE ONE to thoroughly research, verify, and cross-reference information
+- Be thorough, cite sources with links, verify everything in multiple sources, and fulfill the objective. Go DEEP, not just surface-level!
 """
 
     agent_history.append({
@@ -498,6 +536,10 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                 "stream": stream,
                 "llm": llm,
                 "agent_id": agent_id,
+                "agent_memory_service": agent_memory_service,
+                "agent_file_service": agent_file_service,
+                "research_memory_service": research_memory_service,
+                "session_id": session_id,
             }
             result = await ActionRegistry.execute(action_name, kwargs, context)
             # Convert result to string for ToolMessage (LangChain expects string)
@@ -517,9 +559,7 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
     # Get enabled actions for deep research mode
     tools = []
     for action_name, action_def in ActionRegistry._actions.items():
-        # Check if action is enabled (skip reasoning_preamble for deep research)
-        if action_name == "__reasoning_preamble":
-            continue
+        # Check if action is enabled (reasoning_preamble is now enabled for deep research)
         enabled = action_def["enabled_condition"]({
             "mode": "quality",  # Deep research uses quality mode
             "classification": None,
@@ -546,6 +586,11 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
         try:
             from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 
+            # CRITICAL: No context truncation - agent_history keeps all messages for full context
+            # This allows agents to have complete context of their research process
+
+            # CRITICAL: system_prompt contains the task (current_task.title, objective, guidance)
+            # This is NEVER truncated - agent always sees their task
             messages = [SystemMessage(content=system_prompt)]
             for msg in agent_history:
                 if msg["role"] == "user":
@@ -615,12 +660,42 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                     tool_name = tc.get("name") or tc.get("function", {}).get("name")
                 
                 if tool_name == "done":
-                    done = True
+                    # CRITICAL: Require extensive work before allowing done()
+                    # Prevent agents from completing tasks too quickly - force deep research
+                    MIN_STEPS_FOR_DONE = max(5, int(max_steps * 0.6))  # Minimum 60% of max_steps (or 5, whichever is higher)
+                    MIN_SOURCES_FOR_DONE = 5  # Minimum 5 sources before done() is allowed (increased for deep research)
+                    MIN_VERIFIED_CLAIMS = 3  # Minimum 3 verified claims in multiple sources
+                    
+                    if step < MIN_STEPS_FOR_DONE:
+                        logger.warning(f"Agent {agent_id} tried to call done() too early (step {step + 1}/{max_steps}, min {MIN_STEPS_FOR_DONE} required)",
+                                     step=step + 1,
+                                     max_steps=max_steps,
+                                     min_steps=MIN_STEPS_FOR_DONE,
+                                     min_percentage=int((MIN_STEPS_FOR_DONE/max_steps)*100),
+                                     note=f"Agent must complete at least {MIN_STEPS_FOR_DONE} steps ({int((MIN_STEPS_FOR_DONE/max_steps)*100)}% of max) before calling done() - continue deep research!")
+                        # Don't allow done() - continue research
+                        done = False
+                    elif len(sources) < MIN_SOURCES_FOR_DONE:
+                        logger.warning(f"Agent {agent_id} tried to call done() with insufficient sources (found {len(sources)}, min {MIN_SOURCES_FOR_DONE} required)",
+                                     sources_count=len(sources),
+                                     min_sources=MIN_SOURCES_FOR_DONE,
+                                     note=f"Agent must find at least {MIN_SOURCES_FOR_DONE} sources before calling done() - continue searching!")
+                        # Don't allow done() - continue research
+                        done = False
+                    else:
+                        done = True
+                        logger.info(f"Agent {agent_id} signaled done after extensive deep research",
+                                   step=step + 1,
+                                   max_steps=max_steps,
+                                   steps_used_percentage=int(((step + 1)/max_steps)*100),
+                                   sources_count=len(sources),
+                                   notes_count=len(notes),
+                                   note=f"Used {step + 1}/{max_steps} steps ({int(((step + 1)/max_steps)*100)}%) and found {len(sources)} sources")
                     break
 
             if done or not tool_calls:
                 if done:
-                    logger.info(f"Agent {agent_id} signaled done", step=step)
+                    logger.info(f"Agent {agent_id} signaled done", step=step + 1, sources_count=len(sources), notes_count=len(notes))
                 else:
                     logger.warning(f"Agent {agent_id} step {step}: no tool calls, ending", 
                                  response_content_preview=str(response.content)[:200] if hasattr(response, "content") else "no content")
@@ -664,6 +739,10 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                             "stream": stream,
                             "llm": llm,
                             "agent_id": agent_id,
+                            "agent_memory_service": agent_memory_service,
+                            "agent_file_service": agent_file_service,
+                            "research_memory_service": research_memory_service,
+                            "session_id": session_id,
                         }
                     )
                 
@@ -682,10 +761,12 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
 
                     # Track sources and create notes
                     # Handle both dict and string results
+                    # CRITICAL: json is imported at module level (line 4)
                     if isinstance(result, str):
                         try:
                             result = json.loads(result)
-                        except:
+                        except Exception as e:
+                            logger.warning(f"Agent {agent_id} step {step}: failed to parse result as JSON", error=str(e))
                             result = {"error": "Could not parse result"}
 
                     if tool_name == "web_search" and isinstance(result, dict) and "results" in result:
@@ -733,9 +814,12 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                     elif isinstance(tool_call, dict):
                         tool_call_id = tool_call.get("id")
                     
+                    # No truncation - keep full tool output for complete context
+                    output_str = json.dumps(result) if not isinstance(result, str) else result
+                    
                     action_results.append({
                         "tool_call_id": tool_call_id or f"call_{step}_{len(action_results)}",
-                        "output": json.dumps(result) if not isinstance(result, str) else result
+                        "output": output_str
                     })
             else:
                 # Execute tools sequentially (default for mixed tool types)
@@ -759,10 +843,12 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
 
                     # Track sources and create notes
                     # Handle both dict and string results
+                    # CRITICAL: json is imported at module level (line 4)
                     if isinstance(result, str):
                         try:
                             result = json.loads(result)
-                        except:
+                        except Exception as e:
+                            logger.warning(f"Agent {agent_id} step {step}: failed to parse result as JSON", error=str(e))
                             result = {"error": "Could not parse result"}
 
                     if tool_name == "web_search" and isinstance(result, dict) and "results" in result:
@@ -809,9 +895,12 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
                     elif isinstance(tool_call, dict):
                         tool_call_id = tool_call.get("id")
                     
+                    # No truncation - keep full tool output for complete context
+                    output_str = json.dumps(result) if not isinstance(result, str) else result
+                    
                     action_results.append({
                         "tool_call_id": tool_call_id or f"call_{step}_{len(action_results)}",
-                        "output": json.dumps(result) if not isinstance(result, str) else result
+                        "output": output_str
                     })
 
             # Add to history
@@ -822,9 +911,12 @@ Be thorough, cite sources with links, verify everything in multiple sources, and
             })
 
             for result in action_results:
+                # No truncation - keep full tool output in history for complete context
+                output_content = result["output"]
+                
                 agent_history.append({
                     "role": "tool",
-                    "content": result["output"],
+                    "content": output_content,
                     "tool_call_id": result["tool_call_id"]
                 })
 
@@ -1118,7 +1210,37 @@ Create an updated research plan incorporating this new direction. Keep it concis
             tags=["task_complete"]
         )
         # CRITICAL: Pass agent_file_service so note is added to agent's personal file
-        await agent_memory_service.save_agent_note(final_note, agent_id, agent_file_service=agent_file_service)
+        # Also pass research_memory_service and session_id for vector search
+        await agent_memory_service.save_agent_note(
+            final_note, 
+            agent_id, 
+            agent_file_service=agent_file_service,
+            research_memory_service=research_memory_service,
+            session_id=session_id
+        )
+        
+        # CRITICAL: Save finding to research_memory_service for vector search
+        if research_memory_service and session_id:
+            try:
+                # Save finding summary with embedding
+                finding_content = f"{summary}\n\nKey findings:\n" + "\n".join([f"- {kf}" for kf in key_findings[:10]])
+                await research_memory_service.save_finding(
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    title=current_task.title,
+                    content=finding_content,
+                    metadata={
+                        "sources_count": len(useful_sources),
+                        "key_findings_count": len(key_findings),
+                        "confidence": finding.get("confidence", "medium"),
+                        "sources": [s.get("url") for s in useful_sources[:10] if s.get("url")],
+                    }
+                )
+                logger.info(f"Agent {agent_id} saved finding to research_memory_service",
+                           session_id=session_id,
+                           title=current_task.title)
+            except Exception as e:
+                logger.warning(f"Agent {agent_id} failed to save finding to research_memory_service", error=str(e))
 
         stream.emit_agent_note(agent_id, {
             "title": final_note.title,

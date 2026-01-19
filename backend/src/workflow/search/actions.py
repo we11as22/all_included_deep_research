@@ -248,9 +248,18 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
             
             title = content.title if hasattr(content, "title") else ""
 
+            # CRITICAL: Prefer markdown for summarization if available (better structure)
+            content_to_summarize = None
+            if hasattr(content, "markdown") and content.markdown:
+                content_to_summarize = content.markdown
+                logger.debug(f"Using markdown for summarization", url=url, markdown_length=len(content.markdown))
+            elif full_content:
+                content_to_summarize = full_content
+                logger.debug(f"Using plain text content for summarization", url=url, content_length=len(full_content))
+
             # Step 2: Summarize content in parallel with other URLs
             summary = ""
-            if llm and full_content:
+            if llm and content_to_summarize:
                 try:
                     if stream:
                         stream.emit_status(f"Summarizing: {title[:40]}...", step="summarize")
@@ -262,13 +271,14 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
                     logger.debug(
                         "Scraping and summarizing URL",
                         url=url,
-                        content_length=len(full_content),
+                        content_length=len(content_to_summarize),
                         llm_max_tokens=max_tokens_value,
                         summary_target_tokens=4096,
+                        using_markdown=hasattr(content, "markdown") and content.markdown is not None,
                     )
 
                     summary = await summarize_text_llm(
-                        full_content,
+                        content_to_summarize,
                         max_tokens=4096,  # Comprehensive summary (increased) - this is target summary length, not LLM max_tokens
                         llm=llm
                     )
@@ -277,27 +287,20 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
                     logger.warning(f"Summarization failed: {url}", error=str(e))
                     # Fallback to smart truncation (not hard cut)
                     from src.utils.text import summarize_text
-                    summary = summarize_text(full_content, 3200)  # ~800 tokens
+                    summary = summarize_text(content_to_summarize, 3200) if content_to_summarize else ""  # ~800 tokens
 
             # If no summary and no LLM, use smart truncation
-            if not summary and full_content:
+            if not summary and content_to_summarize:
                 from src.utils.text import summarize_text
-                summary = summarize_text(full_content, 3200)
+                summary = summarize_text(content_to_summarize, 3200)
 
-            logger.debug(f"URL scraped and summarized: {url}")
+            logger.debug(f"URL scraped and summarized: {url}", summary_length=len(summary))
 
-            # CRITICAL: Preserve markdown if available - writer needs it for proper formatting
-            original_markdown = None
-            if hasattr(content, "markdown") and content.markdown:
-                original_markdown = content.markdown
-                logger.debug(f"Preserving markdown content for writer", url=url, markdown_length=len(original_markdown))
-
+            # Return only url, title, summary (summary from markdown if available, otherwise from content)
             return {
                 "url": url,
                 "title": title,
-                "content": summary,  # Always use summary (LLM or smart truncation)
-                "summary": summary,  # Full context for writer!
-                "markdown": original_markdown,  # CRITICAL: Preserve markdown for proper formatting in writer
+                "summary": summary,  # Summary from markdown (if available) or content
             }
 
         except Exception as e:
@@ -366,6 +369,85 @@ async def reasoning_preamble_handler(args: dict[str, Any], context: dict[str, An
     #     stream.emit_agent_reasoning(context.get("agent_id", "researcher"), reasoning)
 
     return {"reasoning": reasoning}
+
+
+async def save_note_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
+    """Save a research note with title, summary, and optional URLs.
+    
+    Use this tool to save important findings, discoveries, insights, or information
+    that you've gathered during research. Notes are stored with vector search
+    and can be retrieved by you and other agents for future reference.
+    
+    CRITICAL: Only save notes when you have SUBSTANTIAL, ACTIONABLE INFORMATION:
+    - Key discoveries, important facts, or significant insights
+    - Critical information that directly relates to your current task
+    - Important patterns, trends, or conclusions
+    - Technical details, specifications, or data points
+    - Expert opinions, analysis, or perspectives
+    - Historical context, evolution, or development
+    - Real-world examples, case studies, or applications
+    
+    DO NOT save routine notes like "Found X sources" or "Search: query".
+    When you DO save a note, it MUST be LARGE and DETAILED (minimum 200-500 words).
+    """
+    from src.models.agent_models import AgentNote
+    
+    title = args.get("title", "")
+    summary = args.get("summary", "")
+    urls = args.get("urls", [])
+    tags = args.get("tags", [])
+    
+    if not title or not summary:
+        return {"error": "Title and summary are required"}
+    
+    agent_id = context.get("agent_id", "researcher")
+    agent_memory_service = context.get("agent_memory_service")
+    agent_file_service = context.get("agent_file_service")
+    research_memory_service = context.get("research_memory_service")
+    session_id = context.get("session_id")
+    stream = context.get("stream")
+    
+    if not agent_memory_service:
+        return {"error": "Agent memory service not available"}
+    
+    try:
+        note = AgentNote(
+            title=title,
+            summary=summary,
+            urls=urls if isinstance(urls, list) else [],
+            tags=tags if isinstance(tags, list) else []
+        )
+        
+        file_path = await agent_memory_service.save_agent_note(
+            note,
+            agent_id,
+            agent_file_service=agent_file_service,
+            research_memory_service=research_memory_service,
+            session_id=session_id
+        )
+        
+        if stream:
+            stream.emit_agent_note(agent_id, {
+                "title": note.title,
+                "summary": note.summary,
+                "urls": note.urls,
+                "shared": True
+            })
+        
+        logger.info(f"Agent {agent_id} saved note via save_note tool",
+                   title=title[:100],
+                   summary_length=len(summary),
+                   urls_count=len(urls))
+        
+        return {
+            "success": True,
+            "file_path": file_path,
+            "title": title,
+            "note": "Note saved successfully. It will be available for vector search."
+        }
+    except Exception as e:
+        logger.error(f"Agent {agent_id} failed to save note", error=str(e))
+        return {"error": f"Failed to save note: {str(e)}"}
 
 
 async def select_urls_to_scrape_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
@@ -481,10 +563,17 @@ def register_actions():
     ActionRegistry.register(
         name="web_search",
         description="Search the web for information. Provide up to 3 search queries. "
-        "Write natural search queries as you would type in a browser. "
-        "Keep queries targeted and specific to what you need. "
-        "Returns list of search results with title, URL, and snippet. "
-        "CRITICAL: For balanced/quality modes, use max_results=10 for better coverage. For speed mode, max_results=5 is sufficient.",
+        "**QUERY STRATEGY**: Write natural search queries as you would type in a browser. "
+        "Keep queries targeted and specific to what you need. Use all 3 slots when possible to maximize information gathering. "
+        "**REFORMULATION**: If search results are NOT relevant to your task, try DIFFERENT search queries with different keywords, "
+        "synonyms, related terms, or more specific/general phrasing. Don't repeat the same query multiple times. "
+        "**VERIFICATION STRATEGY**: When you find important information, search for it in different sources to verify accuracy. "
+        "For critical claims, find the same information in 3-5 additional independent sources. "
+        "**SOURCE QUALITY**: Prefer authoritative sources (academic publications, official sources, established news organizations, "
+        "expert-authored content). Be critical of sources with bias, lack of citations, or questionable credibility. "
+        "**RESULTS**: Returns list of search results with title, URL, and snippet. "
+        "**COVERAGE**: For balanced/quality modes, use max_results=10 for better coverage. For speed mode, max_results=5 is sufficient. "
+        "**NEXT STEP**: After web_search, you MUST call select_urls_to_scrape with ALL results to intelligently choose which pages to scrape.",
         args_schema={
             "type": "object",
             "properties": {
@@ -511,7 +600,12 @@ def register_actions():
     ActionRegistry.register(
         name="scrape_url",
         description="Scrape full content from specific URLs. Use when user provides URLs or "
-        "you need full article text. Returns scraped content.",
+        "you need full article text. Returns scraped content (url, title, summary). "
+        "**VERIFICATION**: After scraping, verify important claims from the content by searching for them in other sources. "
+        "**SOURCE QUALITY**: Evaluate the credibility of the source before trusting the information. "
+        "Check if the source is authoritative, has proper citations, and is from a reputable publisher. "
+        "**CROSS-REFERENCE**: For critical information found in scraped content, find the same information in 2-3 additional "
+        "independent sources to verify accuracy. If sources contradict, investigate WHY and document both sides.",
         args_schema={
             "type": "object",
             "properties": {
@@ -553,8 +647,13 @@ def register_actions():
     ActionRegistry.register(
         name="select_urls_to_scrape",
         description="Analyze search results (title + snippet) and select the most relevant URLs to scrape. "
-        "Use this AFTER web_search to intelligently choose which pages to scrape for comprehensive information. "
-        "This helps avoid scraping irrelevant pages and focuses on high-quality sources.",
+        "**MANDATORY WORKFLOW**: Use this AFTER web_search to intelligently choose which pages to scrape. "
+        "**CRITICAL**: When calling this tool, pass ALL results from web_search (all results_count), NOT just the first few! "
+        "**EVALUATION CRITERIA**: Evaluate each result's RELEVANCE to your task AND CREDIBILITY of the source. "
+        "Look at TITLE, SNIPPET, and SOURCE DOMAIN - do they relate to your task AND appear trustworthy? "
+        "Only select URLs that are CLEARLY relevant to your task AND from authoritative, credible sources. "
+        "Skip irrelevant results or those from questionable sources. "
+        "This ensures you scrape only relevant, high-quality sources (like ai.meta.com, huggingface.co), not just top-N by order.",
         args_schema={
             "type": "object",
             "properties": {
@@ -589,18 +688,81 @@ def register_actions():
     ActionRegistry.register(
         name="done",
         description="Signal that research is complete and you have gathered sufficient information. "
-        "Provide a brief summary of what was found.",
+        "**WHEN TO CALL**: Only call this when you have completed DEEP, COMPREHENSIVE research. "
+        "**MANDATORY REQUIREMENTS BEFORE CALLING**: "
+        "1. Verified important claims in 3-5 independent sources (NOT just 2!) "
+        "2. Explored the topic from MULTIPLE angles (at least 4-5 different perspectives) "
+        "3. Found specific examples, case studies, and detailed information (minimum 3-5 concrete examples) "
+        "4. Cross-referenced key findings across different sources "
+        "5. Investigated related aspects and follow-up questions "
+        "6. Found expert opinions, critical analysis, and alternative viewpoints "
+        "7. Documented limitations, challenges, and edge cases "
+        "8. Used at least 80% of your available steps (if you have 8 steps, use at least 6-7 before done()) "
+        "**FORBIDDEN**: Do NOT call done() if you only have surface-level information, basic definitions, or general overviews. "
+        "**DEEP RESEARCH REQUIREMENTS**: You must have investigated: technical specifications, expert analysis, case studies, "
+        "historical context, advanced features, industry trends, comparative analysis, critical perspectives, limitations, and challenges. "
+        "**VERIFICATION**: All important claims, facts, and data MUST be verified in MULTIPLE independent sources (minimum 3-5 sources for critical claims).",
         args_schema={
             "type": "object",
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "Brief summary of research findings",
+                    "description": "Comprehensive summary of research findings. Include: key discoveries, verified facts, "
+                    "sources used (with verification status), expert opinions found, case studies, limitations identified, "
+                    "and how the findings relate to the research objective.",
                 },
             },
             "required": ["summary"],
         },
         handler=done_handler,
+    )
+
+    # Save Note (for deep research mode)
+    ActionRegistry.register(
+        name="save_note",
+        description="Save an important research note with title, detailed summary, and optional URLs. "
+        "**WHEN TO USE**: Use this when you discover SUBSTANTIAL, ACTIONABLE INFORMATION during research. "
+        "**WHAT TO SAVE**: Key discoveries, important facts, significant insights, technical details, "
+        "expert opinions, historical context, real-world examples, comparative analysis, or patterns/trends. "
+        "**WHAT NOT TO SAVE**: Never save routine notes like 'Found X sources', 'Search: query', "
+        "lists of URLs without context, or generic summaries without specific facts. "
+        "**QUALITY REQUIREMENTS**: Notes MUST be LARGE and DETAILED (minimum 200-500 words) with full context, "
+        "specific facts, data points, numbers, dates, analysis, explanations, and source URLs. "
+        "**COORDINATION**: Consider other agents' active tasks (shown in your context) - if your finding relates "
+        "to their research topics, make your note comprehensive so they can find it via vector search. "
+        "**STORAGE**: Notes are stored with vector search and can be retrieved by you and other agents for future reference.",
+        args_schema={
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "Clear, descriptive title for the note (e.g., 'Key Finding: X', 'Discovery: Y', 'Technical Analysis: Z'). "
+                    "Make it searchable and informative.",
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Detailed summary of the finding (MINIMUM 200-500 words - this is CRITICAL). "
+                    "Include: specific facts, data, numbers, dates, concrete information, full context (what, why, when, where, how), "
+                    "detailed explanations (not just brief summaries), analysis/interpretation/synthesis, multiple related facts together, "
+                    "relationships between different pieces of information, quotes/statistics/examples from sources, "
+                    "clear explanation of WHY this information is important, and how it relates to the research objective. "
+                    "Write it so other agents can find and understand it via vector search.",
+                },
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of source URLs related to this note. Include ALL relevant sources that support your findings.",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional list of tags for categorizing the note (e.g., 'technical', 'historical', 'expert_opinion', 'case_study').",
+                },
+            },
+            "required": ["title", "summary"],
+        },
+        handler=save_note_handler,
+        enabled_condition=lambda ctx: ctx.get("mode") in ["quality"],  # Only for deep research
     )
 
     logger.info(f"Registered {len(ActionRegistry._actions)} actions")

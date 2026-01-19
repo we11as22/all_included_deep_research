@@ -114,11 +114,15 @@ def should_continue_research(state: ResearchState) -> str:
 
 
 def should_ask_clarification(state: ResearchState) -> str:
-    """Conditional routing after clarification check based on session status."""
+    """Conditional routing after clarification check based on session status.
+    
+    CRITICAL: Uses session_status and clarification_answers from session state,
+    NOT chat_history. Session state is the source of truth.
+    """
     clarification_needed = state.get("clarification_needed", False)
     session_status = state.get("session_status", "active")
     clarification_just_sent = state.get("clarification_just_sent", False)
-    chat_history = state.get("chat_history", [])
+    clarification_answers = state.get("clarification_answers", "")  # Loaded from session in create_initial_state
 
     if clarification_needed:
         # CRITICAL: If clarification was just sent in THIS iteration, always wait
@@ -128,19 +132,22 @@ def should_ask_clarification(state: ResearchState) -> str:
                        session_status=session_status)
             return "wait_for_user"
 
-        # Use session_status to determine if user has answered (not text markers!)
+        # CRITICAL: Use session_status and clarification_answers from session state
+        # Session state is the source of truth, not chat_history
         if session_status == "waiting_clarification":
-            # Check if user has provided new message (last message should be from user)
-            if chat_history and chat_history[-1].get("role") == "user":
-                # User has answered clarification
-                logger.info("User answered clarification (based on session_status and chat_history)",
+            # Check if clarification_answers exists in session state
+            if clarification_answers and clarification_answers.strip():
+                # User has answered clarification (answers are in session state)
+                logger.info("User answered clarification (based on session_status and clarification_answers from session)",
                            session_status=session_status,
-                           last_message_role=chat_history[-1].get("role"))
+                           has_clarification_answers=bool(clarification_answers),
+                           note="Using clarification_answers from session state, not chat_history")
                 return "proceed"
             else:
-                # Still waiting for user answer
-                logger.info("Waiting for user clarification answer (based on session_status)",
-                           session_status=session_status)
+                # Still waiting for user answer (no answers in session state)
+                logger.info("Waiting for user clarification answer (no clarification_answers in session state)",
+                           session_status=session_status,
+                           note="Checking clarification_answers from session state, not chat_history")
                 return "wait_for_user"
         else:
             # Session is not in waiting_clarification state, proceed
@@ -191,21 +198,105 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
     workflow.add_node("compress_findings", compress_findings_node)
     workflow.add_node("generate_report", generate_final_report_enhanced_node)
 
-    # Define edges
+    # CRITICAL: Entry point is always run_deep_search
+    # The deep_search node itself checks DB FIRST and returns immediately if result exists
+    # This is the MOST RELIABLE approach - DB check happens INSIDE the node, not in routing
     workflow.set_entry_point("run_deep_search")
-    workflow.add_edge("run_deep_search", "clarify")
+    
+    # CRITICAL: Conditional routing after deep_search
+    # If continuation after clarification, skip clarify and go directly to analyze_query
+    def should_skip_clarify_after_deep_search(state: ResearchState) -> str:
+        """Check if we should skip clarify node after deep_search.
+        
+        CRITICAL: This ensures proper sequential workflow:
+        - New session: deep_search → clarify → analyze_query
+        - Continuation after clarification: deep_search (returns existing result) → analyze_query (skip clarify)
+        
+        Returns:
+            "skip_clarify" - if user already answered clarification, go directly to analyze_query
+            "clarify" - normal flow, go to clarify node
+        """
+        session_id = state.get("session_id")
+        session_status = state.get("session_status", "active")
+        clarification_answers = state.get("clarification_answers", "")
+        deep_search_result = state.get("deep_search_result", "")
+        
+        # Handle dict format
+        if isinstance(deep_search_result, dict):
+            deep_search_result = deep_search_result.get("value", "")
+        
+        logger.info("🔀 ROUTING: should_skip_clarify_after_deep_search called",
+                   session_id=session_id,
+                   session_status=session_status,
+                   has_clarification_answers=bool(clarification_answers),
+                   clarification_answers_length=len(clarification_answers) if clarification_answers else 0,
+                   has_deep_search_result=bool(deep_search_result),
+                   deep_search_result_length=len(deep_search_result) if deep_search_result else 0,
+                   note="Checking routing after deep_search node")
+        
+        # CRITICAL: If user already answered clarification, skip clarify and go to analyze_query
+        # This ensures proper sequential workflow without double deep_search
+        if session_status == "researching":
+            logger.warning("⏭️ ROUTING: SKIP CLARIFY - session_status is 'researching' (user answered clarification)",
+                      session_id=session_id,
+                      session_status=session_status,
+                      has_clarification_answers=bool(clarification_answers),
+                      note="Proceeding directly to analyze_query after deep_search (continuation)")
+            return "skip_clarify"
+        
+        if clarification_answers and clarification_answers.strip():
+            logger.warning("⏭️ ROUTING: SKIP CLARIFY - clarification_answers exists (user answered)",
+                      session_id=session_id,
+                      answers_length=len(clarification_answers),
+                      note="Proceeding directly to analyze_query after deep_search (continuation)")
+            return "skip_clarify"
+        
+        # Normal flow: deep_search → clarify
+        logger.info("✅ ROUTING: GO TO CLARIFY - normal flow",
+                   session_id=session_id,
+                   session_status=session_status,
+                   note="Proceeding to clarify after deep_search (new session)")
+        return "clarify"
+    
+    # CRITICAL: Conditional routing after deep_search
+    # If continuation after clarification, skip clarify and go directly to analyze_query
+    workflow.add_conditional_edges(
+        "run_deep_search",
+        should_skip_clarify_after_deep_search,
+        {
+            "skip_clarify": "analyze_query",  # Skip clarify, go directly to analyze
+            "clarify": "clarify",  # Normal flow: go to clarify
+        }
+    )
 
     # CRITICAL: Conditional edge after clarify to handle waiting
     # If clarification_just_sent=True, we need to interrupt and wait for user
     def should_wait_for_clarification(state: ResearchState) -> str:
-        """Check if we should wait for user clarification."""
+        """Check if we should wait for user clarification.
+        
+        CRITICAL: Uses session_status and clarification_answers from session state,
+        NOT chat_history. Session state is the source of truth.
+        """
         clarification_needed = state.get("clarification_needed", False)
         clarification_just_sent = state.get("clarification_just_sent", False)
         session_status = state.get("session_status", "")
+        clarification_answers = state.get("clarification_answers", "")  # Loaded from session in create_initial_state
 
         # CRITICAL: If user answered clarification (session_status changed to "researching"), proceed!
         if session_status == "researching" and not clarification_needed:
-            logger.info("✅ User answered clarification - proceeding to analyze_query", session_status=session_status)
+            logger.info("✅ User answered clarification - proceeding to analyze_query", 
+                       session_status=session_status,
+                       has_clarification_answers=bool(clarification_answers),
+                       note="Using session_status and clarification_answers from session state")
+            return "continue"
+        
+        # CRITICAL: Also check clarification_answers from session state
+        # If answers exist, user has answered, proceed
+        if clarification_answers and clarification_answers.strip() and not clarification_needed:
+            logger.info("✅ User answered clarification (clarification_answers in session state) - proceeding to analyze_query",
+                       session_status=session_status,
+                       answers_length=len(clarification_answers),
+                       note="Using clarification_answers from session state, not chat_history")
             return "continue"
         
         if clarification_needed and clarification_just_sent:
@@ -296,30 +387,103 @@ async def run_research_graph(
     Returns:
         Final state dict
     """
+    logger.info("🚀 RUN_RESEARCH_GRAPH: Starting",
+               session_id=session_id,
+               query_preview=query[:100] if query else None,
+               mode=mode,
+               has_session_manager=bool(session_manager),
+               note="Creating research graph and initial state")
+    
     # Create graph
     graph = create_research_graph()
+    
+    logger.info("✅ RUN_RESEARCH_GRAPH: Graph created",
+               session_id=session_id,
+               note="Research graph compiled successfully")
 
-    # Determine if continuation based on session status (not text markers!)
+    # CRITICAL: Determine if continuation based on ACTUAL session state, not just status
+    # Continuation means: session already has work done (deep_search_result, clarification_answers, etc.)
+    # NOT just status "active" - new sessions also have status "active"!
     is_continuation = False
+    current_session_status = "active"
+    has_deep_search_result = False
+    has_clarification_answers = False
+    
     if session_manager:
         try:
             session = await session_manager.get_session(session_id)
             if session:
-                # Check if session is in a state that indicates continuation
-                is_continuation = session.status in {"waiting_clarification", "researching", "active"}
-                logger.info("Session status check for continuation",
+                current_session_status = session.status
+                has_deep_search_result = bool(session.deep_search_result)
+                has_clarification_answers = bool(session.clarification_answers)
+                
+                # CRITICAL: Continuation is determined by ACTUAL work done, not just status
+                # Continuation if:
+                # 1. deep_search_result exists (deep search was already done)
+                # 2. clarification_answers exists (user already answered)
+                # 3. status is "waiting_clarification" (waiting for user)
+                # 4. status is "researching" (research in progress)
+                # BUT NOT "active" alone - new sessions also have "active" status!
+                
+                if has_deep_search_result:
+                    is_continuation = True
+                    logger.warning("🔄 CONTINUATION DETECTED: deep_search_result exists in DB",
+                                 session_id=session_id,
+                                 status=session.status,
+                                 result_length=len(session.deep_search_result) if session.deep_search_result else 0,
+                                 note="Deep search was already done - this is continuation")
+                elif has_clarification_answers:
+                    is_continuation = True
+                    logger.warning("🔄 CONTINUATION DETECTED: clarification_answers exists in DB",
+                                 session_id=session_id,
+                                 status=session.status,
+                                 note="User already answered clarification - this is continuation")
+                elif session.status == "waiting_clarification":
+                    is_continuation = True
+                    logger.warning("🔄 CONTINUATION DETECTED: session_status is 'waiting_clarification'",
+                                 session_id=session_id,
+                                 note="Waiting for user clarification - this is continuation")
+                elif session.status == "researching":
+                    is_continuation = True
+                    logger.warning("🔄 CONTINUATION DETECTED: session_status is 'researching'",
+                                 session_id=session_id,
+                                 note="Research in progress - this is continuation")
+                else:
+                    # New session - status is "active" but no work done yet
+                    is_continuation = False
+                    logger.info("🆕 NEW SESSION: No work done yet",
+                               session_id=session_id,
+                               status=session.status,
+                               note="This is a new session - deep search will execute")
+                
+                logger.info("Session continuation check",
                            session_id=session_id,
                            status=session.status,
+                           has_deep_search_result=has_deep_search_result,
+                           has_clarification_answers=has_clarification_answers,
                            is_continuation=is_continuation)
         except Exception as e:
-            logger.warning("Failed to check session status", error=str(e))
+            logger.error("Failed to check session status for continuation",
+                        session_id=session_id,
+                        error=str(e),
+                        exc_info=True)
 
     logger.info("Starting research graph execution",
                query=query[:100] if query else None,
                mode=mode,
                query_length=len(query) if query else 0,
-               is_continuation=is_continuation)
+               is_continuation=is_continuation,
+               session_id=session_id)
 
+    # CRITICAL: Validate session_id - it should never be None or empty
+    if not session_id:
+        logger.warning("session_id is None or empty - generating fallback ID", 
+                      session_id=session_id,
+                      mode=mode)
+        from uuid import uuid4
+        session_id = str(uuid4())
+        logger.info("Generated fallback session_id", session_id=session_id)
+    
     # Create initial state (loads original_query from session if session_manager provided)
     initial_state = await create_initial_state(
         query=query,
@@ -349,6 +513,16 @@ async def run_research_graph(
     # CRITICAL: Set runtime dependencies in context variable so nodes can restore them
     # MUST include agent_memory_service and agent_file_service for agents to work!
     from src.workflow.research.nodes import runtime_deps_context
+    
+    # Get research_memory_service from stream.app_state if available
+    research_memory_service = None
+    if stream and hasattr(stream, "app_state"):
+        app_state = stream.app_state
+        if isinstance(app_state, dict):
+            research_memory_service = app_state.get("research_memory_service") or app_state.get("_research_memory_service")
+        else:
+            research_memory_service = getattr(app_state, "research_memory_service", None) or getattr(app_state, "_research_memory_service", None)
+    
     runtime_deps_context.set({
         "stream": stream,
         "llm": llm,
@@ -359,13 +533,21 @@ async def run_research_graph(
         "session_factory": session_factory,
         "agent_memory_service": agent_memory_service,
         "agent_file_service": agent_file_service,
+        "research_memory_service": research_memory_service,
     })
-    logger.info("Runtime dependencies set in context",
-               has_stream=stream is not None,
-               has_llm=llm is not None,
-               has_agent_memory=agent_memory_service is not None,
-               has_agent_file=agent_file_service is not None)
+    logger.warning("🔍 CRITICAL: Runtime dependencies set in context",
+                 has_stream=stream is not None,
+                 has_llm=llm is not None,
+                 has_agent_memory=agent_memory_service is not None,
+                 has_agent_file=agent_file_service is not None,
+                 has_session_manager=bool(session_manager),
+                 session_manager_type=type(session_manager).__name__ if session_manager else "None",
+                 session_id=session_id,
+                 note="CRITICAL: session_manager MUST be set for deep_search to work correctly!")
 
+    # CRITICAL: Create runtime_deps dict with ALL dependencies including session_manager
+    # This will be used to restore context variable later (line 657)
+    # session_manager and session_factory MUST be included here!
     runtime_deps = {
         "stream": stream_obj,
         "llm": llm,
@@ -375,11 +557,41 @@ async def run_research_graph(
         "settings": initial_state.get("settings"),
         "agent_memory_service": agent_memory_service,
         "agent_file_service": agent_file_service,
+        "research_memory_service": research_memory_service,
+        "session_manager": session_manager,  # CRITICAL: Must be included!
+        "session_factory": session_factory,  # CRITICAL: Must be included!
     }
+    
+    logger.warning("🔍 CRITICAL: runtime_deps dict created",
+                 has_session_manager=bool(session_manager),
+                 has_session_factory=bool(session_factory),
+                 runtime_deps_keys=list(runtime_deps.keys()),
+                 session_id=session_id,
+                 note="CRITICAL: session_manager and session_factory MUST be in runtime_deps dict!")
+    
+    # CRITICAL: Update session_status from DB in initial_state (before checkpoint merge)
+    # This ensures we have the latest status even if checkpoint has old status
+    if session_manager and session_id:
+        try:
+            session = await session_manager.get_session(session_id)
+            if session:
+                initial_state["session_status"] = session.status
+                logger.info("Updated session_status in initial_state from DB",
+                           session_id=session_id,
+                           status=session.status)
+        except Exception as e:
+            logger.warning("Failed to update session_status in initial_state", error=str(e))
     
     # CRITICAL: If continuation, try to get checkpoint state and merge it
     # LangGraph automatically resumes from checkpoint, but we need to ensure state is correct
+    # BUT: Only use checkpoint if this is REAL continuation (has work done), not new session
     if is_continuation:
+        logger.warning("🔄 CONTINUATION: Loading checkpoint state",
+                     session_id=session_id,
+                     has_deep_search_result=has_deep_search_result,
+                     has_clarification_answers=has_clarification_answers,
+                     current_session_status=current_session_status,
+                     note="This is continuation - will load checkpoint if available")
         try:
             # Get checkpoint state using graph's checkpointer
             checkpointer = graph.checkpointer if hasattr(graph, 'checkpointer') else None
@@ -394,17 +606,46 @@ async def run_research_graph(
                                    state_keys=list(checkpoint_state.keys()),
                                    deep_search_result_exists="deep_search_result" in checkpoint_state)
                         # Merge checkpoint state into initial_state (checkpoint takes precedence)
-                        # But update chat_history and query with latest
+                        # But update chat_history, query, session_status, and session_id with latest
+                        # CRITICAL: session_id MUST be preserved from current request, not from checkpoint!
+                        # CRITICAL: session_status MUST be preserved from DB, not from checkpoint!
                         for key, value in checkpoint_state.items():
                             if key not in NON_SERIALIZABLE_FIELDS and key not in ["stream", "llm", "search_provider", "scraper", "settings"]:
-                                initial_state[key] = value
-                        # Always update chat_history and query with latest
+                                # CRITICAL: Skip session_id and session_status - they will be set explicitly below
+                                if key not in ["session_id", "session_status"]:
+                                    # CRITICAL: Don't overwrite deep_search_result from DB if it exists in initial_state
+                                    # Checkpoint might not have deep_search_result, but DB does (from previous execution)
+                                    if key == "deep_search_result":
+                                        # Only use checkpoint value if initial_state doesn't have it from DB
+                                        if not initial_state.get("deep_search_result") or not initial_state.get("deep_search_result", "").strip():
+                                            initial_state[key] = value
+                                            logger.info("Using deep_search_result from checkpoint (not in DB initial_state)",
+                                                       checkpoint_has_result=bool(value),
+                                                       initial_state_has_result=bool(initial_state.get("deep_search_result")))
+                                        else:
+                                            logger.info("Preserving deep_search_result from DB initial_state (not overwriting with checkpoint)",
+                                                       db_result_length=len(initial_state.get("deep_search_result", "")),
+                                                       checkpoint_result_length=len(value) if value else 0)
+                                    else:
+                                        initial_state[key] = value
+                        # Always update chat_history, query, session_status, and session_id with latest
                         # CRITICAL: Preserve original query from initial request, not from checkpoint!
+                        # CRITICAL: Preserve session_status from DB, not from checkpoint!
+                        # CRITICAL: Always preserve session_id from current request, not from checkpoint!
                         initial_state["chat_history"] = chat_history
                         initial_state["query"] = query
+                        initial_state["session_id"] = session_id  # CRITICAL: Always use current session_id!
+                        # session_status already updated from DB above, don't overwrite with checkpoint
+                        logger.info("Session ID preserved from current request",
+                                   session_id=session_id,
+                                   session_id_in_checkpoint="session_id" in checkpoint_state,
+                                   checkpoint_session_id=checkpoint_state.get("session_id") if "session_id" in checkpoint_state else None)
                         logger.info("Checkpoint state merged", 
                                    deep_search_result_exists="deep_search_result" in initial_state,
                                    clarification_needed=initial_state.get("clarification_needed", False),
+                                   session_status=initial_state.get("session_status"),
+                                   session_id=initial_state.get("session_id"),
+                                   session_id_in_checkpoint="session_id" in checkpoint_state,
                                    query=query[:100] if query else None,
                                    checkpoint_query=checkpoint_state.get("query", "")[:100] if checkpoint_state.get("query") else None)
         except Exception as e:
@@ -412,50 +653,150 @@ async def run_research_graph(
     
     # Remove non-serializable fields from state before passing to graph
     # They will be restored in nodes via contextvars or passed through config
+    # CRITICAL: session_id MUST be included in filtered_state - it's serializable and needed by nodes!
     filtered_state = {k: v for k, v in initial_state.items() if k not in NON_SERIALIZABLE_FIELDS}
     
-    # Store runtime deps in a context variable or pass through config
-    # Use the same contextvar from nodes.py to ensure consistency
+    # CRITICAL: Ensure session_id is always in filtered_state (it may have been lost during checkpoint merge)
+    if "session_id" not in filtered_state and session_id:
+        filtered_state["session_id"] = session_id
+        logger.warning("session_id was missing from filtered_state - restored it",
+                      session_id=session_id,
+                      filtered_state_keys=list(filtered_state.keys())[:10])
+    
+    # CRITICAL: Store runtime deps in a context variable AND in config
+    # LangGraph may lose contextvars in async execution, so we pass session_manager through config as backup
     from src.workflow.research.nodes import runtime_deps_context
+    
+    # CRITICAL: Verify session_manager is in runtime_deps before setting context
+    if "session_manager" not in runtime_deps:
+        logger.error("❌ CRITICAL: session_manager missing from runtime_deps! Adding it now.",
+                    runtime_deps_keys=list(runtime_deps.keys()),
+                    session_id=session_id,
+                    note="CRITICAL ERROR: This should never happen - session_manager must be in runtime_deps!")
+        runtime_deps["session_manager"] = session_manager
+        runtime_deps["session_factory"] = session_factory
+    
+    logger.warning("🔍 CRITICAL: Setting runtime_deps_context (final check)",
+                 has_session_manager="session_manager" in runtime_deps,
+                 has_session_factory="session_factory" in runtime_deps,
+                 runtime_deps_keys=list(runtime_deps.keys()),
+                 session_id=session_id,
+                 note="CRITICAL: Verifying session_manager is in runtime_deps before setting context!")
+    
     runtime_deps_context.set(runtime_deps)
 
     try:
         # Run graph with filtered state (no non-serializable fields)
+        # CRITICAL: Pass session_manager through config so nodes can access it even if contextvar is lost
         config = {
-            "configurable": {"thread_id": session_id},
+            "configurable": {
+                "thread_id": session_id,
+                "session_manager": session_manager,  # CRITICAL: Pass directly through config
+                "session_factory": session_factory,  # Also pass session_factory for creating new SessionManager if needed
+            },
             "recursion_limit": 100  # Increased from default 25 to handle complex workflows
         }
         
         # CRITICAL: For continuation, only pass updated fields (chat_history, query)
         # LangGraph will automatically load checkpoint and apply our updates
         # This ensures graph continues from where it stopped (after clarify node), not from entry point
+        # BUT: Only if this is REAL continuation (has work done), not new session
         if is_continuation:
+            logger.warning("🔄 CONTINUATION: Using update_state (not full state)",
+                         session_id=session_id,
+                         has_deep_search_result=has_deep_search_result,
+                         has_clarification_answers=has_clarification_answers,
+                         current_session_status=current_session_status,
+                         note="This is continuation - will update checkpoint with new data")
             logger.info("Continuation detected - passing only updated fields to resume from checkpoint",
                        has_deep_search_result="deep_search_result" in filtered_state,
-                       deep_search_result_type=type(filtered_state.get("deep_search_result")).__name__ if "deep_search_result" in filtered_state else "none")
+                       deep_search_result_type=type(filtered_state.get("deep_search_result")).__name__ if "deep_search_result" in filtered_state else "none",
+                       current_session_status=current_session_status)
             # Only update chat_history and query - LangGraph will load the rest from checkpoint
             # BUT: CRITICAL - Preserve deep_search_result if it exists in filtered_state (from checkpoint merge)
             # CRITICAL: Always use the original query from the request, not from checkpoint!
+            # CRITICAL: Update session_status from DB to reflect current state (user may have answered clarification)
+            # CRITICAL: Get original_query from initial_state (loaded from DB session)
+            # query parameter might be clarification answer, but original_query is the actual research topic
+            original_query_from_state = initial_state.get("original_query", query)
             logger.info("Setting query for continuation", 
                        query=query[:100] if query else None,
-                       query_source="original_request")
+                       original_query=original_query_from_state[:100] if original_query_from_state else None,
+                       query_source="original_request",
+                       note="Using original_query from initial_state (DB), not query parameter (might be clarification answer)")
             update_state = {
                 "chat_history": chat_history,
-                "query": query,  # CRITICAL: This is the ORIGINAL query, not clarification answer!
+                "query": query,  # Current query (might be clarification answer for continuation)
+                "original_query": original_query_from_state,  # CRITICAL: Original research topic from DB session
+                "session_status": current_session_status,  # CRITICAL: Update from DB, not checkpoint!
+                "session_id": session_id,  # CRITICAL: Always include session_id so nodes can use it!
             }
-            # CRITICAL: If deep_search_result exists in filtered_state (from checkpoint), preserve it
+            
+            # CRITICAL: If session_status changed to "researching", user answered clarification
+            # Update clarification flags accordingly
+            if current_session_status == "researching":
+                update_state["clarification_needed"] = False
+                update_state["clarification_just_sent"] = False
+                logger.info("✅ Session status is 'researching' - user answered clarification, updating flags",
+                           session_id=session_id)
+            elif current_session_status == "waiting_clarification":
+                # Still waiting for user answer
+                update_state["clarification_needed"] = True
+                update_state["clarification_just_sent"] = True
+                logger.info("⏸️ Session status is 'waiting_clarification' - still waiting for user answer",
+                           session_id=session_id)
+            
+            # CRITICAL: Preserve deep_search_result from initial_state (loaded from DB) OR from filtered_state (checkpoint)
+            # Priority: initial_state (from DB) > filtered_state (checkpoint) > empty
             # This ensures deep search is not re-run when continuing after clarification
-            if "deep_search_result" in filtered_state:
+            if "deep_search_result" in initial_state and initial_state.get("deep_search_result"):
+                # Use deep_search_result from DB (initial_state) - highest priority
+                update_state["deep_search_result"] = initial_state["deep_search_result"]
+                logger.info("CRITICAL: Preserving deep_search_result from DB (initial_state) for continuation",
+                           result_type=type(initial_state["deep_search_result"]).__name__,
+                           is_dict=isinstance(initial_state["deep_search_result"], dict),
+                           result_length=len(str(initial_state["deep_search_result"])) if initial_state.get("deep_search_result") else 0,
+                           note="Using deep_search_result from DB, not checkpoint")
+            elif "deep_search_result" in filtered_state:
+                # Fallback to checkpoint if not in initial_state
                 update_state["deep_search_result"] = filtered_state["deep_search_result"]
                 logger.info("CRITICAL: Preserving deep_search_result from checkpoint for continuation",
                            result_type=type(filtered_state["deep_search_result"]).__name__,
-                           is_dict=isinstance(filtered_state["deep_search_result"], dict))
+                           is_dict=isinstance(filtered_state["deep_search_result"], dict),
+                           note="Using deep_search_result from checkpoint (not in DB initial_state)")
+            else:
+                logger.warning("CRITICAL: deep_search_result not found in initial_state or filtered_state",
+                             has_in_initial="deep_search_result" in initial_state,
+                             has_in_filtered="deep_search_result" in filtered_state,
+                             note="Deep search may execute again - this should not happen!")
+            
+            # CRITICAL: Preserve clarification_answers from initial_state (loaded from DB session)
+            # This is the source of truth for clarification answers, not chat_history
+            if "clarification_answers" in initial_state and initial_state.get("clarification_answers"):
+                update_state["clarification_answers"] = initial_state["clarification_answers"]
+                logger.info("CRITICAL: Preserving clarification_answers from DB (initial_state) for continuation",
+                           answers_length=len(initial_state["clarification_answers"]) if initial_state.get("clarification_answers") else 0,
+                           note="Using clarification_answers from DB session, not chat_history")
+            elif "clarification_answers" in filtered_state:
+                # Fallback to checkpoint if not in initial_state
+                update_state["clarification_answers"] = filtered_state["clarification_answers"]
+                logger.info("CRITICAL: Preserving clarification_answers from checkpoint for continuation",
+                           note="Using clarification_answers from checkpoint (not in DB initial_state)")
+            else:
+                # No clarification_answers - this is normal for new sessions or before clarification
+                logger.debug("No clarification_answers in initial_state or filtered_state",
+                           has_in_initial="clarification_answers" in initial_state,
+                           has_in_filtered="clarification_answers" in filtered_state,
+                           note="This is normal for new sessions or before user answers clarification")
             # Remove non-serializable fields
             update_state = {k: v for k, v in update_state.items() if k not in NON_SERIALIZABLE_FIELDS}
             logger.info("Invoking graph with update state for continuation", 
                        update_keys=list(update_state.keys()),
                        has_checkpoint=True,
-                       has_deep_search_result="deep_search_result" in update_state)
+                       has_deep_search_result="deep_search_result" in update_state,
+                       session_status=update_state.get("session_status"),
+                       session_id=update_state.get("session_id"),
+                       clarification_needed=update_state.get("clarification_needed"))
             final_state = await graph.ainvoke(update_state, config=config)
         else:
             # No checkpoint - start fresh with full state

@@ -247,26 +247,113 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
         content = args.get("content", "")
         # Support both chapter_title and section_title (for backward compatibility)
         chapter_title = args.get("chapter_title") or args.get("section_title", "Chapter")
+        
+        # CRITICAL: Clean chapter_title from any duplicate headers that LLM might have added
+        # Remove patterns like "## Chapter 1: ## Chapter 1: Title" -> "Title"
+        # LLM should NOT include headers in chapter_title, but sometimes does - remove them completely
+        import re
+        if chapter_title:
+            # Remove ALL "## Chapter N:" patterns from title (can be multiple, anywhere in string)
+            # First remove from start (most common case)
+            while True:
+                new_title = re.sub(r'^#+\s*Chapter\s+\d+:\s*', '', chapter_title, flags=re.IGNORECASE)
+                if new_title == chapter_title:
+                    break
+                chapter_title = new_title
+            # Also remove from anywhere in the string (in case LLM puts it in middle/end)
+            chapter_title = re.sub(r'#+\s*Chapter\s+\d+:\s*', '', chapter_title, flags=re.IGNORECASE)
+            # Remove standalone "## Chapter" or "# Chapter" (with or without number)
+            chapter_title = re.sub(r'^#+\s*Chapter\s*:?\s*', '', chapter_title, flags=re.IGNORECASE)
+            chapter_title = re.sub(r'#+\s*Chapter\s*:?\s*', '', chapter_title, flags=re.IGNORECASE)
+            chapter_title = chapter_title.strip()
+        
+        # Validate chapter_title - must not be empty
+        if not chapter_title or chapter_title == "Chapter":
+            # Try to extract title from content if chapter_title is empty
+            if content:
+                # Try to find first meaningful line in content
+                content_lines = content.split('\n')
+                for line in content_lines[:5]:
+                    line = line.strip()
+                    if line and not line.startswith('#') and len(line) > 10:
+                        chapter_title = line[:100]  # Use first meaningful line as title
+                        break
+            
+            # If still empty, use fallback
+            if not chapter_title or chapter_title == "Chapter":
+                chapter_title = f"Research Finding {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                logger.warning("Chapter title was empty, using fallback", fallback_title=chapter_title)
+        
         finding_data_raw = args.get("finding", None)  # Optional: full finding data for chapter summary
         
         # CRITICAL: Ensure finding_data is a dict, not a string
+        # Findings should always be dict after structured output from researcher
+        # If string is passed, try to find corresponding finding from state
         finding_data = None
         if finding_data_raw:
             if isinstance(finding_data_raw, dict):
                 finding_data = finding_data_raw
             elif isinstance(finding_data_raw, str):
-                # Try to parse JSON string if it's a string
-                try:
-                    import json
-                    finding_data = json.loads(finding_data_raw)
-                except (json.JSONDecodeError, TypeError):
-                    logger.warning("finding_data is a string but not valid JSON, treating as None",
-                                 finding_data_preview=finding_data_raw[:100] if finding_data_raw else None)
-                    finding_data = None
+                # String passed - try to find corresponding finding from state by topic/chapter_title
+                # This handles cases where LLM passes topic string instead of full finding dict
+                findings_from_context = context.get("findings", [])
+                if findings_from_context and chapter_title:
+                    # Try to match by chapter_title (normalized)
+                    chapter_title_normalized = chapter_title.strip().lower()
+                    for f in findings_from_context:
+                        if isinstance(f, dict):
+                            # Match by topic (most common case)
+                            topic = f.get("topic", "").strip().lower()
+                            if topic == chapter_title_normalized:
+                                finding_data = f
+                                logger.info("Found finding from state by chapter_title",
+                                           chapter_title=chapter_title,
+                                           finding_topic=f.get("topic", "unknown"),
+                                           note="String finding_data_raw was replaced with full finding dict from state")
+                                break
+                            # Also try matching finding_data_raw string with topic
+                            if finding_data_raw.strip().lower() == topic:
+                                finding_data = f
+                                logger.info("Found finding from state by matching finding_data_raw string with topic",
+                                           finding_data_raw_preview=finding_data_raw[:50],
+                                           finding_topic=f.get("topic", "unknown"),
+                                           note="String finding_data_raw was replaced with full finding dict from state")
+                                break
+                
+                # If still not found, try JSON parse as fallback
+                if not finding_data:
+                    try:
+                        import json
+                        finding_data = json.loads(finding_data_raw)
+                        logger.info("Parsed finding_data from JSON string",
+                                   note="String was valid JSON, parsed to dict")
+                    except (json.JSONDecodeError, TypeError):
+                        logger.warning("finding_data is a string but not valid JSON and not found in state findings",
+                                     finding_data_preview=finding_data_raw[:100] if finding_data_raw else None,
+                                     findings_count=len(findings_from_context) if findings_from_context else 0,
+                                     note="Will use fallback from state.findings if available")
+                        finding_data = None
             else:
                 logger.warning("finding_data has unexpected type, treating as None",
                              finding_data_type=type(finding_data_raw).__name__)
                 finding_data = None
+        
+        # CRITICAL: If finding_data is still None, try to find it from context findings by chapter_title
+        # This ensures we always have finding data if it exists in state
+        if not finding_data and chapter_title:
+            findings_from_context = context.get("findings", [])
+            if findings_from_context:
+                chapter_title_normalized = chapter_title.strip().lower()
+                for f in findings_from_context:
+                    if isinstance(f, dict):
+                        topic = f.get("topic", "").strip().lower()
+                        if topic == chapter_title_normalized:
+                            finding_data = f
+                            logger.info("Found finding from state by chapter_title (fallback)",
+                                       chapter_title=chapter_title,
+                                       finding_topic=f.get("topic", "unknown"),
+                                       note="Finding was not passed in args, but found in context.findings")
+                            break
         
         # CRITICAL: Log context for debugging
         logger.info("write_draft_report called - context available",
@@ -285,7 +372,7 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
         # This will be included in the tool response so supervisor knows what context is available
         context_summary = {
             "query": query,
-            "deep_search_preview": deep_search_result[:500] if deep_search_result else "",
+            "deep_search_preview": deep_search_result if deep_search_result else "",
             "clarification_preview": clarification_context[:300] if clarification_context else "",
             "existing_chapters_count": len(chapter_summaries),
             "existing_chapters_summaries": [
@@ -319,21 +406,33 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
         # NOTE: Regex is used ONLY for numbering, NOT for duplicate detection
         # Duplicate detection is done via chapter_summaries (primary) and draft_report.md (fallback)
         import re
-        chapter_pattern = r'##\s+Chapter\s+(\d+):'
+        # Match "## Chapter N:" pattern (must be at start of line)
+        chapter_pattern = r'^##\s+Chapter\s+(\d+):'
         existing_chapter_numbers = []
-        for match in re.finditer(chapter_pattern, current):
-            chapter_num = int(match.group(1))
-            existing_chapter_numbers.append(chapter_num)
+        for line in current.split('\n'):
+            match = re.match(chapter_pattern, line, re.IGNORECASE)
+            if match:
+                try:
+                    chapter_num = int(match.group(1))
+                    existing_chapter_numbers.append(chapter_num)
+                except (ValueError, IndexError):
+                    pass
         
         # Also check for "# Chapter" format (single #) for numbering
-        single_hash_pattern = r'#\s+Chapter\s+(\d+):'
-        for match in re.finditer(single_hash_pattern, current):
-            chapter_num = int(match.group(1))
-            existing_chapter_numbers.append(chapter_num)
+        single_hash_pattern = r'^#\s+Chapter\s+(\d+):'
+        for line in current.split('\n'):
+            match = re.match(single_hash_pattern, line, re.IGNORECASE)
+            if match:
+                try:
+                    chapter_num = int(match.group(1))
+                    existing_chapter_numbers.append(chapter_num)
+                except (ValueError, IndexError):
+                    pass
         
         # CRITICAL: Check for duplicate chapter titles
-        # Primary check: chapter_summaries (automatically provided to supervisor)
-        # Fallback check: current draft_report.md (in case chapter_summaries are not updated yet)
+        # STRICT LOGIC: Only check chapter_summaries - this is the authoritative source
+        # chapter_summaries is automatically updated when chapters are added, so it's always accurate
+        # No need for fallback checks with regex - that's redundant and error-prone
         chapter_title_normalized = chapter_title.strip().lower()
         
         # Check chapter_summaries first
@@ -346,27 +445,6 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                                      chapter_title=chapter_title,
                                      existing_title=ch.get("chapter_title", "Unknown"),
                                      note="Supervisor has access to existing chapters and should not add duplicates")
-                        return {
-                            "success": False,
-                            "message": f"Chapter '{chapter_title}' already exists in draft report. Check chapter_summaries before adding new chapters.",
-                            "chapter_number": None,
-                        }
-        
-        # Fallback: Check current draft_report.md directly (in case chapter_summaries are not updated)
-        # This is a safety check - chapter_summaries should be the primary source
-        if current:
-            # Simple check: if chapter title appears in draft_report, it's likely a duplicate
-            # Check for "## Chapter N: {chapter_title}" pattern
-            title_in_draft = chapter_title_normalized in current.lower()
-            if title_in_draft:
-                # More precise check: look for chapter header with this title
-                title_pattern_check = re.compile(r'##\s+Chapter\s+\d+:\s+([^\n]+)', re.IGNORECASE)
-                for match in title_pattern_check.finditer(current):
-                    existing_title_in_draft = match.group(1).strip().lower()
-                    if existing_title_in_draft == chapter_title_normalized:
-                        logger.warning("Chapter with this title already exists in draft_report.md - skipping duplicate",
-                                     chapter_title=chapter_title,
-                                     note="Fallback check: found duplicate in draft_report.md even though not in chapter_summaries")
                         return {
                             "success": False,
                             "message": f"Chapter '{chapter_title}' already exists in draft report. Check chapter_summaries before adding new chapters.",
@@ -498,6 +576,41 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                          finding_data_has_sources=bool(finding_data and isinstance(finding_data, dict) and finding_data.get("sources")),
                          note="Sources will NOT be added to this chapter")
         
+        # CRITICAL: Clean content from any chapter headers that LLM might have added
+        # LLM should NOT add headers, but sometimes does - remove them to prevent duplication
+        # Remove any "## Chapter" or "# Chapter" lines from content
+        content_lines = content.split('\n')
+        cleaned_content_lines = []
+        for line in content_lines:
+            # Skip lines that look like chapter headers with number: "## Chapter 1:", "# Chapter 1:", etc.
+            # Also match patterns like "## Chapter 1: ## Chapter 1:" (duplicate headers)
+            if re.match(r'^#+\s*Chapter\s+\d+:', line, re.IGNORECASE):
+                logger.warning("Removed duplicate chapter header from content",
+                             line=line[:100],
+                             chapter_title=chapter_title,
+                             note="LLM added header but it's added automatically - removed to prevent duplication")
+                continue
+            # Skip lines that are just "## Chapter" or "# Chapter" without number
+            if re.match(r'^#+\s*Chapter\s*:?\s*$', line, re.IGNORECASE):
+                logger.warning("Removed duplicate chapter header from content",
+                             line=line[:100],
+                             chapter_title=chapter_title,
+                             note="LLM added header but it's added automatically - removed to prevent duplication")
+                continue
+            # Skip lines that are "## Chapter: Title" or "# Chapter: Title" (without number but with title)
+            if re.match(r'^#+\s*Chapter\s*:\s+', line, re.IGNORECASE):
+                logger.warning("Removed duplicate chapter header from content (without number)",
+                             line=line[:100],
+                             chapter_title=chapter_title,
+                             note="LLM added header but it's added automatically - removed to prevent duplication")
+                continue
+            # Also remove lines that are empty or just separators after chapter headers
+            if line.strip() == "" and len(cleaned_content_lines) > 0 and cleaned_content_lines[-1].strip() == "":
+                # Skip multiple empty lines
+                continue
+            cleaned_content_lines.append(line)
+        cleaned_content = '\n'.join(cleaned_content_lines).strip()
+        
         # Format chapter with clean structure - no metadata, just title, content, and sources
         # CRITICAL: Use ONLY "## Chapter N: Title" format (two #, not one #)
         # This is the ONLY allowed format - no variations!
@@ -508,7 +621,7 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
 
 ## Chapter {chapter_number}: {chapter_title}
 
-{content}{sources_section}
+{cleaned_content}{sources_section}
 
 """
         
@@ -524,7 +637,10 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                 
                 # Get current session metadata
                 session_data = await session_manager.get_session(session_id)
-                current_metadata = session_data.get("session_metadata", {}) if session_data else {}
+                # CRITICAL: session_data is ResearchSessionModel object, not dict - use getattr
+                current_metadata = getattr(session_data, "session_metadata", None) if session_data else {}
+                if not isinstance(current_metadata, dict):
+                    current_metadata = {}
                 
                 # Initialize chapter_summaries if not exists
                 if "chapter_summaries" not in current_metadata:
@@ -1063,10 +1179,8 @@ async def review_agent_progress_handler(args: Dict[str, Any], context: Dict[str,
         agent_file = await agent_file_service.read_agent_file(agent_id)
         todos = agent_file.get("todos", [])
         
-        # Get agent's notes from personal file - LIMIT to prevent context bloat
-        # Only include last 10 most recent important notes
+        # Get agent's notes count (but don't include content to prevent context bloat)
         all_notes = agent_file.get("notes", [])
-        recent_notes = all_notes[-10:] if len(all_notes) > 10 else all_notes
         
         # Get items count (but don't include full content)
         items = await agent_memory_service.list_items() if agent_memory_service else []
@@ -1087,7 +1201,6 @@ async def review_agent_progress_handler(args: Dict[str, Any], context: Dict[str,
             "in_progress": in_progress_todos,
             "progress_percent": (completed_todos / total_todos * 100) if total_todos > 0 else 0,
             "notes_count": len(all_notes),
-            "recent_notes": recent_notes,  # Only recent important notes
             "items_count": agent_items_count,  # Total items in items/ directory
             "current_todos": [
                 {
@@ -1198,8 +1311,16 @@ class SupervisorToolsRegistry:
                           "**CRITICAL FORMAT REQUIREMENT**: Chapter format is STRICTLY '## Chapter N: Title' (two #, space, Chapter, space, number, colon, space, title). "
                           "**FORBIDDEN**: Do NOT use '# Chapter' (single #) or any other format - ONLY '## Chapter N: Title'. "
                           "**FORBIDDEN**: Do NOT add multiple titles for the same chapter - use ONLY '## Chapter N: Title' format, no additional '# Chapter' or '## Title' lines. "
+                          "**CRITICAL - DO NOT ADD CHAPTER HEADERS IN chapter_title PARAMETER**: The chapter header '## Chapter N: Title' is added AUTOMATICALLY by the tool. Your 'chapter_title' parameter should contain ONLY the title text (e.g., 'Historical Analysis of Topic X'), NOT the header format (NOT '## Chapter 2: Historical Analysis of Topic X'). The tool will automatically format it as '## Chapter N: [your_title]'. "
+                          "**CRITICAL - DO NOT ADD CHAPTER HEADERS IN CONTENT**: The chapter header '## Chapter N: Title' is added AUTOMATICALLY by the tool. Your 'content' parameter should contain ONLY the chapter body text, NOT the chapter header. If you include '## Chapter' or '# Chapter' in your content, it will be removed automatically, but this wastes tokens. Start your content directly with the chapter body text. "
                           "**MANDATORY**: You have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE calling this tool to ensure the chapter title doesn't already exist. If it exists, do NOT add it again - the tool will return an error if you try to add a duplicate. "
-                          "**CRITICAL MARKDOWN FORMAT**: Use proper markdown formatting: '##' for chapter titles (already added automatically), '###' for subsections, '**bold**' for emphasis, '*italic*' for emphasis, '-' for lists, '[text](url)' for links. "
+                          "**MANDATORY WORKFLOW**: After EACH agent task completion, you MUST call this tool to add the finding as a chapter. "
+                          "Draft report is structured by chapters - each chapter = one finding from one agent task. "
+                          "When you receive a finding from an agent (in the findings list), you MUST add it as a new chapter - NO EXCEPTIONS. "
+                          "**CONTENT REQUIREMENTS**: Write comprehensive, detailed content (1000-2500 words) based on the finding. "
+                          "Chapters must be FULL and DETAILED. Include ALL details, facts, data, and evidence from the finding. "
+                          "**MARKDOWN FORMAT**: Use proper markdown formatting: '##' for chapter titles (already added automatically - DO NOT include in content), "
+                          "'###' for subsections, '**bold**' for emphasis, '*italic*' for emphasis, '-' for lists, '[text](url)' for links. "
                           "**CRITICAL SOURCES RULE**: Sources are added AUTOMATICALLY at the end of each chapter with clickable links in format '- [Title](URL)'. "
                           "**FORBIDDEN**: Do NOT write sources, references, links, or '## Sources' sections in your content - they are automatically added from finding data. "
                           "**FORBIDDEN**: Do NOT include any source lists, reference sections, citation lists, or links in the chapter content. "
@@ -1211,7 +1332,8 @@ class SupervisorToolsRegistry:
                           "3) Clarification answers (user's additional requirements), "
                           "4) Summaries of existing chapters (to avoid repetition). "
                           "Use this context to adapt the finding content, avoiding repetition while ensuring NO information is lost. "
-                          "Write the chapter as an adapted version of the finding that fits the overall research context.",
+                          "Write the chapter as an adapted version of the finding that fits the overall research context. "
+                          "**CHAPTER TITLE**: Use chapter_title based on the finding topic. Pass the full finding data in the 'finding' parameter for chapter summary storage.",
             "args_schema": {
                 "type": "object",
                 "properties": {
@@ -1221,7 +1343,7 @@ class SupervisorToolsRegistry:
                     },
                     "chapter_title": {
                         "type": "string",
-                        "description": "Title for this chapter based on the finding topic (e.g., 'Historical Analysis of Topic X', 'Technical Specifications of Y'). REQUIRED. **CRITICAL**: You have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE calling this tool to ensure this chapter title doesn't already exist. If it exists, do NOT add it again - the tool will return an error if you try to add a duplicate."
+                        "description": "Title for this chapter based on the finding topic (e.g., 'Historical Analysis of Topic X', 'Technical Specifications of Y'). REQUIRED. **CRITICAL - DO NOT INCLUDE CHAPTER HEADER IN TITLE**: The chapter header '## Chapter N: Title' is added AUTOMATICALLY by the tool. Your 'chapter_title' parameter should contain ONLY the title text, NOT the header. Do NOT include '## Chapter', '# Chapter', or '## Chapter N:' in the chapter_title - just the title text itself (e.g., 'Historical Analysis of Topic X', NOT '## Chapter 2: Historical Analysis of Topic X'). **CRITICAL**: You have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE calling this tool to ensure this chapter title doesn't already exist. If it exists, do NOT add it again - the tool will return an error if you try to add a duplicate."
                     },
                     "section_title": {
                         "type": "string",
@@ -1324,14 +1446,27 @@ class SupervisorToolsRegistry:
         "create_agent_todo": {
             "name": "create_agent_todo",
             "description": "Create a new todo task for a specific research agent. "
-                          "Use this to assign new research tasks or follow-up investigations. "
-                          "CRITICAL: Researcher agents DO NOT have access to the original user query or chat history - "
-                          "they ONLY see the task you assign. You MUST provide COMPREHENSIVE, EXHAUSTIVE task descriptions "
-                          "that include full context, specific details, and background information. "
-                          "Ensure each agent gets DIFFERENT tasks covering different aspects "
-                          "(history, technical, expert views, applications, trends, comparisons, impact, challenges) "
-                          "to build a complete picture. Avoid duplicate/overlapping tasks between agents. "
-                          "ACTIVELY create multiple follow-up tasks to promote deep research and verification.",
+                          "**CRITICAL CONTEXT RULE**: Researcher agents DO NOT have access to the original user query or chat history - "
+                          "they ONLY see the task you assign. You MUST provide COMPREHENSIVE, EXHAUSTIVE task descriptions. "
+                          "**MANDATORY**: Every task MUST include the original user query in the objective or guidance so the agent understands what they're researching. "
+                          "**DIVERSIFICATION STRATEGY**: Ensure each agent gets DIFFERENT tasks covering different aspects "
+                          "(history, technical, expert views, applications, trends, comparisons, impact, challenges) to build a complete picture. "
+                          "Avoid duplicate/overlapping tasks between agents. "
+                          "**TASK DISTRIBUTION**: Check each agent's current workload BEFORE creating new todos. "
+                          "Prioritize assigning to agents with FEWER tasks. Aim for balanced distribution: each agent should have 2-4 active tasks maximum. "
+                          "**AGENT LIMIT**: You have exactly {max_agents} agents (agent_1, agent_2, agent_3). DO NOT create tasks for agent_4, agent_5, etc.! "
+                          "**DEEP RESEARCH**: ACTIVELY create multiple follow-up tasks to promote deep research and verification. "
+                          "If an agent only provides basic/general information, create MULTIPLE todos forcing them to dig into SPECIFIC details from different angles. "
+                          "**CLARIFICATION CONTEXT**: If clarification was provided, interpret it IN THE CONTEXT of the original query - it does NOT replace the original query! "
+                          "Clarification specifies WHAT ASPECT of the original topic to focus on, not a new topic. "
+                          "**EXAMPLES**: "
+                          "1) User query: 'расскажи про историю советской палубной авиации' → Good task: 'Research the history of Soviet carrier aviation. The user asked about [query]. Investigate development, aircraft, key milestones.' "
+                          "2) User query: 'обучение моделей qwen', Clarification: 'технические тонкости' → Good task: 'Research Qwen training. The user asked about [query] and wants technical details. Focus on Qwen-specific training: algorithms, hyperparameters, infrastructure.' "
+                          "3) User query: 'оформление работников в РФ', Clarification: 'все режимы' → Good task: 'Research employee registration types in Russia. The user asked about [query] and wants all regimes/types. Investigate contracts, part-time, remote work, etc.' "
+                          "**BAD EXAMPLES** (avoid these): "
+                          "- 'Research history of technology' (ignores original query) "
+                          "- 'Research technical details for all models' (ignores Qwen-specific focus) "
+                          "- 'Research types of political regimes' (misinterprets 'режимы' out of context)",
             "args_schema": {
                 "type": "object",
                 "properties": {
@@ -1341,7 +1476,15 @@ class SupervisorToolsRegistry:
                     },
                     "reasoning": {
                         "type": "string",
-                        "description": "Why this task is needed"
+                        "description": """**CRITICAL: Before creating this task, document your thinking in reasoning:**
+1. **Original Query**: What is the user asking for? How does this task relate to the original query?
+2. **Deep Search Context**: What did the initial deep search reveal? How does this task address those findings?
+3. **Clarification Questions & Answers**: What clarification was asked? What did the user answer? How does this task incorporate those answers IN THE CONTEXT of the original query?
+4. **Task Necessity**: Why is this specific task needed? What gap does it fill?
+5. **Integration**: How do original query, deep search context, and clarification answers come together for this task?
+6. **Agent Context**: Remember - the agent will NOT see the original query or chat history. This task description must be self-contained and include all necessary context.
+
+Document your complete thinking process in the reasoning field before defining the task."""
                     },
                     "title": {
                         "type": "string",
@@ -1363,7 +1506,7 @@ class SupervisorToolsRegistry:
                     },
                     "guidance": {
                         "type": "string",
-                        "description": "Specific guidance on how to approach this task. MUST include: THE ORIGINAL USER QUERY (quote it exactly: 'The user asked: [query]'), what specific information to find related to that query, how to verify findings in multiple sources, and what aspects to investigate deeply. Make it clear how this task helps answer the user's specific question."
+                        "description": "Specific guidance on how to approach this task. MUST include: THE ORIGINAL USER QUERY (quote it exactly: 'The user asked: [query]'), relevant context from deep search result (if available), clarification answers interpreted IN CONTEXT of original query (if provided), what specific information to find related to that query, how to verify findings in multiple sources, and what aspects to investigate deeply. Make it clear how this task helps answer the user's specific question. The agent has NO access to dialogue context - this guidance must be COMPREHENSIVE and self-contained!"
                     }
                 },
                 # Azure/OpenRouter require all properties to be in required array
@@ -1669,11 +1812,20 @@ async def run_supervisor_agent(
         deep_search_result = str(deep_search_result_raw) if deep_search_result_raw else ""
     
     # Log if deep_search_result is missing (this should not happen in normal flow)
+    # CRITICAL: deep_search_result can be empty string if deep search was skipped (continuation after clarification)
+    # This is normal for continuations - don't warn if it's a continuation
     if not deep_search_result:
-        logger.warning("Supervisor: deep_search_result is empty or missing from state", 
-                      state_keys=list(state.keys()) if isinstance(state, dict) else "not a dict",
-                      has_deep_search_result="deep_search_result" in state,
-                      deep_search_result_type=type(deep_search_result_raw).__name__ if deep_search_result_raw else "none")
+        # Check if this is a continuation (clarification was already sent)
+        is_continuation = state.get("clarification_needed", False) or state.get("session_status") == "waiting_clarification"
+        if not is_continuation:
+            logger.warning("Supervisor: deep_search_result is empty or missing from state", 
+                          state_keys=list(state.keys()) if isinstance(state, dict) else "not a dict",
+                          has_deep_search_result="deep_search_result" in state,
+                          deep_search_result_type=type(deep_search_result_raw).__name__ if deep_search_result_raw else "none",
+                          deep_search_value_preview=str(deep_search_result_raw)[:200] if deep_search_result_raw else "none")
+        else:
+            logger.info("Supervisor: deep_search_result is empty (continuation after clarification - this is normal)",
+                       session_status=state.get("session_status"))
     else:
         logger.info("Supervisor: deep_search_result available", 
                    length=len(deep_search_result),
@@ -1696,7 +1848,8 @@ async def run_supervisor_agent(
         }
     
     if stream:
-        stream.emit_status(f"Supervisor reviewing iteration #{iteration + 1}...", step="supervisor")
+        findings_count = len(findings) if findings else 0
+        stream.emit_status(f"Supervisor reviewing iteration #{iteration + 1}... ({findings_count} findings to process)", step="supervisor")
     
     # Build context for supervisor - LIMIT SIZE to prevent context bloat
     # Only include recent findings and summaries, not full details
@@ -1781,12 +1934,24 @@ async def run_supervisor_agent(
             "full_finding": f  # Full finding for chapter creation
         })
     
-    # Get clarification context if available - extract from chat_history
-    # CRITICAL: Always try to extract clarification questions AND answers - they are essential for proper research direction
+    # CRITICAL: Get clarification context from session state, not chat_history
+    # clarification_answers is loaded from DB session in create_initial_state - this is the source of truth
     clarification_context = state.get("clarification_context", "")
     clarification_questions_text = ""
+    clarification_answers_from_state = state.get("clarification_answers", "")
+    
+    if not clarification_context and clarification_answers_from_state and clarification_answers_from_state.strip():
+        # Use clarification_answers from session state (source of truth)
+        # Note: We don't have clarification questions text in session, but answers are what matter
+        clarification_context = f"\n\n**USER CLARIFICATION ANSWERS:**\n{clarification_answers_from_state}\n\n**CRITICAL INTERPRETATION RULES**:\n- The ORIGINAL USER QUERY above is still the PRIMARY topic to research: \"{query}\"\n- This clarification provides additional context about what aspects/depth the user wants to focus on WITHIN the original query topic\n- **MANDATORY**: Clarification MUST be interpreted IN THE CONTEXT of the original query\n- **CRITICAL**: If clarification mentions words that could have multiple meanings, they ALWAYS refer to those words IN THE CONTEXT of the original query\n- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic\n- Example: If original query is \"оформление работников\" and clarification says \"все режимы\", this means \"режимы оформления работников\", NOT \"режимы\" in general\n- Use this clarification to understand what depth/angle to focus on, but ALWAYS within the context of the original query topic"
+        logger.info("Using clarification_answers from session state for supervisor", 
+                   answer_preview=clarification_answers_from_state[:200],
+                   original_query=query[:100] if query else None,
+                   source="session_state",
+                   note="Clarification answers from session state (source of truth), not chat_history")
+    
+    # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
     if not clarification_context:
-        # Extract clarification questions and user answers from chat_history
         chat_history = state.get("chat_history", [])
         if chat_history:
             for i, msg in enumerate(chat_history):
@@ -1805,7 +1970,7 @@ async def run_supervisor_agent(
                                 questions_end = len(assistant_content)
                             
                             clarification_questions_text = assistant_content[questions_start:questions_end].strip()
-                            logger.info("Extracted clarification questions for supervisor", 
+                            logger.info("Extracted clarification questions for supervisor (fallback)", 
                                       questions_preview=clarification_questions_text[:300],
                                       clarification_index=i)
                     
@@ -1816,17 +1981,20 @@ async def run_supervisor_agent(
                             # Build comprehensive clarification context with both questions and answers
                             questions_section = f"\n\n**CLARIFICATION QUESTIONS ASKED:**\n{clarification_questions_text}\n" if clarification_questions_text else ""
                             clarification_context = f"{questions_section}\n\n**USER CLARIFICATION ANSWERS:**\n{user_answer}\n\n**CRITICAL INTERPRETATION RULES**:\n- The ORIGINAL USER QUERY above is still the PRIMARY topic to research: \"{query}\"\n- This clarification provides additional context about what aspects/depth the user wants to focus on WITHIN the original query topic\n- **MANDATORY**: Clarification MUST be interpreted IN THE CONTEXT of the original query\n- **CRITICAL**: If clarification mentions words that could have multiple meanings, they ALWAYS refer to those words IN THE CONTEXT of the original query\n- **FORBIDDEN**: Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic\n- Example: If original query is \"оформление работников\" and clarification says \"все режимы\", this means \"режимы оформления работников\", NOT \"режимы\" in general\n- Use this clarification to understand what depth/angle to focus on, but ALWAYS within the context of the original query topic"
-                            logger.info("Extracted user clarification questions and answers for supervisor", 
+                            logger.warning("Extracted user clarification questions and answers from chat_history (fallback)", 
                                       questions_preview=clarification_questions_text[:200] if clarification_questions_text else "None",
                                       answer_preview=user_answer[:200],
                                       clarification_index=i,
                                       answer_index=i+1,
                                       original_query=query[:100] if query else None,
-                                      note="Clarification must be interpreted IN CONTEXT of original query")
+                                      source="chat_history_fallback",
+                                      note="This should not happen - clarification_answers should be in session state")
                         break
         if not clarification_context:
             clarification_context = ""
-            logger.info("No clarification context found in chat_history", chat_history_length=len(chat_history) if chat_history else 0)
+            logger.info("No clarification context found in session state or chat_history", 
+                       has_clarification_answers_in_state=bool(clarification_answers_from_state),
+                       chat_history_length=len(chat_history) if chat_history else 0)
     
     # Format chat history to show actual messages from chat
     # For deep_research, use only 2 messages as they can be very long
@@ -1851,16 +2019,58 @@ async def run_supervisor_agent(
     # Prepare clarification context fallback message (avoid backslash in f-string expression)
     clarification_fallback = "\n⚠️ NOTE: No user clarification answers found. Proceed with the original query as-is."
     
-    # CRITICAL: Final log of all context data before creating prompt
-    logger.info("Supervisor final context data", 
+    # CRITICAL: Initialize chapter_summaries BEFORE using it (prevents UnboundLocalError)
+    # Get chapter summaries for context (existing chapters in draft_report)
+    chapter_summaries = []
+    chapter_summaries_text = ""
+    session_id_for_context = state.get("session_id")
+    if session_id_for_context and stream:
+        try:
+            session_factory = stream.app_state.get("session_factory")
+            if session_factory:
+                from src.workflow.research.session.manager import SessionManager
+                session_manager = SessionManager(session_factory)
+                session_data = await session_manager.get_session(session_id_for_context)
+                if session_data:
+                    # CRITICAL: session_data is ResearchSessionModel object, not dict
+                    # Use getattr or direct attribute access
+                    metadata = getattr(session_data, "session_metadata", None) or {}
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                    chapter_summaries = metadata.get("chapter_summaries", []) if isinstance(metadata, dict) else []
+                    if chapter_summaries:
+                        # Format chapter summaries for prompt - NO LIMIT, show ALL chapters
+                        summaries_parts = []
+                        for ch in chapter_summaries:  # ALL chapters, no limit
+                            summaries_parts.append(
+                                f"Chapter {ch.get('chapter_number', '?')}: {ch.get('chapter_title', 'Unknown')} "
+                                f"(Topic: {ch.get('topic', 'Unknown')}, Summary: {ch.get('summary', '')})"
+                            )
+                        chapter_summaries_text = "\n".join(summaries_parts)
+                        logger.info("Retrieved chapter summaries for supervisor prompt",
+                                   chapters_count=len(chapter_summaries))
+        except Exception as e:
+            logger.warning("Failed to get chapter summaries for prompt", error=str(e))
+    
+    # CRITICAL: Final log of all context data before creating prompt (лизонинг)
+    findings_count = len(findings) if findings else 0
+    chapters_count = len(chapter_summaries) if chapter_summaries else 0
+    missing_chapters = findings_count - chapters_count
+    
+    logger.info("🔍 SUPERVISOR: Context data check before creating tasks",
                query=query[:100] if query else None,
+               original_query=query[:100] if query else None,  # query is already original_query from state
                query_length=len(query) if query else 0,
                deep_search_result_length=len(deep_search_result) if deep_search_result else 0,
                deep_search_result_preview=deep_search_result[:200] if deep_search_result else None,
                has_clarification_context=bool(clarification_context),
                clarification_context_length=len(clarification_context) if clarification_context else 0,
                clarification_preview=clarification_context[:200] if clarification_context else None,
-               chat_history_length=len(chat_history) if chat_history else 0)
+               chat_history_length=len(chat_history) if chat_history else 0,
+               findings_count=findings_count,
+               chapters_count=chapters_count,
+               missing_chapters=missing_chapters,
+               note=f"Verifying supervisor has access to: original_query, deep_search_result, clarification questions, and user answers. CRITICAL: {findings_count} findings, {chapters_count} chapters - {missing_chapters} missing chapters must be added!")
     
     # Create supervisor prompt
     # CRITICAL: Include current date and time for supervisor context
@@ -1889,118 +2099,47 @@ Your role:
 Research plan: {research_plan.get('reasoning', '')}
 Iteration: {iteration + 1}
 
+**CRITICAL STATUS CHECK - MANDATORY VERIFICATION:**
+- **Findings received from agents:** {findings_count}
+- **Chapters in draft_report.md:** {chapters_count} (check chapter_summaries for exact count)
+- **Missing chapters:** {missing_chapters}
+- **MANDATORY ACTION**: If missing_chapters > 0, you MUST add ALL missing findings as chapters using write_draft_report BEFORE making final decision!
+- **FORBIDDEN**: Do NOT call make_final_decision with "finish" if missing_chapters > 0!
+- **MANDATORY**: Every finding MUST become a separate chapter - if you have 6 findings, draft_report.md MUST have 6 chapters!
+
+**CRITICAL STATUS CHECK:**
+- **Findings received from agents:** {findings_count}
+- **Chapters in draft_report.md:** {chapters_count}
+- **Missing chapters:** {missing_chapters}
+- **MANDATORY**: If missing_chapters > 0, you MUST add them as chapters before making final decision!
+- **FORBIDDEN**: Do NOT call make_final_decision with "finish" if missing_chapters > 0!
+
 **CRITICAL: SUPERVISOR CALL LIMIT STATUS:**
 {"⚠️ TODO OPERATIONS LIMITED: Supervisor call limit reached (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You CANNOT create or update agent todos (create_agent_todo, update_agent_todo will fail). However, you MUST STILL process findings and write to draft_report (write_draft_report, update_synthesized_report work normally)." if todo_operations_limited else "✅ TODO OPERATIONS AVAILABLE: Supervisor call count (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You can create and update agent todos."}
 
 {"**MANDATORY WHEN TODO LIMIT REACHED**: Even though you cannot create/update todos, you MUST process ALL findings and write them to draft_report. Use write_draft_report for each finding and update_synthesized_report to synthesize them. Findings processing is NEVER limited!" if todo_operations_limited else ""}
 
 **INITIAL DEEP SEARCH CONTEXT (CRITICAL - USE THIS TO GUIDE RESEARCH):**
-{deep_search_result[:2000] if deep_search_result else "⚠️ WARNING: No initial deep search context available. This may indicate an issue with the deep search step."}
+{deep_search_result if deep_search_result else "⚠️ WARNING: No initial deep search context available. This may indicate an issue with the deep search step."}
 {clarification_context if clarification_context else clarification_fallback}
 
-**CRITICAL CONTEXT USAGE - MANDATORY:**
+**CRITICAL CONTEXT - READ TOOL DESCRIPTIONS CAREFULLY:**
 - **THE ORIGINAL USER QUERY IS: "{query}"** - THIS IS THE PRIMARY TOPIC YOU MUST RESEARCH
-- **EVERY task you create MUST be directly related to this specific query and topic**
 - **CRITICAL**: The clarification (if provided above) is ONLY additional context about what aspects/depth the user wants - it does NOT replace the original query!
 - **CRITICAL**: Clarification answers MUST be interpreted IN THE CONTEXT of the original query - they are NOT a new query!
-  * If user asked about "оформление работников" and clarification says "мне надо подробно про вообще все режимы", this means "режимы оформления работников", NOT "режимы" in general (political regimes, technical regimes, etc.)
-  * If user asked about "обучение моделей qwen" and clarification says "технические тонкости", this means "технические тонкости обучения моделей qwen", NOT "технические тонкости" in general
-  * ALWAYS combine clarification with original query: clarification specifies WHAT ASPECT of the original topic to focus on
-- **MANDATORY**: When creating agent todos, you MUST:
-  1. Research the SPECIFIC TOPIC from the original query: "{query}"
-  2. Include the original user query in the task objective or guidance: "The user asked: '{query}'. Research [specific aspect of THIS topic]..."
-  3. If clarification was provided, interpret it IN CONTEXT: "The user asked: '{query}' and wants [clarification interpreted in context of query]. Research [specific aspect]..."
-  4. Explain how this task helps answer the user's query about THIS SPECIFIC TOPIC
-  5. Reference the specific topic from the user's query in the task description
-  6. NEVER create tasks about topics that are NOT in the original query, even if clarification mentions them!
 - **MANDATORY**: Use the initial deep search context when creating agent todos and evaluating findings
-- **FORBIDDEN**: Do NOT create generic tasks unrelated to the user's query (e.g., "History of technology" when user asked about "Soviet carrier aviation")
-- **FORBIDDEN**: Do NOT ignore the original query and create tasks based only on clarification - clarification is ADDITIONAL context, not a replacement!
-- **FORBIDDEN**: Do NOT interpret clarification answers as a new query - they are ALWAYS clarifications about the original query topic!
-- **EXAMPLE 1**: User query: "расскажи про историю советской палубной авиации"
-  - Good task: "Research the history of Soviet carrier aviation. The user asked about 'история советской палубной авиации'. Investigate the development of Soviet aircraft carriers, their aircraft, and key historical milestones."
-  - Bad task: "Research history of technology" (too generic, not related to user query)
-- **EXAMPLE 2**: User query: "расскажи про обучение моделей серии qwen", Clarification: "мне надо про технические тонкости глубокие обучения вообще всех моделей подробно"
-  - Good task: "Research the training process of Qwen model series. The user asked about 'обучение моделей серии qwen' and wants deep technical details. Focus on technical details of Qwen training: optimization algorithms, loss functions, hyperparameters, training infrastructure, and technical nuances specific to Qwen models."
-  - Bad task: "Research technical details of deep learning for all models" (ignores original query about Qwen, focuses only on clarification)
-- **EXAMPLE 3**: User query: "расскажи про все возможные виды оформления работников в РФ и их тонкости", Clarification: "мне надо подробно про вообще все режимы"
-  - Good task: "Research all types of employee registration/employment arrangements in Russia. The user asked about 'виды оформления работников в РФ' and wants detailed information about all regimes/types. Investigate: permanent employment contracts, fixed-term contracts, part-time work, remote work, agency work, and all other employment arrangement types with their legal, tax, and practical nuances."
-  - Bad task: "Research types of political regimes, technical regimes, social regimes" (completely ignores original query about employee registration, interprets 'режимы' as general regimes)
-- If research is going off-topic, redirect agents back to the original query using the deep search context as reference
+- **READ TOOL DESCRIPTIONS**: All detailed instructions for creating tasks, diversifying research, distributing workload, and deep research requirements are in the create_agent_todo tool description
+- **READ TOOL DESCRIPTIONS**: All detailed instructions for writing chapters, formatting, and source handling are in the write_draft_report tool description
 
-CRITICAL STRATEGY: Diversify agent tasks to build complete picture!
-- Each agent should research DIFFERENT aspects/aspects of the topic
-- Examples of diverse research angles:
-  * Agent 1: Historical development and evolution
-  * Agent 2: Technical specifications and technical details
-  * Agent 3: Expert opinions, analysis, and critical perspectives
-  * Agent 4: Real-world applications, case studies, and practical examples
-  * Agent 5: Industry trends, current state, and future prospects
-  * Agent 6: Comparative analysis with alternatives/competitors
-  * Agent 7: Economic, social, or cultural impact
-  * Agent 8: Challenges, limitations, and controversies
-- When creating todos, ensure agents cover DIFFERENT angles - avoid overlap!
-- From diverse agent findings, you will assemble a COMPLETE, comprehensive picture
-- If multiple agents research the same aspect, redirect them to different angles
-
-**CRITICAL: RESEARCHER AGENTS HAVE NO DIALOGUE CONTEXT!**
-- **MANDATORY**: Researcher agents DO NOT have access to the original user query or chat history
-- They ONLY see the task you assign them (title, objective, expected_output, guidance)
-- **YOU MUST provide COMPREHENSIVE, EXHAUSTIVE task descriptions** that include:
-  * Full context about what the user asked for
-  * Specific details about what aspect to research
-  * What kind of information is needed (technical specs, expert opinions, case studies, etc.)
-  * Why this research is important for answering the user's query
-  * Any relevant background information they need to understand the task
-- When creating todos, write DETAILED objectives and guidance that make the task completely self-contained
-- Include the original user query context in the task description so agents understand what they're researching
-- Example of GOOD task: "Research technical specifications of [topic] mentioned in user query '[original query]'. Find detailed technical parameters, performance characteristics, and expert analysis. The user wants comprehensive information about this aspect."
-- Example of BAD task: "Research [topic]" (too vague, no context)
-
-CRITICAL: Your agents must go DEEP, not just surface-level!
-- **ACTIVELY PROMOTE DEEP DIVE RESEARCH** - constantly create additional tasks for agents to dig deeper into different aspects
-- If an agent only provides basic/general information, create MULTIPLE todos forcing them to dig into SPECIFIC details from different angles
-- **PROACTIVELY assign follow-up tasks** to explore deeper questions, verify findings, and investigate related aspects
-- **CRITICAL: DISTRIBUTE TASKS EVENLY** - When assigning new tasks, ensure ALL agents get similar workload:
-  * If one agent has many todos and others have few, prioritize assigning to agents with FEWER tasks
-  * Check cada agent's current workload BEFORE creating new todos
-  * Aim for balanced distribution: each agent should have 2-4 active tasks maximum
-  * Example: If agent_1 has 5 tasks and agent_2 has 1 task, assign new tasks to agent_2 first
-  * This ensures parallel execution and faster completion
-- **CRITICAL: DO NOT CREATE NEW AGENTS** - You have exactly {max_agents} agents (agent_1, agent_2, agent_3). DO NOT create agent_4, agent_5, etc.!
-  * If you need to assign more tasks, use existing agents (agent_1, agent_2, agent_3)
-  * Use update_agent_todo to refine existing tasks instead of creating new ones
-  * Only use create_agent_todo for existing agents (agent_1, agent_2, agent_3) - never for agent_4+
-- Examples of deep research: technical specifications, expert analysis, case studies, historical context, advanced features, industry trends, comparative analysis, critical perspectives
-- Examples of shallow research: basic definitions, general overviews, simple facts
-- When creating todos, explicitly instruct agents to find: technical details, expert opinions, real-world examples, advanced features, specific data, multiple sources for verification
-- **STRATEGY**: Break down complex topics into multiple deep-dive tasks - assign different aspects to different agents or create sequential tasks for the same agent
-- **MANDATORY**: After agents complete initial tasks, review their findings and create ADDITIONAL tasks to:
-  * Verify important claims in multiple independent sources
-  * Investigate related aspects that emerged from initial research
-  * Dig deeper into specific technical details or expert perspectives
-  * Explore alternative viewpoints or controversial aspects
-  * Find real-world case studies and practical applications
-
-Available tools:
+Available tools (read their descriptions for complete guidance):
 - read_supervisor_file: Read YOUR personal file (agents/supervisor.md) with your notes and observations
 - write_supervisor_note: Write note to YOUR personal file - use this for your thoughts, observations, and notes
 - read_main_document: Read current main research document (key insights only, not all items) - SHARED with all agents
-- write_main_document: Add KEY INSIGHTS ONLY to main document (not all items - items stay in items/ directory) - ONLY essential shared info
-  **You can update the Research Plan section** by using section_title="Research Plan" - this will replace the existing Research Plan section with your updated version
+- write_main_document: Add KEY INSIGHTS ONLY to main document (not all items - items stay in items/ directory) - ONLY essential shared info. You can update the Research Plan section by using section_title="Research Plan"
 - read_draft_report: Read draft_report.md to see current draft report with chapters (each chapter = one finding from one agent task)
-- write_draft_report: **PRIMARY TOOL** - Add a new CHAPTER to draft_report.md based on a finding from an agent. 
-  * CRITICAL: Draft report is structured by chapters - each chapter = one finding from one agent task
-  * When you receive a finding from an agent (in the findings list below), you MUST add it as a new chapter
-  * Write comprehensive, detailed content (1000-2500 words) based on the finding - chapters must be FULL and DETAILED
-  * Include ALL details, facts, data, and evidence from the finding
-  * Use chapter_title based on the finding topic
-  * Pass the full finding data in the "finding" parameter for chapter summary storage
+- write_draft_report: **MANDATORY PRIMARY TOOL** - Add a new CHAPTER to draft_report.md based on a finding from an agent. **MANDATORY**: After EACH agent task completion, you MUST call this tool to add the finding as a chapter. Read the tool description for complete formatting and content requirements.
 - review_agent_progress: Check specific agent's progress and todos
-- create_agent_todo: Assign new task to an agent (use this ONLY if agent has fewer than 2-3 tasks)
-  **MANDATORY**: Every task MUST include the original user query "{query}" in the objective or guidance so the agent understands what they're researching!
-  **CRITICAL**: DO NOT create tasks for agent_4, agent_5, etc. - you have exactly {max_agents} agents (agent_1 to agent_{max_agents})!
-  **PREFER**: If agent already has tasks, use update_agent_todo to refine them instead of creating new ones
+- create_agent_todo: Assign new task to an agent. **MANDATORY**: Every task MUST include the original user query "{query}" in the objective or guidance. Read the tool description for complete guidance on context, diversification, distribution, and deep research requirements.
   {"⚠️ **LIMITED**: This tool is DISABLED because supervisor call limit reached (" + str(supervisor_call_count) + "/" + str(max_supervisor_calls) + "). You can only process findings now." if todo_operations_limited else ""}
 - update_agent_todo: Update existing agent todo (OPTIMAL for refining tasks, changing priority, updating guidance, or modifying objectives)
   **PREFER THIS** over create_agent_todo when agents already have tasks - refine existing tasks instead of creating new ones
@@ -2017,10 +2156,18 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
 - **Chapters are added iteratively** as findings arrive from agents
 - **Draft report is a working draft** - it accumulates chapters as research progresses
 
-**Your workflow each iteration:**
+**CRITICAL: MANDATORY WORKFLOW - YOU MUST COMPLETE ALL STEPS IN ONE REVIEW CALL:**
 1. **Review findings** - Check the findings list below to see what agents have completed
+   - Count total findings: {findings_count}
 2. **Read draft_report** - Call read_draft_report to see which findings are already added as chapters
-3. **For each NEW finding** (not yet added to draft_report as a chapter):
+   - Count existing chapters: {chapters_count} (check chapter_summaries)
+   - Calculate missing: {missing_chapters} findings need to become chapters
+3. **CRITICAL: Add ALL missing findings as chapters** - For each NEW finding (not yet in chapter_summaries):
+   - **MANDATORY**: You MUST add EVERY finding as a separate chapter
+   - **MANDATORY**: Count how many findings you have vs how many chapters are in draft_report
+   - **MANDATORY**: If you have 6 findings but only 5 chapters, you MUST add the missing chapter!
+   - **MANDATORY**: Check chapter_summaries to see which findings are already added
+   - **MANDATORY**: For each finding NOT in chapter_summaries, call write_draft_report to add it
    - **Call write_draft_report** to add it as a new chapter
    - Use chapter_title based on the finding topic (e.g., "Technical Analysis of X", "Historical Context of Y")
    - Write comprehensive content (1000-2500 words) based on ALL information from the finding - chapters must be FULL and DETAILED, not brief summaries
@@ -2029,6 +2176,8 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
    - **CRITICAL**: Each finding MUST become a separate chapter - do NOT combine multiple findings into one chapter
    - **CRITICAL FORMAT REQUIREMENT**: Chapter format is STRICTLY "## Chapter N: Title" (two #, space, Chapter, space, number, colon, space, title)
    - **FORBIDDEN**: Do NOT use "# Chapter" (single #) or any other format - ONLY "## Chapter N: Title"
+   - **CRITICAL - DO NOT ADD CHAPTER HEADERS IN chapter_title PARAMETER**: The chapter header "## Chapter N: Title" is added AUTOMATICALLY by write_draft_report tool. Your 'chapter_title' parameter should contain ONLY the title text (e.g., "Historical Analysis of Topic X"), NOT the header format (NOT "## Chapter 2: Historical Analysis of Topic X"). The tool will automatically format it as "## Chapter N: [your_title]".
+   - **CRITICAL - DO NOT ADD CHAPTER HEADERS IN CONTENT**: The chapter header "## Chapter N: Title" is added AUTOMATICALLY by write_draft_report tool. Your content should contain ONLY the chapter body text, NOT the chapter header. Start your content directly with the chapter body text - do NOT include "## Chapter" or "# Chapter" in your content.
    - **FORBIDDEN**: Do NOT add duplicate chapters - you have access to chapter_summaries in your context which automatically show all existing chapters. Check chapter_summaries BEFORE adding a new chapter to ensure it doesn't already exist. If a chapter with the same title already exists, do NOT add it again.
    - **FORBIDDEN**: Do NOT add multiple titles for the same chapter - use ONLY "## Chapter N: Title" format, no additional "# Chapter" or "## Title" lines
    - **CRITICAL MARKDOWN FORMAT REQUIREMENTS**:
@@ -2040,7 +2189,10 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
      * Sources are extracted from the finding and formatted automatically - you should focus only on writing the chapter content itself
 4. **Write YOUR notes** - use write_supervisor_note for personal observations
 5. **CRITICAL: Add ALL findings as chapters** - if you don't add findings as chapters, information will be lost!
-6. **After adding chapters**, review agent progress and create new todos if needed
+   - **MANDATORY CHECK**: Count findings vs chapters - they MUST match!
+   - **MANDATORY**: If you have 6 findings, you MUST have 6 chapters in draft_report!
+   - **MANDATORY**: If chapters < findings, you MUST add missing chapters before making final decision!
+6. **After adding ALL chapters**, review agent progress and create new todos if needed
    - **CRITICAL**: If you see gaps in research coverage or aspects of the query that aren't being researched, you MUST add new tasks!
    - **Check**: Does the current research fully cover the user's query "{query}"? If not, add tasks to fill gaps!
    - **Check**: Are there important aspects, subtopics, or angles that agents haven't covered yet? Add tasks for them!
@@ -2088,16 +2240,29 @@ CRITICAL WORKFLOW - CHAPTER-BASED DRAFT SYSTEM:
    - If you're ready to finish: call make_final_decision (this is the ONLY way to finish!)
    - **CRITICAL**: Before calling make_final_decision with "finish", ensure you've synthesized all RAW findings using update_synthesized_report!
 8. **Make final decision** - CRITICAL: You MUST call make_final_decision tool on EVERY review cycle!
-   - This is MANDATORY - you cannot skip this tool!
-   - **BEFORE deciding "finish"**: Check draft_report.md - have you synthesized ALL RAW FINDINGS?
-   - Read draft_report to see if RAW FINDINGS sections are still marked "Awaiting supervisor synthesis"
-   - If ANY RAW FINDINGS are unprocessed, synthesize them using update_synthesized_report FIRST
-   - "finish" ONLY when: ALL RAW findings synthesized AND SYNTHESIZED REPORT section is comprehensive
-   - "continue" if more research is needed (agents have new todos to complete)
-   - "replan" if research direction needs to change
-   - **YOU MUST CALL THIS TOOL** - it's the only way to finish or continue research!
+   - **THIS IS MANDATORY - YOU CANNOT SKIP THIS TOOL - IT IS THE LAST STEP OF EVERY REVIEW!**
+   - **WORKFLOW FOR EACH REVIEW (MUST COMPLETE ALL STEPS):**
+     1. Read draft_report to see current state
+     2. Review findings list - count how many findings you have
+     3. Check chapter_summaries - count how many chapters exist
+     4. **If missing_chapters > 0**: Add ALL missing findings as chapters using write_draft_report
+     5. **After adding ALL chapters**: Review agent progress and create new tasks if needed
+     6. **MANDATORY FINAL STEP**: Call make_final_decision to signal completion of this review
+   - **BEFORE deciding "finish"**: 
+     * Check draft_report.md - have you added ALL findings as chapters?
+     * Count findings vs chapters - they MUST match!
+     * If missing_chapters > 0, add them FIRST before deciding finish
+   - **Decision logic:**
+     * "finish" ONLY when: ALL findings are chapters AND no pending tasks AND research is comprehensive
+     * "continue" if: missing chapters exist OR agents have pending tasks OR more research needed
+     * "replan" if: research direction needs to change (rare)
+   - **CRITICAL: You MUST complete the ENTIRE review in ONE call:**
+     * Add all missing chapters
+     * Create/update tasks if needed
+     * Call make_final_decision
+     * **DO NOT leave work for next call - complete everything now!**
    - **CRITICAL: If ALL agents have completed their tasks (no pending/in_progress tasks), you MUST:**
-     * Synthesize ALL RAW FINDINGS using update_synthesized_report
+     * Add ALL missing findings as chapters
      * Call make_final_decision with decision="finish" to complete research
      * DO NOT create new tasks if all agents are done - finalize the report!
 9. **When finishing**: The SYNTHESIZED REPORT section becomes the final report - NOT the RAW findings!
@@ -2200,50 +2365,89 @@ Current findings from agents (last 10, summarized):
 - DO NOT create new tasks - all agents are done!
 """
     else:
-        # Get chapter summaries for context (existing chapters in draft_report)
-        chapter_summaries = []
-        chapter_summaries_text = ""
-        session_id_for_context = state.get("session_id")
-        if session_id_for_context and stream:
-            try:
-                session_factory = stream.app_state.get("session_factory")
-                if session_factory:
-                    from src.workflow.research.session.manager import SessionManager
-                    session_manager = SessionManager(session_factory)
-                    session_data = await session_manager.get_session(session_id_for_context)
-                    if session_data:
-                        metadata = session_data.get("session_metadata", {})
-                        chapter_summaries = metadata.get("chapter_summaries", [])
-                        if chapter_summaries:
-                            # Format chapter summaries for prompt
-                            summaries_parts = []
-                            for ch in chapter_summaries[-10:]:  # Last 10 chapters
-                                summaries_parts.append(
-                                    f"Chapter {ch.get('chapter_number', '?')}: {ch.get('chapter_title', 'Unknown')} "
-                                    f"(Topic: {ch.get('topic', 'Unknown')}, Summary: {ch.get('summary', '')[:150]}...)"
-                                )
-                            chapter_summaries_text = "\n".join(summaries_parts)
-                            logger.info("Retrieved chapter summaries for supervisor prompt",
-                                       chapters_count=len(chapter_summaries))
-            except Exception as e:
-                logger.warning("Failed to get chapter summaries for prompt", error=str(e))
+        # chapter_summaries already initialized above, just format text if needed
+        if chapter_summaries and not chapter_summaries_text:
+            # Format chapter summaries for prompt - NO LIMIT, show ALL chapters
+            summaries_parts = []
+            for ch in chapter_summaries:  # ALL chapters, no limit
+                summaries_parts.append(
+                    f"Chapter {ch.get('chapter_number', '?')}: {ch.get('chapter_title', 'Unknown')} "
+                    f"(Topic: {ch.get('topic', 'Unknown')}, Summary: {ch.get('summary', '')})"
+                )
+            chapter_summaries_text = "\n".join(summaries_parts)
+        
+        # CRITICAL: Filter findings_summary to remove findings that are already in chapter_summaries
+        # This prevents duplication - if a finding is already a chapter, don't show it in findings_summary
+        # But keep findings that are NOT yet chapters (they need to be added)
+        # Filter BEFORE building user_message to avoid showing duplicates
+        if findings_summary and chapter_summaries:
+            # Extract topics from chapter_summaries (normalized for comparison)
+            chapter_topics = set()
+            for ch in chapter_summaries:
+                topic = ch.get('topic', '').strip().lower()
+                if topic:
+                    chapter_topics.add(topic)
+            
+            # Split findings_summary back into individual findings
+            # Format: "**agent_id** - topic:\nsummary\nKey findings:..."
+            # Findings are separated by double newline
+            findings_parts = findings_summary.split('\n\n')
+            filtered_findings_parts = []
+            
+            for part in findings_parts:
+                if not part.strip():
+                    continue
+                
+                # Extract topic from finding (format: "**agent_id** - topic:")
+                topic_match = None
+                for line in part.split('\n'):
+                    if '**' in line and ' - ' in line:
+                        # Extract topic from "**agent_id** - topic:"
+                        parts = line.split(' - ')
+                        if len(parts) > 1:
+                            topic_match = parts[1].replace(':', '').strip().lower()
+                            break
+                
+                # Only include if topic is NOT already in chapters
+                if topic_match and topic_match not in chapter_topics:
+                    filtered_findings_parts.append(part)
+                elif not topic_match:
+                    # If we can't extract topic, include it (better safe than sorry)
+                    filtered_findings_parts.append(part)
+            
+            findings_summary = '\n\n'.join(filtered_findings_parts) if filtered_findings_parts else ""
+            logger.info("Filtered findings_summary to remove duplicates with chapters",
+                       original_count=len(findings_parts),
+                       filtered_count=len(filtered_findings_parts),
+                       chapters_count=len(chapter_topics),
+                       note="Only showing findings that are NOT yet added as chapters")
         
         user_message = f"""Review the latest research findings and coordinate next steps.
 
-Current findings from agents (last 10, summarized):
-{findings_summary if findings_summary else "No findings yet - agents are still researching."}
+Current findings from agents (NOT yet added as chapters):
+{findings_summary if findings_summary else "No new findings - all findings are already added as chapters in draft_report."}
 
-**CRITICAL: FINDINGS MUST BE ADDED AS CHAPTERS TO DRAFT REPORT!**
-- Each finding from an agent becomes a NEW CHAPTER in draft_report.md
-- Draft report is structured by chapters - one chapter = one finding
-- You MUST call write_draft_report for each NEW finding to add it as a chapter
-- Read draft_report.md first to see which findings are already added as chapters
-- For each finding NOT yet in draft_report, add it as a new chapter with comprehensive content (1000-2500 words) - chapters must be FULL and DETAILED, not brief summaries
+**CRITICAL: VERIFY EACH FINDING MATCHES THE ASSIGNED TASK!**
+- **MANDATORY**: Before adding any finding as a chapter, verify that it corresponds to the task that agent was assigned
+- **MANDATORY**: Compare the finding topic with the task objective - they MUST match!
+- **FORBIDDEN**: If a finding is about a different topic than the assigned task, DO NOT add it as a chapter
+- **MANDATORY**: If a finding doesn't match the task, call review_agent_progress to check the task, then create a new task to get the correct research
+- **MANDATORY**: Each finding should be the result of working on the assigned task - verify this before accepting
+
+**MANDATORY: YOU MUST ADD EACH FINDING AS A CHAPTER TO DRAFT REPORT!**
+- **CRITICAL**: After EACH agent task completion, you MUST add the finding as a NEW CHAPTER in draft_report.md
+- Each finding from an agent becomes a NEW CHAPTER - this is NOT optional, it's MANDATORY
+- Draft report is structured by chapters - one chapter = one finding from one agent task
+- **YOU CANNOT SKIP THIS STEP** - if an agent completed a task, you MUST add it as a chapter
+- Read draft_report.md first to see which findings are already added as chapters (check chapter_summaries)
+- For each finding NOT yet in draft_report, you MUST add it as a new chapter with comprehensive content (1000-2500 words)
+- Chapters must be FULL and DETAILED, not brief summaries
 - Pass the full finding data in the "finding" parameter when calling write_draft_report
+- **IF YOU SEE FINDINGS IN THE LIST ABOVE, YOU MUST ADD THEM AS CHAPTERS - NO EXCEPTIONS!**
 
 **CONTEXT AVAILABLE WHEN WRITING CHAPTERS** (use this when calling write_draft_report):
 1. **Original user query**: "{query}"
-2. **Deep search result**: {deep_search_result[:300] + "..." if len(deep_search_result) > 300 else deep_search_result if deep_search_result else "Not available"}
+2. **Deep search result**: {deep_search_result if deep_search_result else "Not available"}
 3. **Clarification answers**: {clarification_context[:200] + "..." if len(clarification_context) > 200 else clarification_context if clarification_context else "None"}
 4. **Existing chapters** ({len(chapter_summaries)} chapters already in draft_report):
 {chapter_summaries_text if chapter_summaries_text else "No chapters yet"}
@@ -2310,8 +2514,12 @@ CRITICAL INSTRUCTIONS:
 
 2. **Review agent progress:**
    - Call review_agent_progress to check each agent's status
+   - **CRITICAL: VERIFY FINDING MATCHES TASK** - When reviewing each finding, check that it corresponds to the task that agent was assigned
+   - **MANDATORY**: Compare the finding topic with the task objective - they MUST match!
+   - **FORBIDDEN**: If a finding is about a different topic than the task, reject it and create a new task to get the correct research
    - Evaluate if findings are deep enough AND if they cover different aspects
    - Identify gaps, overlaps, or shallow research
+   - **MANDATORY**: Each finding should be the result of working on the assigned task - verify this before accepting
 
 3. **ACTIVELY add findings as chapters to draft report (CRITICAL):**
    - **After reviewing findings, ALWAYS call write_supervisor_note** to record:
@@ -2328,7 +2536,7 @@ CRITICAL INSTRUCTIONS:
      * **CRITICAL**: Each finding MUST become a separate chapter - do NOT combine multiple findings into one chapter
      * **CONTEXT AVAILABLE WHEN WRITING CHAPTER** (you have access to this when calling write_draft_report):
        - **Original user query**: "{query}" (to understand the research goal)
-       - **Deep search result**: {deep_search_result[:500] if deep_search_result else "Not available"} (initial context from deep search)
+       - **Deep search result**: {deep_search_result if deep_search_result else "Not available"} (initial context from deep search)
        - **Clarification answers**: {clarification_context[:300] if clarification_context else "None"} (user's additional requirements)
        - **Existing chapters summaries**: {len(chapter_summaries)} chapters already in draft_report (to avoid repetition)
      * **CRITICAL INSTRUCTIONS FOR WRITING CHAPTER**:
@@ -2344,7 +2552,8 @@ CRITICAL INSTRUCTIONS:
          * Integrates smoothly with the rest of the draft report
        - The chapter should be comprehensive (500-1500 words) and cover the finding fully
        - DO NOT just copy the finding - adapt it to the research context while keeping all information
-   - **IMPORTANT:** Don't wait until the end - add findings as chapters continuously as agents complete tasks
+   - **MANDATORY:** After EACH agent task completion, you MUST add the finding as a chapter - don't wait until the end
+   - **CRITICAL:** If you see findings in the list above, you MUST add them as chapters immediately - this is not optional
    - **IMPORTANT:** Your supervisor file is YOUR thinking space - use it actively to track your reasoning
 
 4. **Manage agent tasks:**
@@ -2391,6 +2600,10 @@ CRITICAL INSTRUCTIONS:
     
     # Track last usage of critical tools to remind supervisor if not used
     last_draft_write = -1  # Iteration when draft_report was last written
+    
+    # CRITICAL: Track tool_call_id -> tool_name mapping for read tools compression
+    # This allows us to replace old read tool responses with placeholders
+    read_tool_call_ids = {}  # Maps tool_name -> last tool_call_id for read tools
     last_memory_write = -1  # Iteration when supervisor memory was last written
     last_draft_read = -1  # Iteration when draft_report was last read
     last_memory_read = -1  # Iteration when supervisor memory was last read
@@ -2579,20 +2792,31 @@ CRITICAL INSTRUCTIONS:
                                note="write_draft_report can use this to extract sources if finding parameter not provided")
                     
                     # Add chapter summaries to context (for write_draft_report to see existing chapters)
-                    if tool_name == "write_draft_report" and tool_context.get("session_id") and tool_context.get("session_factory"):
-                        try:
-                            from src.workflow.research.session.manager import SessionManager
-                            session_manager = SessionManager(tool_context["session_factory"])
-                            session_data = await session_manager.get_session(tool_context["session_id"])
-                            if session_data:
-                                metadata = session_data.get("session_metadata", {})
-                                chapter_summaries = metadata.get("chapter_summaries", [])
-                                tool_context["chapter_summaries"] = chapter_summaries
-                                logger.info("Added chapter summaries to context for write_draft_report",
-                                           chapters_count=len(chapter_summaries))
-                        except Exception as e:
-                            logger.warning("Failed to get chapter summaries for context", error=str(e))
+                    # CRITICAL: Always initialize chapter_summaries, even if we can't load it from session
+                    # This prevents "cannot access local variable" errors
+                    if tool_name == "write_draft_report":
+                        if tool_context.get("session_id") and tool_context.get("session_factory"):
+                            try:
+                                from src.workflow.research.session.manager import SessionManager
+                                session_manager = SessionManager(tool_context["session_factory"])
+                                session_data = await session_manager.get_session(tool_context["session_id"])
+                                if session_data:
+                                    # CRITICAL: session_data is ResearchSessionModel object, not dict
+                                    # Use getattr or direct attribute access
+                                    metadata = getattr(session_data, "session_metadata", None) or {}
+                                    if not isinstance(metadata, dict):
+                                        metadata = {}
+                                    chapter_summaries = metadata.get("chapter_summaries", []) if isinstance(metadata, dict) else []
+                                    tool_context["chapter_summaries"] = chapter_summaries
+                                    logger.info("Added chapter summaries to context for write_draft_report",
+                                               chapters_count=len(chapter_summaries))
+                            except Exception as e:
+                                logger.warning("Failed to get chapter summaries for context", error=str(e))
+                                tool_context["chapter_summaries"] = []
+                        else:
+                            # No session_id or session_factory - initialize empty list
                             tool_context["chapter_summaries"] = []
+                            logger.debug("No session_id or session_factory for chapter_summaries, using empty list")
                     
                     result = await SupervisorToolsRegistry.execute(
                         tool_name,
@@ -2602,6 +2826,7 @@ CRITICAL INSTRUCTIONS:
                     
                     action_results.append({
                         "tool_call_id": tool_call_id,
+                        "tool_name": tool_name,  # CRITICAL: Store tool_name to identify read tools for history compression
                         "output": json.dumps(result, ensure_ascii=False)
                     })
                     
@@ -2668,10 +2893,12 @@ CRITICAL INSTRUCTIONS:
                 decision_made = True
                 break
             
-            # Force decision if we're near max iterations and no decision made
-            # Check if we've reached supervisor call limit - if so, finish research
+            # CRITICAL: Force decision if we're near max iterations and no decision made
+            # Supervisor MUST call make_final_decision - if it doesn't, force it
             iterations_without_decision = react_iteration + 1
-            if (iterations_without_decision >= max_iterations - 2) and not decision_made:
+            # Force decision earlier (at 80% of max_iterations) to ensure supervisor completes review
+            force_decision_threshold = int(max_iterations * 0.8)  # Force at 80% of max iterations
+            if (iterations_without_decision >= force_decision_threshold) and not decision_made:
                 # CRITICAL: If this is forced finalization, always finish regardless of limit
                 if force_finalization:
                     logger.warning(f"MANDATORY finalization: forcing finish (call {supervisor_call_count + 1}, iterations {iterations_without_decision}/{max_iterations}) - supervisor did not call make_final_decision")
@@ -2778,11 +3005,44 @@ CRITICAL INSTRUCTIONS:
                 "tool_calls": stored_tool_calls  # Store with exact IDs preserved
             })
             
+            # CRITICAL: For read tools (read_draft_report, read_main_document, read_supervisor_file),
+            # only keep the LATEST response in full, replace older ones with placeholders
+            # This prevents context bloat from accumulating large file contents
+            read_tools_to_compress = {"read_draft_report", "read_main_document", "read_supervisor_file"}
+            
             for result in action_results:
+                tool_name = result.get("tool_name", "")
+                tool_call_id = result["tool_call_id"]
+                output = result["output"]
+                
+                # If this is a read tool, replace old responses from the same tool with placeholders
+                if tool_name in read_tools_to_compress:
+                    # Find previous tool_call_id for this read tool (if exists)
+                    previous_tool_call_id = read_tool_call_ids.get(tool_name)
+                    
+                    if previous_tool_call_id:
+                        # Replace old tool response with placeholder
+                        for i, msg in enumerate(agent_history):
+                            if msg.get("role") == "tool" and msg.get("tool_call_id") == previous_tool_call_id:
+                                placeholder = f"[Previous {tool_name} output - see latest call for current content]"
+                                agent_history[i] = {
+                                    "role": "tool",
+                                    "content": json.dumps({"placeholder": placeholder, "note": "Previous output replaced to save context"}),
+                                    "tool_call_id": previous_tool_call_id
+                                }
+                                logger.debug(f"Replaced old {tool_name} response with placeholder",
+                                           old_tool_call_id=previous_tool_call_id,
+                                           new_tool_call_id=tool_call_id)
+                                break
+                    
+                    # Update mapping: this is now the latest tool_call_id for this read tool
+                    read_tool_call_ids[tool_name] = tool_call_id
+                
+                # Add current tool response (always add latest, even if it's a read tool)
                 agent_history.append({
                     "role": "tool",
-                    "content": result["output"],
-                    "tool_call_id": result["tool_call_id"]
+                    "content": output,
+                    "tool_call_id": tool_call_id
                 })
         
         except Exception as e:
@@ -2790,6 +3050,13 @@ CRITICAL INSTRUCTIONS:
             break
     
     if not decision_made:
+        # CRITICAL: Supervisor did NOT call make_final_decision - this is a problem!
+        # Force a decision to prevent hanging
+        logger.warning(f"Supervisor did NOT call make_final_decision after {max_iterations} iterations - forcing decision",
+                      max_iterations=max_iterations,
+                      agent_history_length=len(agent_history),
+                      note="Supervisor should ALWAYS call make_final_decision - this is a bug!")
+        
         # CRITICAL: If this is forced finalization, always finish regardless of limit
         if force_finalization:
             logger.info(f"MANDATORY finalization: forcing finish (no decision made, call {supervisor_call_count + 1})",
@@ -2920,9 +3187,10 @@ Research completed with {len(findings)} findings from multiple agents covering v
     # CRITICAL: Update status after supervisor review completes
     # This ensures frontend doesn't show stale "Supervisor reviewing iteration #1..." status
     if stream:
+        findings_count = len(findings) if findings else 0
         if not final_decision.get("should_continue", False):
             # Supervisor decided to finish
-            stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
+            stream.emit_status(f"✅ Supervisor finalized report ({findings_count} findings processed) - generating final result...", step="supervisor")
         else:
             # Supervisor decided to continue - check if there are pending tasks
             if agent_file_service:

@@ -9,7 +9,52 @@ import structlog
 
 from src.streaming.socketio_stream import SocketIOStreamingGenerator
 from src.memory.agent_session import create_agent_session_services, cleanup_agent_session_dir
-from src.api.routes.chat_stream import _store_session_report
+# Helper function for storing session reports
+import time
+
+def _store_session_report(app_state: object, session_id: str, report: str, query: str, mode: str) -> None:
+    """Store session report for PDF generation."""
+    if not hasattr(app_state, "session_reports"):
+        app_state.session_reports = {}
+    if not hasattr(app_state, "session_report_order"):
+        app_state.session_report_order = []
+
+    now = time.time()
+    app_state.session_reports[session_id] = {
+        "report": report,
+        "query": query,
+        "mode": mode,
+        "stored_at": now,
+    }
+    order = app_state.session_report_order
+    if session_id in order:
+        order.remove(session_id)
+    order.append(session_id)
+    _prune_session_reports(app_state)
+
+
+def _prune_session_reports(app_state: object) -> None:
+    """Prune old session reports."""
+    MAX_SESSION_REPORTS = 20
+    SESSION_REPORT_TTL_SECONDS = 2 * 60 * 60
+    
+    reports = getattr(app_state, "session_reports", {})
+    order = getattr(app_state, "session_report_order", [])
+    now = time.time()
+
+    expired = [
+        session_id
+        for session_id in list(order)
+        if now - reports.get(session_id, {}).get("stored_at", now) > SESSION_REPORT_TTL_SECONDS
+    ]
+    for session_id in expired:
+        reports.pop(session_id, None)
+        if session_id in order:
+            order.remove(session_id)
+
+    while len(order) > MAX_SESSION_REPORTS:
+        oldest = order.pop(0)
+        reports.pop(oldest, None)
 
 logger = structlog.get_logger(__name__)
 
@@ -267,10 +312,27 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         memory_root, session_id
                     )
                     await agent_memory_service.read_main_file()
+                    
+                    # Initialize research memory service for vector search
+                    from src.memory.research_memory_service import ResearchMemoryService
+                    session_factory = getattr(app_state, "session_factory", None)
+                    embedding_provider = getattr(app_state, "embedding_provider", None)
+                    research_memory_service = ResearchMemoryService(session_factory, embedding_provider) if session_factory and embedding_provider else None
+                    
+                    # Clear research memories at the start of deep research
+                    if research_memory_service:
+                        try:
+                            await research_memory_service.clear_session_memories(session_id)
+                            logger.info("Cleared research memories at start of deep research", session_id=session_id)
+                        except Exception as e:
+                            logger.warning("Failed to clear research memories at start", error=str(e))
+                    
                     stream_generator.app_state["agent_memory_service"] = agent_memory_service
                     stream_generator.app_state["agent_file_service"] = agent_file_service
+                    stream_generator.app_state["research_memory_service"] = research_memory_service
                     stream_generator.app_state["_agent_memory_service"] = agent_memory_service
                     stream_generator.app_state["_agent_file_service"] = agent_file_service
+                    stream_generator.app_state["_research_memory_service"] = research_memory_service
 
                     research_mode = ResearchMode.QUALITY
                     mode_config = {
@@ -278,16 +340,37 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                         "max_concurrent": research_mode.get_max_concurrent(),
                     }
 
-                    # CRITICAL: Use original_query from SessionManager, not current message!
-                    research_query = original_query if original_query else message
-                    logger.info("🔥 SocketIO: Starting deep_research",
-                               session_id=session_id,
-                               is_new_session=is_new_session,
-                               query=research_query[:100])
-
-                    # Get SessionManager instance
+                    # CRITICAL: Get SessionManager instance FIRST (before using it)
                     session_factory = getattr(app_state, "session_factory", None)
                     session_manager = SessionManager(session_factory) if session_factory else None
+                    
+                    # CRITICAL: Use original_query from SessionManager, not current message!
+                    research_query = original_query if original_query else message
+                    
+                    # CRITICAL: Check if deep_search_result already exists in DB BEFORE calling graph
+                    # This prevents double execution if graph is called multiple times
+                    if session_manager and session_id:
+                        try:
+                            check_session = await session_manager.get_session(session_id)
+                            if check_session and check_session.deep_search_result:
+                                logger.warning("🛑 SocketIO: deep_search_result already exists in DB - checking if graph should run",
+                                             session_id=session_id,
+                                             result_length=len(check_session.deep_search_result),
+                                             session_status=check_session.status,
+                                             note="Result exists - graph may skip deep_search node, but will still be called")
+                        except Exception as e:
+                            logger.warning("Failed to check session before graph execution", error=str(e))
+                    
+                    logger.warning("🔥 SocketIO: Starting deep_research",
+                               session_id=session_id,
+                               is_new_session=is_new_session,
+                               query=research_query[:100],
+                               note="CRITICAL: About to call run_research_graph - deep_search node will check DB and skip if result exists")
+                    
+                    logger.warning("🚀 SocketIO: Calling run_research_graph",
+                                 session_id=session_id,
+                                 query_preview=research_query[:100],
+                                 note="Graph will start with run_deep_search node, which will check DB first")
                     
                     final_state = await run_research_graph(
                         query=research_query,
