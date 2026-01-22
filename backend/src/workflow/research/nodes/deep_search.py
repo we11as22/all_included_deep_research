@@ -218,16 +218,18 @@ class DeepSearchNode(ResearchNode):
         logger.info("Running initial deep search", query=query[:100])
 
         # Perform web search
-        search_response = await search_provider.search(query, max_results=10)
+        # CRITICAL: Use more results for better coverage (standalone deep_search uses balanced mode with more iterations)
+        search_response = await search_provider.search(query, max_results=15)
 
         # Extract content from top results
+        # CRITICAL: Scrape more pages for comprehensive context (standalone deep_search scrapes more)
         contents = []
-        total_results = min(len(search_response.results), 5)
+        total_results = min(len(search_response.results), 10)
 
         if stream:
             stream.emit_status(f"Analyzing {total_results} sources...", step="deep_search")
 
-        for i, result in enumerate(search_response.results[:5]):
+        for i, result in enumerate(search_response.results[:10]):
             try:
                 url = result.url
                 if url:
@@ -243,19 +245,50 @@ class DeepSearchNode(ResearchNode):
                         )
 
                     scraped = await scraper.scrape(url)
-                    if scraped and scraped.content:
+                    # CRITICAL: Check both content and markdown - prefer markdown if available
+                    # BUT: If markdown has no spaces (likely not real markdown), use plain text
+                    content_to_use = None
+                    if scraped:
+                        # Try markdown first (better structure)
+                        if hasattr(scraped, 'markdown') and scraped.markdown and scraped.markdown.strip():
+                            # CRITICAL: If markdown has no spaces, it's likely not real markdown - use text instead
+                            if ' ' in scraped.markdown:
+                                content_to_use = scraped.markdown
+                            else:
+                                # Markdown has no spaces - likely not real markdown, use text
+                                if hasattr(scraped, 'content') and scraped.content and scraped.content.strip():
+                                    content_to_use = scraped.content
+                                else:
+                                    content_to_use = scraped.markdown  # Fallback to markdown even if no spaces
+                        # Fallback to content
+                        elif hasattr(scraped, 'content') and scraped.content and scraped.content.strip():
+                            content_to_use = scraped.content
+                    
+                    if content_to_use:
                         contents.append(
                             {
                                 "url": url,
-                                "title": scraped.title or result.title,
-                                "content": scraped.content[:2000],
+                                "title": scraped.title if hasattr(scraped, 'title') and scraped.title else (result.title if result.title else "Unknown"),
+                                "content": content_to_use[:5000],  # CRITICAL: Use more content for better synthesis (standalone uses more)
                             }
                         )
+                        # Minimal logging - no huge content dumps
+                        logger.debug(f"Added content to deep search synthesis",
+                                   url=url[:100],  # Truncate URL
+                                   content_length=len(content_to_use))
                         if stream:
                             stream.emit_status(
                                 f"✓ Source {i+1}/{total_results} analyzed",
                                 step="deep_search"
                             )
+                    else:
+                        logger.warning(f"Skipped URL - no content available",
+                                     url=url,
+                                     has_scraped=scraped is not None,
+                                     has_content=hasattr(scraped, 'content') if scraped else False,
+                                     has_markdown=hasattr(scraped, 'markdown') if scraped else False,
+                                     content_length=len(scraped.content) if scraped and hasattr(scraped, 'content') else 0,
+                                     markdown_length=len(scraped.markdown) if scraped and hasattr(scraped, 'markdown') else 0)
             except Exception as e:
                 logger.warning(
                     "Failed to scrape URL", url=result.url, error=str(e)
@@ -267,31 +300,86 @@ class DeepSearchNode(ResearchNode):
                     )
 
         # Synthesize findings using LLM
+        # CRITICAL: Log contents before synthesis to debug empty results (minimal logging)
+        logger.info("Preparing LLM synthesis",
+                   contents_count=len(contents),
+                   total_content_length=sum(len(c.get("content", "")) for c in contents))
+        
         if contents:
-            if stream:
-                stream.emit_status(
-                    f"Synthesizing insights from {len(contents)} sources...",
-                    step="deep_search"
+            # CRITICAL: Verify contents actually have content
+            valid_contents = [c for c in contents if c.get("content") and c.get("content").strip()]
+            if not valid_contents:
+                logger.error("CRITICAL: contents list is not empty but all items have empty content!",
+                           contents_count=len(contents),
+                           note="All contents have empty content - this will cause LLM to return empty result")
+                # Use fallback
+                deep_search_result = (
+                    f"Initial deep search for '{query}' completed. "
+                    f"Found {len(search_response.results)} search results, but content extraction had issues. "
+                    "Proceeding with detailed research approach."
                 )
+            else:
+                if stream:
+                    stream.emit_status(
+                        f"Synthesizing insights from {len(valid_contents)} sources...",
+                        step="deep_search"
+                    )
 
-            # Get user language from state for response
-            user_language = state.get("user_language", "English")
-            logger.info("Starting LLM synthesis",
-                       user_language=user_language,
-                       query=query[:50],
-                       contents_count=len(contents))
+                # Get user language from state for response
+                user_language = state.get("user_language", "English")
+                logger.info("Starting LLM synthesis",
+                           user_language=user_language,
+                           query=query[:50],
+                           valid_contents_count=len(valid_contents),
+                           total_content_length=sum(len(c.get("content", "")) for c in valid_contents))
 
-            synthesis_prompt = self._build_synthesis_prompt(query, contents, user_language)
+                synthesis_prompt = self._build_synthesis_prompt(query, valid_contents, user_language)
 
-            logger.info("Calling LLM for deep search synthesis",
-                       prompt_length=len(synthesis_prompt),
-                       user_language=user_language)
-            synthesis_result = await llm.ainvoke(synthesis_prompt)
+                logger.info("Calling LLM for deep search synthesis",
+                           prompt_length=len(synthesis_prompt),
+                           user_language=user_language,
+                           prompt_preview=synthesis_prompt[:500])
+                synthesis_result = await llm.ainvoke(synthesis_prompt)
 
-            logger.info("LLM synthesis completed",
-                       result_length=len(synthesis_result.content) if synthesis_result.content else 0,
-                       user_language=user_language)
-            deep_search_result = synthesis_result.content
+                # CRITICAL: Extract content properly - handle different response formats
+                synthesis_content = None
+                if hasattr(synthesis_result, 'content'):
+                    synthesis_content = synthesis_result.content
+                elif isinstance(synthesis_result, str):
+                    synthesis_content = synthesis_result
+                elif hasattr(synthesis_result, 'text'):
+                    synthesis_content = synthesis_result.text
+                
+                # CRITICAL: Log raw LLM response for debugging
+                logger.info("LLM synthesis response received",
+                           synthesis_result_type=type(synthesis_result).__name__,
+                           content_length=len(synthesis_content) if synthesis_content else 0,
+                           note="Raw LLM response received")
+                
+                # CRITICAL: If content is None or empty, log detailed error
+                if not synthesis_content or not synthesis_content.strip():
+                    logger.error("CRITICAL: LLM synthesis returned empty result!",
+                               user_language=user_language,
+                               synthesis_result_type=type(synthesis_result).__name__,
+                               synthesis_result_repr=repr(synthesis_result)[:500],
+                               has_content_attr=hasattr(synthesis_result, 'content'),
+                               has_text_attr=hasattr(synthesis_result, 'text'),
+                               content_attr_value=repr(getattr(synthesis_result, 'content', None))[:200] if hasattr(synthesis_result, 'content') else "N/A",
+                               text_attr_value=repr(getattr(synthesis_result, 'text', None))[:200] if hasattr(synthesis_result, 'text') else "N/A",
+                               valid_contents_count=len(valid_contents),
+                               prompt_length=len(synthesis_prompt),
+                               note="LLM returned empty result - this is a CRITICAL ERROR, not normal behavior!")
+                    # Use fallback
+                    deep_search_result = (
+                        f"Initial deep search for '{query}' completed. "
+                        f"Found {len(valid_contents)} sources with relevant information. "
+                        "Proceeding with detailed research approach."
+                    )
+                else:
+                    deep_search_result = synthesis_content
+                    logger.info("LLM synthesis completed successfully",
+                               result_length=len(deep_search_result),
+                               user_language=user_language)
             
             # CRITICAL: Log formatting from LLM response (before any processing)
             import re
@@ -334,14 +422,26 @@ class DeepSearchNode(ResearchNode):
         # This prevents race condition where two calls both execute and both try to save
         session_id = state.get("session_id")
         
+        # CRITICAL: Ensure result is not None or empty before saving
+        # If result is empty, use fallback to ensure we always have something to save
+        if not deep_search_result or not deep_search_result.strip():
+            logger.warning("Deep search result is empty - using fallback before saving",
+                         session_id=session_id,
+                         original_result_length=len(deep_search_result) if deep_search_result else 0,
+                         note="Result was empty - using fallback to ensure DB save succeeds")
+            deep_search_result = (
+                f"Initial deep search for '{query}' completed. "
+                "Proceeding with detailed research approach."
+            )
+        
         # CRITICAL: Log session_manager availability before save attempt
         has_session_manager = hasattr(self, 'deps') and self.deps and hasattr(self.deps, 'session_manager') and self.deps.session_manager is not None
-        logger.error("💾 DEEP_SEARCH: Attempting to save result to DB",
+        logger.info("💾 DEEP_SEARCH: Attempting to save result to DB",
                     session_id=session_id,
                     has_session_manager=has_session_manager,
                     session_manager_type=type(self.deps.session_manager).__name__ if has_session_manager else "None",
                     result_length=len(deep_search_result) if deep_search_result else 0,
-                    note="CRITICAL: If has_session_manager=False, result will NOT be saved and will execute again!")
+                    note="Saving deep search result to DB")
         
         if session_id and has_session_manager:
             try:
@@ -418,7 +518,7 @@ Query: {query}
 Search Results:
 {contents_text}
 
-Provide a comprehensive summary (500-800 words) that:
+Provide a comprehensive, detailed summary (1500-2500 words) that:
 1. Overviews the main topic
 2. Highlights key aspects and subtopics
 3. Identifies important context for further research

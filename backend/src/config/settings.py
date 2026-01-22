@@ -174,8 +174,8 @@ class Settings(BaseSettings):
     quality_max_concurrent: int = Field(default=3, description="Quality mode max concurrent researchers")  # Old value: 4
     
     # Deep Research Limits (centralized configuration)
-    deep_research_max_supervisor_calls: int = Field(default=12, description="Max supervisor calls in deep research")  # Increased from 6 to allow more thorough research coordination
-    deep_research_agent_max_steps: int = Field(default=10, description="Max steps per agent task in deep research")  # Increased for deeper research
+    deep_research_max_supervisor_calls: int = Field(default=5, description="Max supervisor calls in deep research")  # Limited to 5 - after limit, supervisor can only add findings to draft_report, not edit tasks
+    deep_research_agent_max_steps: int = Field(default=5, description="Max steps per agent task in deep research")  # Reduced to 5 for faster task completion
     deep_research_supervisor_max_iterations: int = Field(default=7, description="Max ReAct iterations per ONE supervisor call (not total) - keep low to force frequent agent-supervisor cycles")  # Low value = supervisor works quickly and returns to agents
     deep_research_default_max_iterations: int = Field(default=20, description="Default max iterations for deep research cycles")  # Increased from 15 for more comprehensive research
 

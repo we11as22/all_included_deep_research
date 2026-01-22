@@ -513,6 +513,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(draft_report_content)
                         _store_session_report(app_state, session_id, draft_report_content, message, mode)
+                        # CRITICAL: Change status after final report is sent to indicate completion
+                        stream_generator.emit_status("✅ Report finalized", step="report")
                     elif final_report:
                         # Fallback to generated final_report if draft_report not available
                         logger.info("Using generated final_report (draft_report not available)",
@@ -524,6 +526,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                             await asyncio.sleep(0.02)
                         stream_generator.emit_final_report(final_report)
                         _store_session_report(app_state, session_id, final_report, message, mode)
+                        # CRITICAL: Change status after final report is sent to indicate completion
+                        stream_generator.emit_status("✅ Report finalized", step="report")
                     elif session_status_from_db == "completed":
                         # CRITICAL: If research completed but no final_report, use draft_report as result
                         # Draft report is the structured research result with chapters
@@ -599,6 +603,8 @@ async def handle_chat_send(sid: str, data: Dict[str, Any]) -> Dict[str, Any]:
                                     await asyncio.sleep(0.02)
                                 stream_generator.emit_final_report(fallback_report)
                                 _store_session_report(app_state, session_id, fallback_report, message, mode)
+                                # CRITICAL: Change status after final report is sent to indicate completion
+                                stream_generator.emit_status("✅ Report finalized", step="report")
                             else:
                                 # Research completed but no report available - this is an error
                                 logger.error("Research completed but no final_report and no fallback available",

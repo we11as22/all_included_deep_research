@@ -11,7 +11,7 @@ from src.workflow.research.nodes.base import ResearchNode
 from src.workflow.research.nodes.utils import _restore_runtime_deps
 from src.workflow.research.supervisor_queue import SupervisorQueue
 from src.workflow.research.researcher import run_researcher_agent_enhanced
-from src.workflow.research.supervisor_agent import run_supervisor_agent
+from src.workflow.research.supervisor_chain import run_supervisor_chain
 
 logger = structlog.get_logger(__name__)
 
@@ -64,20 +64,15 @@ class ExecuteAgentsNode(ResearchNode):
         # All collected findings from all agent iterations
         all_findings = []
         
-        # Track supervisor calls (not ReAct iterations, but actual supervisor invocations)
-        supervisor_call_count = state_dict.get("supervisor_call_count", 0)
-        # Get max_supervisor_calls from settings (centralized config)
-        settings = state_dict.get("settings")
-        if settings:
-            max_supervisor_calls = settings.deep_research_max_supervisor_calls
-        else:
-            from src.config.settings import get_settings
-            settings_obj = get_settings()
-            max_supervisor_calls = settings_obj.deep_research_max_supervisor_calls
+        # Лимиты на вызовы сняты - супервизор вызывается без ограничений
+        # Трекинг task_addition_count для лимита на добавление задач (максимум 2 раза)
+        task_addition_count = state_dict.get("task_addition_count", 0)
         
         # Run agents in continuous mode until all todos complete or max iterations
         agents_active = True
         iteration_count = 0
+        
+        # Агенты возвращаются к работе через agents_to_return в следующем цикле
         
         # CRITICAL: Hard limit to prevent infinite loops
         # If max_iterations reached, MUST stop and generate report
@@ -86,8 +81,11 @@ class ExecuteAgentsNode(ResearchNode):
             logger.info(f"Agent execution cycle {iteration_count}")
             
             if stream:
-                stream.emit_status(f"🔄 Agent execution cycle {iteration_count}/{max_iterations} (Supervisor calls: {supervisor_call_count}/{max_supervisor_calls})", step="agents")
-                logger.info(f"Emitting progress: cycle {iteration_count}/{max_iterations}, supervisor calls {supervisor_call_count}/{max_supervisor_calls}")
+                stream.emit_status(f"🔄 Agent execution cycle {iteration_count}/{max_iterations}", step="agents")
+                logger.info(f"Emitting progress: cycle {iteration_count}/{max_iterations}")
+            
+            # Убрана логика немедленного перезапуска агентов
+            # Агенты теперь возвращаются к работе через agents_to_return в следующем цикле
             
             # Launch all agents in parallel for this iteration
             # Get max_steps from settings (centralized config)
@@ -129,6 +127,67 @@ class ExecuteAgentsNode(ResearchNode):
             else:
                 # No file service, use agent_characteristics
                 agents_to_run = list(agent_characteristics.keys())
+            
+            # CRITICAL: Agents wait for THEIR OWN finding to be processed, but work independently otherwise
+            # An agent should NOT run if it has a finding waiting in queue (its own finding)
+            # But agents work independently - they don't wait for other agents' findings
+            
+            # Check which agents have pending/in_progress tasks AND don't have findings in queue
+            agents_to_run_filtered = []
+            agents_waiting_for_review = []
+            agents_with_tasks = []
+            
+            if agent_file_service and supervisor_queue:
+                try:
+                    for agent_id in agents_to_run:
+                        agent_file = await agent_file_service.read_agent_file(agent_id)
+                        todos = agent_file.get("todos", [])
+                        pending = [t for t in todos if t.status == "pending"]
+                        in_progress = [t for t in todos if t.status == "in_progress"]
+                        has_tasks = len(pending) > 0 or len(in_progress) > 0
+                        
+                        if has_tasks:
+                            agents_with_tasks.append(agent_id)
+                            
+                            # CRITICAL: Check if agent has finding in queue (waiting for supervisor review)
+                            has_finding_in_queue = supervisor_queue.has_finding_from_agent(agent_id)
+                            
+                            if has_finding_in_queue:
+                                # Agent is waiting for supervisor to process its finding - don't run it
+                                agents_waiting_for_review.append(agent_id)
+                                logger.info(f"SUPERVISOR: Agent {agent_id} has finding in queue - waiting for supervisor review",
+                                           agent_id=agent_id,
+                                           pending_tasks=len(pending),
+                                           in_progress_tasks=len(in_progress))
+                            else:
+                                # Agent has tasks and no finding in queue - can run
+                                agents_to_run_filtered.append(agent_id)
+                                logger.info(f"SUPERVISOR: Agent {agent_id} can run - has tasks and no finding in queue",
+                                           agent_id=agent_id,
+                                           pending_tasks=len(pending),
+                                           in_progress_tasks=len(in_progress))
+                except Exception as e:
+                    logger.warning("SUPERVISOR: Failed to check agent tasks and queue status", error=str(e))
+                    # Fallback: run all agents with tasks if check fails
+                    agents_to_run_filtered = agents_with_tasks
+            else:
+                # No file service or queue - run all discovered agents (fallback)
+                agents_to_run_filtered = agents_to_run
+            
+            agents_to_run = agents_to_run_filtered
+            
+            # CRITICAL: agents_to_return is ONLY for logging - it doesn't affect which agents run
+            # Agents are selected based on: has_tasks AND no_finding_in_queue
+            # Processing other agents' findings doesn't affect running agents
+            supervisor_decision = state_dict.get("supervisor_decision", {})
+            agents_to_return = supervisor_decision.get("agents_to_return", [])
+            
+            logger.info(f"SUPERVISOR: Agent execution decision for cycle {iteration_count}",
+                       agents_with_tasks=agents_with_tasks,
+                       agents_waiting_for_review=agents_waiting_for_review,
+                       agents_to_run=agents_to_run,
+                       agents_to_return=agents_to_return,
+                       note="Agents with tasks but no finding in queue will run. Agents waiting for review will NOT run. Processing other agents' findings doesn't affect running agents.")
 
             # Emit status with ACTUAL agent count
             if stream:
@@ -245,43 +304,22 @@ class ExecuteAgentsNode(ResearchNode):
                                           completed_agents=f"{completed_count}/{len(agent_tasks)}",
                                           note="Result queued for supervisor, supervisor will review immediately")
                                 
-                                # CRITICAL: Process supervisor review immediately when agent completes
-                                # Don't wait for all agents - supervisor should review EACH agent's work as soon as they complete
+                                # CRITICAL: Process supervisor chain immediately when agent completes
+                                # Don't wait for all agents - supervisor processes EACH agent's finding as soon as they complete
                                 # This ensures supervisor updates draft_report and manages tasks in real-time
-                                # CRITICAL: Supervisor is ALWAYS called for findings processing and draft_report writing
-                                # Limit applies ONLY to TODO operations (create_agent_todo, update_agent_todo), NOT to findings processing
-                                # CRITICAL: Other agents continue working in parallel - supervisor review doesn't block them
+                                # CRITICAL: Other agents continue working in parallel - supervisor processing doesn't block them
                                 
-                                # Track call count for TODO operations limit, but ALWAYS call supervisor for findings
-                                is_todo_operations_available = supervisor_call_count < max_supervisor_calls
-                                
-                                if is_todo_operations_available:
-                                    # Increment counter only for TODO operations tracking
-                                    supervisor_call_count += 1
-                                    state_dict["supervisor_call_count"] = supervisor_call_count
-                                    logger.info(f"Agent {agent_id} completed task - calling supervisor for review (call {supervisor_call_count}/{max_supervisor_calls}, TODO operations available)",
-                                              note="Other agents continue working in parallel during supervisor review")
-                                else:
-                                    # Don't increment counter, but STILL call supervisor for findings processing
-                                    logger.info(f"Agent {agent_id} completed task - calling supervisor for findings processing (TODO limit reached: {supervisor_call_count}/{max_supervisor_calls})",
-                                              note="Supervisor will process findings and write to draft_report, but TODO operations are disabled")
+                                logger.info(
+                                    "SUPERVISOR: Agent completed task, processing finding immediately",
+                                    agent_id=agent_id,
+                                    finding_topic=result.get("topic", "unknown"),
+                                    queue_size_before=supervisor_queue.size() if supervisor_queue else 0
+                                )
                                 
                                 try:
-                                    if settings:
-                                        supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
-                                    else:
-                                        from src.config.settings import get_settings
-                                        settings_obj = get_settings()
-                                        supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
-                                    
                                     if stream:
-                                        if is_todo_operations_available:
-                                            stream.emit_status(f"👔 Supervisor reviewing findings from {agent_id} (call {supervisor_call_count}/{max_supervisor_calls})", step="supervisor")
-                                        else:
-                                            stream.emit_status(f"👔 Supervisor processing findings from {agent_id} (TODO limit reached, writing to draft_report)", step="supervisor")
+                                        stream.emit_status(f"👔 Supervisor processing finding from {agent_id}", step="supervisor")
                                     
-                                    # CRITICAL: Supervisor review happens while other agents continue working
-                                    # This is non-blocking - agents run in parallel via asyncio.create_task
                                     # CRITICAL: Ensure deep_search_result is in state before calling supervisor
                                     deep_search_result_in_state = state_dict.get("deep_search_result", "")
                                     if not deep_search_result_in_state:
@@ -294,9 +332,9 @@ class ExecuteAgentsNode(ResearchNode):
                                                     deep_search_type=type(deep_search_result_in_state).__name__)
                                     
                                     # CRITICAL: Add current finding to state so supervisor can see it
-                                    # Supervisor reads findings from state, not from cycle_findings
                                     if result:
-                                        existing_findings = state_dict.get("findings", state_dict.get("agent_findings", []))
+                                        # Use only "findings" field (not "agent_findings" - avoid duplication)
+                                        existing_findings = state_dict.get("findings", [])
                                         # Check if this finding is already in state (avoid duplicates)
                                         finding_already_in_state = any(
                                             f.get("topic") == result.get("topic") and f.get("agent_id") == result.get("agent_id")
@@ -311,24 +349,48 @@ class ExecuteAgentsNode(ResearchNode):
                                                        total_findings_in_state=len(existing_findings),
                                                        note="Supervisor will now see this finding in state")
                                     
-                                    decision = await run_supervisor_agent(
+                                    # Вызвать supervisor chain вместо ReAct агента
+                                    decision = await run_supervisor_chain(
                                         state=state_dict,
                                         llm=llm,
                                         stream=stream,
-                                        supervisor_queue=supervisor_queue,
-                                        max_iterations=supervisor_max_iterations
+                                        supervisor_queue=supervisor_queue
                                     )
+                                    
+                                    # Обновить task_addition_count из результата
+                                    if "task_management" in decision:
+                                        task_addition_count = decision["task_management"].get("task_addition_count", task_addition_count)
+                                        state_dict["task_addition_count"] = task_addition_count
                                     
                                     state_dict["should_continue"] = decision.get("should_continue", False)
                                     state_dict["replanning_needed"] = decision.get("replanning_needed", False)
                                     
+                                    # CRITICAL: Store supervisor decision with agents_to_return for logging only
+                                    # This does NOT affect running agents - they continue working independently
+                                    # agents_to_return is used only to track which agent's finding was processed
+                                    # Agents are selected for next cycle based on: has_tasks AND no_finding_in_queue
+                                    state_dict["supervisor_decision"] = decision
+                                    
+                                    agents_to_return = decision.get("agents_to_return", [])
+                                    logger.info(
+                                        "SUPERVISOR: Supervisor decision stored (for logging only)",
+                                        finding_agent_id=agent_id,
+                                        agents_to_return=agents_to_return,
+                                        should_continue=decision.get("should_continue", False),
+                                        queue_size_remaining=supervisor_queue.size() if supervisor_queue else 0,
+                                        note="Processing this finding doesn't affect other running agents. agents_to_return is for logging only - agents are selected in next cycle based on has_tasks AND no_finding_in_queue"
+                                    )
+                                    
                                     # CRITICAL: After supervisor review, check if supervisor created new tasks
-                                    # Even if supervisor says stop, we must check for new tasks before stopping
-                                    # Supervisor might have created new tasks before deciding to stop
+                                    # This is ONLY for setting should_continue flag - it does NOT restart agents
+                                    # Running agents continue working independently - they are NOT affected by processing other agents' findings
+                                    # Agents are restarted ONLY at the beginning of next cycle (in while loop)
                                     new_pending_tasks = 0  # Initialize before use
                                     if agent_file_service:
                                         try:
                                             # Check if any agents have new pending tasks after supervisor review
+                                            # NOTE: This doesn't affect running agents - they continue working on their current tasks
+                                            # Only pending tasks (not in_progress) can be changed, and this doesn't break current work
                                             agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
                                             all_agent_ids = []
                                             for file_path in agent_files:
@@ -348,17 +410,19 @@ class ExecuteAgentsNode(ResearchNode):
                                                     new_pending_tasks += len(pending_tasks) + len(in_progress_tasks)
                                             
                                             if new_pending_tasks > 0:
-                                                logger.info(f"After supervisor review: {len(agents_with_new_tasks)} agents have {new_pending_tasks} pending/in_progress tasks",
+                                                logger.info(f"SUPERVISOR: After processing finding from {agent_id}: {len(agents_with_new_tasks)} agents have {new_pending_tasks} pending/in_progress tasks",
+                                                           finding_agent_id=agent_id,
                                                            agents_with_tasks=agents_with_new_tasks,
                                                            total_pending=new_pending_tasks,
-                                                           note="Supervisor created new tasks - agents will continue working in next cycle")
+                                                           note="Processing this finding doesn't affect running agents. New/updated tasks will be picked up in next cycle. Running agents continue working on their current tasks.")
                                                 # CRITICAL: If supervisor created new tasks, we MUST continue
                                                 # Override supervisor's decision to stop if there are new tasks
+                                                # This only sets should_continue flag - agents are NOT restarted here
                                                 state_dict["should_continue"] = True
-                                                logger.info("Overriding supervisor's stop decision because new tasks were created",
-                                                           note="Agents must complete all tasks before finalization")
+                                                logger.info("SUPERVISOR: Overriding supervisor's stop decision because new tasks were created",
+                                                           note="This only sets should_continue flag. Agents are restarted only at beginning of next cycle.")
                                         except Exception as e:
-                                            logger.error("Error checking for new tasks after supervisor review", error=str(e), exc_info=True)
+                                            logger.error("SUPERVISOR: Error checking for new tasks after supervisor review", error=str(e), exc_info=True)
                                     
                                     # CRITICAL: Update status after supervisor review completes
                                     # If supervisor decided to continue or created new tasks, show that agents are working
@@ -429,14 +493,23 @@ class ExecuteAgentsNode(ResearchNode):
                             except Exception as e:
                                 logger.error(f"Error processing unprocessed agent {agent_id}", error=str(e))
             
-            logger.info(f"Cycle {iteration_count} complete: {len(cycle_findings)} tasks completed, {no_tasks_count} agents with no tasks, {completed_count}/{len(agent_tasks)} agents processed",
+            logger.info(f"SUPERVISOR: Cycle {iteration_count} complete",
+                       tasks_completed=len(cycle_findings),
+                       agents_with_no_tasks=no_tasks_count,
+                       agents_processed=f"{completed_count}/{len(agent_tasks)}",
                        processed_agents=list(processed_agents),
-                       unprocessed_agents=unprocessed_agents if unprocessed_agents else None)
+                       unprocessed_agents=unprocessed_agents if unprocessed_agents else None,
+                       supervisor_decision_agents_to_return=state_dict.get("supervisor_decision", {}).get("agents_to_return", []),
+                       note="Agents will be returned to work in next cycle via agents_to_return")
             
             # CRITICAL: Check if agents have pending tasks after cycle completes
             # This ensures agents continue working if supervisor assigned new tasks
             # IMPORTANT: Check even if agents_active is False - supervisor might have created new tasks before stopping
             if agent_file_service:
+                logger.info(
+                    "SUPERVISOR: Checking for pending tasks after cycle",
+                    iteration_count=iteration_count
+                )
                 try:
                     # Reload agents list in case supervisor created new agents
                     agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
@@ -459,60 +532,83 @@ class ExecuteAgentsNode(ResearchNode):
                             total_pending += len(pending_tasks) + len(in_progress_tasks)
                     
                     if agents_with_pending_tasks:
-                        logger.info(f"After cycle {iteration_count}: {len(agents_with_pending_tasks)} agents have {total_pending} pending/in_progress tasks, continuing to next cycle",
+                        logger.info(f"SUPERVISOR: After cycle {iteration_count}: {len(agents_with_pending_tasks)} agents have {total_pending} pending/in_progress tasks, continuing to next cycle",
                                    agents_with_tasks=agents_with_pending_tasks,
                                    total_pending_tasks=total_pending,
                                    note="Agents will continue working in next cycle - supervisor may have assigned new tasks")
                         # CRITICAL: Even if supervisor decided to stop, if there are pending tasks, we must continue
                         # Supervisor might have created new tasks before deciding to stop
                         agents_active = True
-                        logger.info("Reactivating agents because pending tasks found", 
+                        logger.info("SUPERVISOR: Reactivating agents because pending tasks found", 
                                    pending_tasks=total_pending,
                                    agents=agents_with_pending_tasks,
                                    note="Supervisor may have created new tasks before stopping - agents must complete them")
                         # Continue to next iteration - agents will pick up their pending tasks
                         # The while loop will continue because agents_active is now True
                     else:
-                        logger.info(f"After cycle {iteration_count}: no agents have pending tasks")
+                        logger.info(f"SUPERVISOR: After cycle {iteration_count}: no agents have pending tasks",
+                                   iteration_count=iteration_count)
                         # Check if we should stop
                         if no_tasks_count == len(agent_tasks):
                             logger.info("All agents have no tasks, stopping agent execution")
                             if stream:
                                 stream.emit_status("✅ All agents completed their tasks", step="agents")
                             
-                            # CRITICAL: When all tasks are done, FORCE supervisor to finalize report
-                            # This ensures final report is generated even if supervisor didn't call make_final_decision
-                            # MANDATORY: Call supervisor EVEN IF limit reached - this is finalization call
-                            logger.info("MANDATORY: All tasks completed - forcing supervisor to finalize report (bypassing call limit if needed)")
+                            # CRITICAL: When all tasks are done, finalize report
+                            logger.info("MANDATORY: All tasks completed - finalizing report")
                             if stream:
                                 stream.emit_status("👔 Supervisor finalizing report...", step="supervisor")
                             
-                            # CRITICAL: Always call supervisor for finalization, even if limit reached
-                            # This is a special finalization call that bypasses the normal limit
+                            # Обработать оставшиеся файндинги из очереди перед финализацией
                             try:
-                                # Increment counter but don't check limit - this is mandatory finalization
-                                supervisor_call_count += 1
-                                state_dict["supervisor_call_count"] = supervisor_call_count
+                                # Извлечь все файндинги из очереди
+                                if supervisor_queue and supervisor_queue.size() > 0:
+                                    findings_from_queue = []
+                                    temp_events = []
+                                    queue_size = supervisor_queue.size()
+                                    for _ in range(queue_size):
+                                        try:
+                                            event = supervisor_queue.queue.get_nowait()
+                                            temp_events.append(event)
+                                            if event.result:
+                                                findings_from_queue.append(event.result)
+                                        except:
+                                            break
+                                    
+                                    # Вернуть события обратно для обработки
+                                    for event in temp_events:
+                                        await supervisor_queue.queue.put(event)
+                                    
+                                    # Добавить файндинги в state
+                                    if findings_from_queue:
+                                        existing_findings = state_dict.get("findings", state_dict.get("agent_findings", []))
+                                        for new_finding in findings_from_queue:
+                                            finding_already_exists = any(
+                                                f.get("topic") == new_finding.get("topic") and 
+                                                f.get("agent_id") == new_finding.get("agent_id")
+                                                for f in existing_findings
+                                            )
+                                            if not finding_already_exists:
+                                                existing_findings.append(new_finding)
+                                        
+                                        state_dict["findings"] = existing_findings
+                                        state_dict["agent_findings"] = existing_findings
+                                        logger.info(f"Extracted {len(findings_from_queue)} findings from supervisor_queue before finalization",
+                                                   total_findings=len(existing_findings))
                                 
-                                if settings:
-                                    supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
-                                else:
-                                    from src.config.settings import get_settings
-                                    settings_obj = get_settings()
-                                    supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
-                                
-                                logger.info("Calling supervisor for MANDATORY finalization (bypassing call limit)",
-                                           call_count=supervisor_call_count,
-                                           max_calls=max_supervisor_calls,
-                                           note="This is a special finalization call when all tasks are done")
-                                
-                                decision = await run_supervisor_agent(
-                                    state=state_dict,
-                                    llm=llm,
-                                    stream=stream,
-                                    supervisor_queue=supervisor_queue,
-                                    max_iterations=supervisor_max_iterations
-                                )
+                                # Обработать оставшиеся файндинги через supervisor chain
+                                while supervisor_queue and supervisor_queue.size() > 0:
+                                    decision = await run_supervisor_chain(
+                                        state=state_dict,
+                                        llm=llm,
+                                        stream=stream,
+                                        supervisor_queue=supervisor_queue
+                                    )
+                                    
+                                    # Обновить task_addition_count
+                                    if "task_management" in decision:
+                                        task_addition_count = decision["task_management"].get("task_addition_count", task_addition_count)
+                                        state_dict["task_addition_count"] = task_addition_count
                                 
                                 # Force should_continue to False to trigger report generation
                                 state_dict["should_continue"] = False
@@ -522,11 +618,10 @@ class ExecuteAgentsNode(ResearchNode):
                                 if stream:
                                     stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
                                 
-                                logger.info("Forced supervisor finalization completed", 
-                                          decision=decision.get("should_continue"),
+                                logger.info("Supervisor finalization completed", 
                                           note="Research will proceed to report generation")
                             except Exception as e:
-                                logger.error("Failed to force supervisor finalization", error=str(e), exc_info=True)
+                                logger.error("Failed to finalize supervisor", error=str(e), exc_info=True)
                                 # Even if supervisor fails, set should_continue to False to proceed to report
                                 state_dict["should_continue"] = False
                                 state_dict["replanning_needed"] = False
@@ -552,33 +647,14 @@ class ExecuteAgentsNode(ResearchNode):
                 if stream:
                     stream.emit_status("✅ All agents completed their tasks", step="agents")
                 
-                # CRITICAL: When all tasks are done, FORCE supervisor to finalize report
-                # MANDATORY: Call supervisor EVEN IF limit reached - this is finalization call
-                logger.info("MANDATORY: All tasks completed - forcing supervisor to finalize report (bypassing call limit if needed)")
+                # CRITICAL: When all tasks are done, finalize report
+                logger.info("MANDATORY: All tasks completed - finalizing report")
                 if stream:
                     stream.emit_status("👔 Supervisor finalizing report...", step="supervisor")
                 
-                # CRITICAL: Always call supervisor for finalization, even if limit reached
-                # This is a special finalization call that bypasses the normal limit
+                # Обработать оставшиеся файндинги из очереди перед финализацией
                 try:
-                    # Increment counter but don't check limit - this is mandatory finalization
-                    supervisor_call_count += 1
-                    state_dict["supervisor_call_count"] = supervisor_call_count
-                    
-                    if settings:
-                        supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
-                    else:
-                        from src.config.settings import get_settings
-                        settings_obj = get_settings()
-                        supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
-                    
-                    logger.info("Calling supervisor for MANDATORY finalization (bypassing call limit)",
-                               call_count=supervisor_call_count,
-                               max_calls=max_supervisor_calls,
-                               note="This is a special finalization call when all tasks are done")
-                    
-                    # CRITICAL: Extract ALL findings from supervisor_queue and add to state BEFORE finalization
-                    # This ensures supervisor sees all findings when finalizing the report
+                    # Извлечь все файндинги из очереди
                     if supervisor_queue and supervisor_queue.size() > 0:
                         findings_from_queue = []
                         temp_events = []
@@ -592,14 +668,13 @@ class ExecuteAgentsNode(ResearchNode):
                             except:
                                 break
                         
-                        # Put events back in queue (they'll be processed properly by supervisor)
+                        # Вернуть события обратно для обработки
                         for event in temp_events:
                             await supervisor_queue.queue.put(event)
                         
-                        # Add findings to state so supervisor can see them
+                        # Добавить файндинги в state
                         if findings_from_queue:
                             existing_findings = state_dict.get("findings", state_dict.get("agent_findings", []))
-                            # Combine existing findings with queue findings (avoid duplicates)
                             for new_finding in findings_from_queue:
                                 finding_already_exists = any(
                                     f.get("topic") == new_finding.get("topic") and 
@@ -612,34 +687,21 @@ class ExecuteAgentsNode(ResearchNode):
                             state_dict["findings"] = existing_findings
                             state_dict["agent_findings"] = existing_findings
                             logger.info(f"Extracted {len(findings_from_queue)} findings from supervisor_queue before finalization",
-                                       total_findings=len(existing_findings),
-                                       note="Supervisor will now see ALL findings when finalizing report")
+                                       total_findings=len(existing_findings))
                     
-                    # Also extract findings from cycle_findings if available
-                    if cycle_findings and len(cycle_findings) > 0:
-                        existing_findings = state_dict.get("findings", state_dict.get("agent_findings", []))
-                        for new_finding in cycle_findings:
-                            finding_already_exists = any(
-                                f.get("topic") == new_finding.get("topic") and 
-                                f.get("agent_id") == new_finding.get("agent_id")
-                                for f in existing_findings
-                            )
-                            if not finding_already_exists:
-                                existing_findings.append(new_finding)
+                    # Обработать оставшиеся файндинги через supervisor chain
+                    while supervisor_queue and supervisor_queue.size() > 0:
+                        decision = await run_supervisor_chain(
+                            state=state_dict,
+                            llm=llm,
+                            stream=stream,
+                            supervisor_queue=supervisor_queue
+                        )
                         
-                        state_dict["findings"] = existing_findings
-                        state_dict["agent_findings"] = existing_findings
-                        logger.info(f"Added {len(cycle_findings)} findings from cycle_findings to state before finalization",
-                                   total_findings=len(existing_findings),
-                                   note="Supervisor will now see ALL findings when finalizing report")
-                    
-                    decision = await run_supervisor_agent(
-                        state=state_dict,
-                        llm=llm,
-                        stream=stream,
-                        supervisor_queue=supervisor_queue,
-                        max_iterations=supervisor_max_iterations
-                    )
+                        # Обновить task_addition_count
+                        if "task_management" in decision:
+                            task_addition_count = decision["task_management"].get("task_addition_count", task_addition_count)
+                            state_dict["task_addition_count"] = task_addition_count
                     
                     # Force should_continue to False to trigger report generation
                     state_dict["should_continue"] = False
@@ -649,12 +711,11 @@ class ExecuteAgentsNode(ResearchNode):
                     if stream:
                         stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
                     
-                    logger.info("Forced supervisor finalization completed", 
-                              decision=decision.get("should_continue"),
+                    logger.info("Supervisor finalization completed", 
                               total_findings=len(state_dict.get("findings", state_dict.get("agent_findings", []))),
                               note="Research will proceed to report generation")
                 except Exception as e:
-                    logger.error("Failed to force supervisor finalization", error=str(e), exc_info=True)
+                    logger.error("Failed to finalize supervisor", error=str(e), exc_info=True)
                     # Even if supervisor fails, set should_continue to False to proceed to report
                     state_dict["should_continue"] = False
                     state_dict["replanning_needed"] = False
@@ -674,93 +735,40 @@ class ExecuteAgentsNode(ResearchNode):
             # Process any remaining items in queue (should be rare, as we process during cycle)
             # CRITICAL: Only process queue if agents are still active (not finalized)
             if queue_size > 0 and agents_active:
-                # CRITICAL: Supervisor is ALWAYS called for findings processing and draft_report writing
-                # Limit applies ONLY to TODO operations, NOT to findings processing
-                is_todo_operations_available = supervisor_call_count < max_supervisor_calls
-                
-                if is_todo_operations_available:
-                    # Increment counter only for TODO operations tracking
-                    supervisor_call_count += 1
-                    state_dict["supervisor_call_count"] = supervisor_call_count
-                    logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (call {supervisor_call_count}/{max_supervisor_calls}, TODO operations available)")
-                else:
-                    # Don't increment counter, but STILL call supervisor for findings processing
-                    logger.info(f"Processing {supervisor_queue.size()} agent completions in supervisor queue (TODO limit reached: {supervisor_call_count}/{max_supervisor_calls})",
-                              note="Supervisor will process findings and write to draft_report, but TODO operations are disabled")
+                logger.info(f"Processing {supervisor_queue.size()} remaining findings in supervisor queue")
                 
                 if stream:
-                    if is_todo_operations_available:
-                        stream.emit_status(f"👔 Supervisor reviewing findings (call {supervisor_call_count}/{max_supervisor_calls})", step="supervisor")
-                    else:
-                        stream.emit_status(f"👔 Supervisor processing findings (TODO limit reached, writing to draft_report)", step="supervisor")
+                    stream.emit_status(f"👔 Supervisor processing {supervisor_queue.size()} remaining findings", step="supervisor")
                 
-                # CRITICAL: Call supervisor agent to review and process findings
-                # Supervisor is ALWAYS called - limit only blocks TODO operations, NOT findings processing
-                
+                # Обработать все оставшиеся файндинги из очереди
                 try:
-                    
-                    # Get max_iterations from settings (centralized config)
-                    if settings:
-                        supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
-                    else:
-                        from src.config.settings import get_settings
-                        settings_obj = get_settings()
-                        supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
-                    
-                    # CRITICAL: Extract findings from supervisor_queue and add to state
-                    # Supervisor needs findings in state to process them
-                    if supervisor_queue and supervisor_queue.size() > 0:
-                        findings_from_queue = []
-                        # Get all pending findings from queue (peek without removing)
-                        temp_events = []
-                        queue_size = supervisor_queue.size()
-                        for _ in range(queue_size):
-                            try:
-                                event = supervisor_queue.queue.get_nowait()
-                                temp_events.append(event)
-                                if event.result:
-                                    findings_from_queue.append(event.result)
-                            except:
-                                break
+                    while supervisor_queue and supervisor_queue.size() > 0:
+                        decision = await run_supervisor_chain(
+                            state=state_dict,
+                            llm=llm,
+                            stream=stream,
+                            supervisor_queue=supervisor_queue
+                        )
                         
-                        # Put events back in queue (they'll be processed properly by supervisor)
-                        for event in temp_events:
-                            await supervisor_queue.queue.put(event)
+                        # Обновить task_addition_count
+                        if "task_management" in decision:
+                            task_addition_count = decision["task_management"].get("task_addition_count", task_addition_count)
+                            state_dict["task_addition_count"] = task_addition_count
                         
-                        # Add findings to state so supervisor can see them
-                        if findings_from_queue:
-                            existing_findings = state_dict.get("findings", state_dict.get("agent_findings", []))
-                            # Combine existing findings with queue findings (avoid duplicates)
-                            for new_finding in findings_from_queue:
-                                finding_already_exists = any(
-                                    f.get("topic") == new_finding.get("topic") and 
-                                    f.get("agent_id") == new_finding.get("agent_id")
-                                    for f in existing_findings
-                                )
-                                if not finding_already_exists:
-                                    existing_findings.append(new_finding)
-                            
-                            state_dict["findings"] = existing_findings
-                            state_dict["agent_findings"] = existing_findings
-                            logger.info(f"Extracted {len(findings_from_queue)} findings from supervisor_queue and added to state",
-                                       total_findings=len(existing_findings),
-                                       note="Supervisor will now see these findings in state")
-                    
-                    decision = await run_supervisor_agent(
-                        state=state_dict,
-                        llm=llm,
-                        stream=stream,
-                        supervisor_queue=supervisor_queue,  # Pass supervisor_queue
-                        max_iterations=supervisor_max_iterations
-                    )
-                    
-                    # Update state with supervisor decision
-                    state_dict["should_continue"] = decision.get("should_continue", False)
-                    state_dict["replanning_needed"] = decision.get("replanning_needed", False)
+                        # Update state with supervisor decision
+                        state_dict["should_continue"] = decision.get("should_continue", False)
+                        state_dict["replanning_needed"] = decision.get("replanning_needed", False)
+                        
+                        # Если supervisor решил остановиться, выйти из цикла
+                        if not decision.get("should_continue", False):
+                            logger.info("Supervisor decided to stop", 
+                                       decision_reasoning=decision.get("reasoning", "")[:200])
+                            agents_active = False
+                            break
                     
                     # CRITICAL: Update status after supervisor review completes
                     if stream:
-                        if not decision.get("should_continue", False):
+                        if not state_dict.get("should_continue", False):
                             stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
                         else:
                             # Check if there are pending tasks
@@ -789,44 +797,12 @@ class ExecuteAgentsNode(ResearchNode):
                                     logger.warning("Failed to check pending tasks for status update", error=str(e))
                                     stream.emit_status("🚀 Research continuing...", step="agents")
                     
-                    # If supervisor says stop, break the loop
-                    if not decision.get("should_continue", False):
-                        logger.info("Supervisor decided to stop, breaking agent execution loop", 
-                                   decision_reasoning=decision.get("reasoning", "")[:200])
-                        agents_active = False
-                        break
-                    
-                    # Check if we've reached the limit after this call
-                    if supervisor_call_count >= max_supervisor_calls:
-                        logger.warning(f"Supervisor call limit reached after decision ({supervisor_call_count}/{max_supervisor_calls}), agents will complete tasks without supervisor")
-                        # Don't break - let agents complete their tasks
-                        # Clear queue and continue
-                        while not supervisor_queue.queue.empty():
-                            try:
-                                supervisor_queue.queue.get_nowait()
-                                supervisor_queue.queue.task_done()
-                            except:
-                                break
-                        # Continue loop - agents will finish their tasks
-                        continue  # Skip further supervisor calls but continue agent execution
-                    
-                    # Clear the queue after processing
-                    while not supervisor_queue.queue.empty():
-                        try:
-                            supervisor_queue.queue.get_nowait()
-                            supervisor_queue.queue.task_done()
-                        except:
-                            break
-                            
                     logger.info("Supervisor queue processed", 
-                               decision=decision.get("should_continue"),
+                               decision=state_dict.get("should_continue"),
                                note="Agents will continue working in next cycle if they have pending tasks")
                     
-                    # CRITICAL: After supervisor review, agents should continue working if they have pending tasks
-                    # The while loop will continue and agents will be launched again in next iteration
-                    
                 except Exception as e:
-                    logger.error("Supervisor processing failed", error=str(e))
+                    logger.error("Supervisor processing failed", error=str(e), exc_info=True)
             
             # CRITICAL: DO NOT automatically add findings to draft_report - supervisor should add them as chapters
             # Automatic addition creates duplicate sections ("New Findings") and messes up the structure
@@ -842,15 +818,13 @@ class ExecuteAgentsNode(ResearchNode):
             # Force should_continue to False to trigger report generation
             state_dict["should_continue"] = False
             state_dict["replanning_needed"] = False
-            # CRITICAL: Force supervisor finalization even if limit reached
-            state_dict["_force_supervisor_finalization"] = True
             if stream:
                 stream.emit_status(f"⚠️ Max iterations reached ({iteration_count}/{max_iterations}) - finalizing report", step="agents")
         
         # Add findings to agent_findings (using reducer)
         # Update iteration in state
         new_iteration = current_iteration + iteration_count
-        logger.info(f"Agent execution completed", cycles=iteration_count, total_iteration=new_iteration, max_iterations=max_iterations, supervisor_calls=supervisor_call_count, max_reached=(iteration_count >= max_iterations))
+        logger.info(f"Agent execution completed", cycles=iteration_count, total_iteration=new_iteration, max_iterations=max_iterations, task_addition_count=task_addition_count, max_reached=(iteration_count >= max_iterations))
         
         # CRITICAL: Supervisor continues to be called even after TODO limit is reached
         # Supervisor can still process findings and write chapters to draft_report
@@ -862,94 +836,66 @@ class ExecuteAgentsNode(ResearchNode):
         # Supervisor will continue to be called for findings processing and will write chapters
         # Finalization happens in generate_final_report_enhanced_node when all tasks are done
 
-        # CRITICAL: Multiple safety checks to ensure research ALWAYS completes and generates result
-        # 1. Check if max_iterations reached
-        # 2. Check if supervisor call limit reached
-        # 3. Check if all tasks done
-        # ANY of these conditions MUST trigger report generation
-        
+        # Проверка завершения: все задачи done + все главы записаны
         final_should_continue = state_dict.get("should_continue", True)
         
-        # Safety check 1: Max iterations reached
+        # Проверить, есть ли еще задачи у агентов
+        agents_still_working = False
+        if agent_file_service:
+            try:
+                agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
+                all_agent_ids = []
+                for file_path in agent_files:
+                    agent_id = file_path.replace("agents/", "").replace(".md", "")
+                    if agent_id.startswith("agent_") and agent_id != "supervisor":
+                        all_agent_ids.append(agent_id)
+                
+                for agent_id in all_agent_ids:
+                    agent_file = await agent_file_service.read_agent_file(agent_id)
+                    todos = agent_file.get("todos", [])
+                    pending_tasks = [t for t in todos if t.status == "pending"]
+                    in_progress_tasks = [t for t in todos if t.status == "in_progress"]
+                    if pending_tasks or in_progress_tasks:
+                        agents_still_working = True
+                        break
+            except Exception as e:
+                logger.warning("Could not verify agent tasks status", error=str(e))
+                agents_still_working = True  # Если не можем проверить, предполагаем что работают
+        
+        # Set flag in state so graph.py can check it
+        state_dict["_agents_still_working"] = agents_still_working
+        
+        # Safety check: Max iterations reached
         if iteration_count >= max_iterations:
-            logger.warning(f"MANDATORY: Max iterations reached ({iteration_count}/{max_iterations}) - forcing should_continue=False")
-            final_should_continue = False
-        
-        # Safety check 2: Supervisor call limit reached
-        if supervisor_call_count >= max_supervisor_calls:
-            logger.warning(f"MANDATORY: Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}) - forcing should_continue=False")
-            final_should_continue = False
-        
-        # Safety check 3: All tasks done
-        if not final_should_continue:
-            logger.info("should_continue is False - research will proceed to report generation")
-        else:
-            # Check if all agents really have no tasks
-            if agent_file_service:
-                try:
-                    agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
-                    all_agent_ids = []
-                    for file_path in agent_files:
-                        agent_id = file_path.replace("agents/", "").replace(".md", "")
-                        if agent_id.startswith("agent_") and agent_id != "supervisor":
-                            all_agent_ids.append(agent_id)
-                    
-                    all_agents_have_no_tasks = True
-                    for agent_id in all_agent_ids:
-                        agent_file = await agent_file_service.read_agent_file(agent_id)
-                        todos = agent_file.get("todos", [])
-                        pending_tasks = [t for t in todos if t.status == "pending"]
-                        in_progress_tasks = [t for t in todos if t.status == "in_progress"]
-                        if pending_tasks or in_progress_tasks:
-                            all_agents_have_no_tasks = False
-                            break
-                    
-                    if all_agents_have_no_tasks:
-                        logger.info("MANDATORY: All agents have no tasks - forcing should_continue=False to trigger report generation")
-                        final_should_continue = False
-                except Exception as e:
-                    logger.warning("Could not verify agent tasks status", error=str(e))
-        
-        # CRITICAL: Final guarantee - if we have findings, we MUST generate report
-        # Even if should_continue is True, if we have findings and limits reached, force completion
-        if all_findings and len(all_findings) > 0:
-            if iteration_count >= max_iterations or supervisor_call_count >= max_supervisor_calls:
-                logger.warning(f"MANDATORY: Limits reached but findings exist - forcing completion to generate report",
-                              findings_count=len(all_findings),
-                              iteration_count=iteration_count,
-                              max_iterations=max_iterations,
-                              supervisor_calls=supervisor_call_count,
-                              max_supervisor_calls=max_supervisor_calls)
+            if agents_still_working:
+                logger.warning(f"Max iterations reached ({iteration_count}/{max_iterations}) but agents still working - NOT forcing completion",
+                             note="Research will continue until all agents finish")
+                final_should_continue = True
+            else:
+                logger.warning(f"MANDATORY: Max iterations reached ({iteration_count}/{max_iterations}) - forcing should_continue=False")
                 final_should_continue = False
         
-        # CRITICAL: If no findings and limits reached, still generate report (even if empty)
-        # This ensures user always gets a result, not infinite loop
-        if not all_findings or len(all_findings) == 0:
-            if iteration_count >= max_iterations or supervisor_call_count >= max_supervisor_calls:
-                logger.warning(f"MANDATORY: Limits reached with no findings - forcing completion to generate report (may be empty)",
-                              iteration_count=iteration_count,
-                              max_iterations=max_iterations,
-                              supervisor_calls=supervisor_call_count,
-                              max_supervisor_calls=max_supervisor_calls)
-                final_should_continue = False
+        # Проверка: все задачи завершены
+        if not agents_still_working:
+            logger.info("All agents have no tasks - research complete")
+            final_should_continue = False
         
         logger.info("Final should_continue decision",
                   should_continue=final_should_continue,
                   iteration_count=iteration_count,
                   max_iterations=max_iterations,
-                  supervisor_calls=supervisor_call_count,
-                  max_supervisor_calls=max_supervisor_calls,
                   findings_count=len(all_findings),
+                  task_addition_count=task_addition_count,
                   note="If False, research will proceed to report generation")
         
         return {
             "agent_findings": all_findings,
-            "findings": all_findings,  # Keep for supervisor review
+            "findings": all_findings,
             "findings_count": len(all_findings),
             "iteration": new_iteration,
-            "supervisor_call_count": supervisor_call_count,
-            "should_continue": final_should_continue,  # CRITICAL: Ensure this is False when limits reached or tasks done
-            "replanning_needed": False  # CRITICAL: Don't replan when limits reached or tasks done
+            "task_addition_count": task_addition_count,
+            "should_continue": final_should_continue,
+            "replanning_needed": False
         }
 
 
@@ -968,7 +914,7 @@ async def execute_agents_enhanced_node(state: ResearchState) -> Dict:
     runtime_deps = runtime_deps_context.get()
     if not runtime_deps:
         logger.warning("Runtime dependencies not found in context")
-        return {"findings": [], "agent_findings": []}
+        return {"findings": []}
 
     # Create dependencies container
     from src.workflow.research.dependencies import ResearchDependencies

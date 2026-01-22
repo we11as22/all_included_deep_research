@@ -112,3 +112,81 @@ class ChatTitle(BaseModel):
         min_length=1,
         max_length=60
     )
+
+
+class ScrapedPageAnalysis(BaseModel):
+    """Structured output for analyzing scraped page content."""
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "required": ["reasoning", "summary", "brief_info", "is_relevant"]
+        }
+    )
+    
+    reasoning: str = Field(
+        ...,
+        description="Your reasoning about the page content and its relevance to the research task. Explain what information you found, how it relates to the task, and why you made the decisions about summary and relevance.",
+        min_length=50
+    )
+    
+    summary: str = Field(
+        ...,
+        description="Comprehensive summary of the page content focused on the research task. This will be used for creating findings. Include all relevant facts, data, and insights. If content has markdown structure, preserve it. Target: 2000-4000 tokens.",
+        min_length=200
+    )
+    
+    brief_info: str = Field(
+        ...,
+        description="Brief description (2-3 sentences, max 200 chars) of what information is on this page. This will be shown in tool history to help agent understand what pages contain without storing full summary.",
+        max_length=200
+    )
+    
+    is_relevant: bool = Field(
+        ...,
+        description="Whether this page's content is relevant and needed for completing the research task. True if page contains information directly related to the task, False if it's not relevant or only tangentially related."
+    )
+
+
+class FindingContent(BaseModel):
+    """Structured output for creating finding from scraped summaries and search snippets."""
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "required": ["summary", "key_findings"]
+        }
+    )
+    
+    summary: str = Field(
+        ...,
+        description="Comprehensive, detailed finding summary (2000-4000 words minimum, longer if many sources available) based on ALL scraped page summaries and search result snippets. MUST include ALL relevant facts, data, insights, comparisons, statistics, examples, and context from ALL available sources. Use proper markdown formatting with sections, subsections, lists, and emphasis. The more sources available, the longer and more detailed the summary should be.",
+        min_length=1500
+    )
+    
+    key_findings: list[str] = Field(
+        ...,
+        description="List of 8-15 key findings extracted from the content. Each finding should be a specific fact, insight, or data point.",
+        min_items=5,
+        max_items=20
+    )
+
+
+class NoteContent(BaseModel):
+    """Structured output for creating note from scraped summaries and search snippets."""
+    
+    model_config = ConfigDict(
+        json_schema_extra={
+            "required": ["title", "summary"]
+        }
+    )
+    
+    title: str = Field(
+        ...,
+        description="Concise, descriptive title for the note (max 100 chars)",
+        max_length=100
+    )
+    
+    summary: str = Field(
+        ...,
+        description="Comprehensive note content (500-2000 words) based on scraped page summaries and search result snippets. Include all relevant information, facts, and context.",
+        min_length=500
+    )

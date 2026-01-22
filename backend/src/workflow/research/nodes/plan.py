@@ -98,6 +98,11 @@ class PlanResearchNode(ResearchNode):
                    result_preview=deep_search_result[:200] if deep_search_result else None,
                    note="Deep search result loaded for planning")
 
+        # CRITICAL: Check if clarification was needed but not answered
+        # If clarification_needed=True but clarification_answers is empty, we should NOT create plan
+        clarification_needed = state.get("clarification_needed", False)
+        session_status = state.get("session_status", "active")
+        
         # CRITICAL: Use clarification_answers from session state (loaded from DB), not chat_history
         # clarification_answers is the source of truth, loaded from session in create_initial_state
         clarification_answers = state.get("clarification_answers", "")
@@ -110,11 +115,31 @@ class PlanResearchNode(ResearchNode):
                              session_id=session_id,
                              note="This should not happen in normal flow - clarification_answers should be in session")
         
+        # CRITICAL: If clarification was needed but not answered, STOP and wait
+        # This prevents creating plan before user answers clarification questions
+        if clarification_needed and session_status == "waiting_clarification" and not clarification_answers:
+            logger.error("❌ CRITICAL: Cannot create research plan - clarification needed but not answered",
+                       session_id=session_id,
+                       clarification_needed=clarification_needed,
+                       session_status=session_status,
+                       has_clarification_answers=bool(clarification_answers),
+                       note="Research plan should NOT be created before user answers clarification questions")
+            if stream:
+                stream.emit_status("⏸️ Waiting for clarification answers before creating research plan...",
+                                 step="planning")
+            return {
+                "planning_waiting": True,
+                "should_stop": True,
+                "error": "clarification_answers_required"
+            }
+        
         logger.info("🔍 PLANNING: Clarification answers",
                    session_id=session_id,
                    has_clarification_answers=bool(clarification_answers),
                    clarification_preview=clarification_answers[:200] if clarification_answers else None,
                    source="session_state" if state.get("clarification_answers") else "chat_history_fallback",
+                   clarification_needed=clarification_needed,
+                   session_status=session_status,
                    note="Clarification answers from session state (source of truth)")
 
         # Build prompt using prompt builder

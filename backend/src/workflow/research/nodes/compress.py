@@ -99,9 +99,16 @@ Provide structured output with:
                        session_id=session_id)
 
             # CRITICAL: Return format must match original - use override format
-            # Original backup: {"compressed_research": {"type": "override", "value": result.compressed_summary}}
+            # Use result.summary (not compressed_summary - that field doesn't exist in CompressedFindings model)
+            compressed_summary_value = getattr(result, 'summary', '') or ''
+            if not compressed_summary_value:
+                # Fallback: create summary from key_insights and themes
+                key_insights = getattr(result, 'key_insights', []) or []
+                themes = getattr(result, 'themes', []) or []
+                compressed_summary_value = f"Key insights: {', '.join(key_insights[:5])}. Themes: {', '.join(themes[:3])}."
+            
             return {
-                "compressed_research": {"type": "override", "value": result.compressed_summary}
+                "compressed_research": {"type": "override", "value": compressed_summary_value}
             }
 
         except Exception as e:
@@ -147,9 +154,14 @@ Provide structured output with:
             themes_text = "\n".join([f"- {theme}" for theme in result.themes])
             sections.append(f"## Major Themes\n\n{themes_text}")
 
-        # Sources count
+        # Sources count - NOTE: This is only for compressed_research summary, NOT for final report
+        # Sources are already in each chapter of draft_report - do NOT add Sources section here
+        # This compressed_research is used as context for LLM, not as final report content
+        # If sources_count is needed, mention it in summary text, not as separate Sources section
         if hasattr(result, "sources_count") and result.sources_count:
-            sections.append(f"## Sources\n\nAnalyzed approximately {result.sources_count} unique sources.")
+            # Just mention in summary, don't create separate Sources section
+            # This prevents Sources section from appearing in final report
+            pass  # Sources count is already mentioned in summary if needed
 
         return "\n\n".join(sections)
 

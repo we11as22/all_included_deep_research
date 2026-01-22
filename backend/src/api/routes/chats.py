@@ -593,3 +593,105 @@ async def create_chat_with_message(
                 "chat": chat.to_dict(),
                 "message": msg.to_dict(),
             }
+
+
+# Separate router for chat stream endpoints (PDF download)
+chat_stream_router = APIRouter(prefix="/api/chat/stream", tags=["chat_stream"])
+
+
+@chat_stream_router.get("/{session_id}/pdf")
+async def download_pdf(session_id: str, app_request: Request):
+    """
+    Download PDF report for a completed deep research session.
+    
+    Args:
+        session_id: Research session ID
+        app_request: FastAPI request object
+        
+    Returns:
+        PDF file as downloadable response
+        
+    Raises:
+        HTTPException: If session not found or no report available
+    """
+    from fastapi.responses import Response
+    from sqlalchemy import select
+    from src.database.schema import ResearchSessionModel
+    from src.utils.pdf_generator import markdown_to_pdf
+    
+    logger.info("PDF download request", session_id=session_id)
+    
+    session_factory = app_request.app.state.session_factory
+    
+    async with session_factory() as session:
+        # Get session from database
+        result = await session.execute(
+            select(ResearchSessionModel).where(ResearchSessionModel.id == session_id)
+        )
+        research_session = result.scalar_one_or_none()
+        
+        if not research_session:
+            logger.warning("Session not found for PDF download", session_id=session_id)
+            raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+        
+        # Get final report
+        final_report = research_session.final_report
+        
+        # If no final_report, try draft_report as fallback
+        if not final_report or len(final_report.strip()) < 100:
+            final_report = research_session.draft_report
+            logger.info("Using draft_report as fallback for PDF", 
+                       session_id=session_id,
+                       draft_length=len(final_report) if final_report else 0)
+        
+        if not final_report or len(final_report.strip()) < 100:
+            logger.warning("No report available for PDF download", 
+                          session_id=session_id,
+                          has_final_report=bool(research_session.final_report),
+                          has_draft_report=bool(research_session.draft_report))
+            raise HTTPException(
+                status_code=404, 
+                detail=f"No report available for session {session_id}. Research may not be completed yet."
+            )
+        
+        # Generate PDF
+        try:
+            # Extract title from report (first H1 heading)
+            import re
+            title_match = re.search(r'^#\s+(.+)$', final_report, re.MULTILINE)
+            if title_match:
+                pdf_title = title_match.group(1).strip()
+            else:
+                # Fallback to original query
+                query = research_session.original_query or "Research Report"
+                pdf_title = query[:50]
+            
+            pdf_buffer = markdown_to_pdf(final_report, title=pdf_title)
+            pdf_bytes = pdf_buffer.getvalue()
+            
+            logger.info("PDF generated successfully", 
+                       session_id=session_id,
+                       pdf_size=len(pdf_bytes),
+                       report_length=len(final_report))
+            
+            # Return PDF file
+            filename = f"research_report_{session_id[:8]}.pdf"
+            
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(pdf_bytes)),
+                },
+            )
+            
+        except Exception as e:
+            logger.error("Failed to generate PDF", 
+                        session_id=session_id,
+                        error=str(e),
+                        exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to generate PDF: {str(e)}"
+            )

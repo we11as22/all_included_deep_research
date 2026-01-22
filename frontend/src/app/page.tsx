@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { ErrorBoundary } from '@/components/ErrorBoundary';
 import { ChatSidebar } from '@/components/ChatSidebar';
 import { ChatContainer } from '@/components/ChatContainer';
@@ -22,48 +22,112 @@ export default function HomePage() {
   const clearCurrentChat = useChatStore((state) => state.clearCurrentChat);
   const showChatSearch = useUIStore((state) => state.showChatSearch);
   const setShowChatSearch = useUIStore((state) => state.setShowChatSearch);
+  const connectionStatus = useChatStore((state) => state.connectionStatus);
+  const [isInitializing, setIsInitializing] = useState(true);
 
   // Initialize Socket.IO and offline queue on mount
   useEffect(() => {
     let cancelled = false;
+    let initTimeout: NodeJS.Timeout | null = null;
+
+    const finishInitialization = () => {
+      if (cancelled) return;
+      setIsInitializing(false);
+      if (initTimeout) {
+        clearTimeout(initTimeout);
+        initTimeout = null;
+      }
+    };
 
     const init = async () => {
       try {
-        await offlineQueue.init();
-      } catch (error) {
-        console.error('Failed to initialize offline queue:', error);
-        return;
-      }
-
-      if (cancelled) return;
-
-      offlineQueue.getAll().then((messages) => {
-        messages.forEach((msg) => {
-          useChatStore.getState().queueMessage(msg);
+        // Set connecting status
+        useChatStore.getState().setConnectionStatus('connecting');
+        
+        // Health check with timeout
+        const healthCheckPromise = (async () => {
+          try {
+            const { checkBackendHealth } = await import('@/lib/api');
+            return await checkBackendHealth(3, 200).catch(() => false);
+          } catch (error) {
+            return false;
+          }
+        })();
+        
+        const timeoutPromise = new Promise<boolean>((resolve) => {
+          setTimeout(() => resolve(false), 3000);
         });
-      });
+        
+        await Promise.race([healthCheckPromise, timeoutPromise]);
+        
+        if (cancelled) return;
 
-      socketService.connect();
+        // Initialize offline queue (non-blocking)
+        offlineQueue.init().catch(() => {
+          // Ignore errors
+        });
+
+        // Load queued messages (non-blocking)
+        offlineQueue.getAll().then((messages) => {
+          if (cancelled) return;
+          messages.forEach((msg) => {
+            useChatStore.getState().queueMessage(msg);
+          });
+        }).catch(() => {
+          // Ignore errors
+        });
+
+        // Connect socket
+        if (!socketService.isConnected()) {
+          socketService.connect();
+        }
+        
+        // Listen to connection status to finish initialization
+        let unsubscribe: (() => void) | null = null;
+        let hasFinished = false;
+        
+        unsubscribe = useChatStore.subscribe((state) => {
+          if (state.connectionStatus === 'online' && !hasFinished) {
+            hasFinished = true;
+            finishInitialization();
+            if (unsubscribe) {
+              unsubscribe();
+              unsubscribe = null;
+            }
+          }
+        });
+        
+        // Timeout fallback - always finish initialization after 3 seconds
+        initTimeout = setTimeout(() => {
+          if (!cancelled && !hasFinished) {
+            hasFinished = true;
+            finishInitialization();
+            if (unsubscribe) {
+              unsubscribe();
+              unsubscribe = null;
+            }
+          }
+        }, 3000);
+        
+      } catch (error) {
+        console.error('Failed to initialize:', error);
+        // Still try to connect
+        if (!socketService.isConnected()) {
+          socketService.connect();
+        }
+        finishInitialization();
+      }
     };
 
-    const idleCallback = typeof window !== 'undefined' ? (window as any).requestIdleCallback : null;
-    const cancelIdle = typeof window !== 'undefined' ? (window as any).cancelIdleCallback : null;
-
-    const schedule = idleCallback
-      ? idleCallback(() => {
-          init();
-        }, { timeout: 1000 })
-      : window.setTimeout(() => init(), 0);
+    init();
 
     // Cleanup on unmount
     return () => {
       cancelled = true;
-      if (cancelIdle) {
-        cancelIdle(schedule as number);
-      } else {
-        window.clearTimeout(schedule as number);
+      if (initTimeout) {
+        clearTimeout(initTimeout);
       }
-      socketService.disconnect();
+      // Don't disconnect socket on unmount - let it stay connected
     };
   }, []);
 
@@ -71,21 +135,37 @@ export default function HomePage() {
   useSocketEvents();
 
   // Restore chat from localStorage on mount
+  // CRITICAL: Only load once, with timeout protection
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    if (isInitializing) return; // Don't load chat while initializing
 
     const savedChatId = localStorage.getItem('currentChatId');
     if (!savedChatId) return;
 
-    if (savedChatId !== currentChatId || messages.length === 0) {
-      loadChat(savedChatId).catch((error) => {
+    // CRITICAL: Only load if chat ID changed
+    if (savedChatId !== currentChatId) {
+      // Chat ID changed - load new chat with timeout
+      const timeoutPromise = new Promise<void>((resolve) => {
+        setTimeout(() => {
+          console.warn('Chat load timeout - skipping');
+          resolve();
+        }, 5000); // 5 second timeout
+      });
+      
+      Promise.race([
+        loadChat(savedChatId),
+        timeoutPromise
+      ]).catch((error) => {
         console.error('Failed to load saved chat:', error);
         // Clear invalid chat ID
         localStorage.removeItem('currentChatId');
         useChatStore.getState().setCurrentChatId(null);
       });
     }
-  }, [currentChatId, messages.length, loadChat]);
+    // CRITICAL: Don't reload if we already have messages - prevents infinite loops
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentChatId, isInitializing]);
 
   const handleChatSelect = async (chatId: string) => {
     try {
@@ -98,6 +178,20 @@ export default function HomePage() {
   const handleNewChat = () => {
     clearCurrentChat();
   };
+
+  // Show loading screen while initializing
+  if (isInitializing) {
+    return (
+      <ErrorBoundary>
+        <div className="flex h-screen bg-background items-center justify-center">
+          <div className="flex flex-col items-center gap-4">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary"></div>
+            <p className="text-muted-foreground">Connecting to server...</p>
+          </div>
+        </div>
+      </ErrorBoundary>
+    );
+  }
 
   return (
     <ErrorBoundary>

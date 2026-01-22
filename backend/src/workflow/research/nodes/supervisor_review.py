@@ -8,7 +8,7 @@ from datetime import datetime
 from src.workflow.research.state import ResearchState
 from src.workflow.research.nodes.base import ResearchNode
 from src.workflow.research.nodes.utils import _restore_runtime_deps
-from src.workflow.research.supervisor_agent import run_supervisor_agent
+from src.workflow.research.supervisor_chain import run_supervisor_chain
 
 logger = structlog.get_logger(__name__)
 
@@ -38,7 +38,8 @@ class SupervisorReviewNode(ResearchNode):
         stream = state_dict.get("stream")
         agent_file_service = stream.app_state.get("agent_file_service") if stream else None
 
-        # CRITICAL: Check if all agents have no tasks - if so, FORCE supervisor to finalize
+        # Проверить, есть ли еще задачи у агентов
+        all_agents_have_no_tasks = True
         if agent_file_service:
             try:
                 agent_files = await agent_file_service.file_manager.list_files("agents/agent_*.md")
@@ -48,9 +49,6 @@ class SupervisorReviewNode(ResearchNode):
                     if agent_id.startswith("agent_") and agent_id != "supervisor":
                         all_agent_ids.append(agent_id)
                 
-                all_agents_have_no_tasks = True
-                total_pending = 0
-                total_in_progress = 0
                 for agent_id in all_agent_ids:
                     agent_file = await agent_file_service.read_agent_file(agent_id)
                     todos = agent_file.get("todos", [])
@@ -58,56 +56,41 @@ class SupervisorReviewNode(ResearchNode):
                     in_progress_tasks = [t for t in todos if t.status == "in_progress"]
                     if pending_tasks or in_progress_tasks:
                         all_agents_have_no_tasks = False
-                        total_pending += len(pending_tasks)
-                        total_in_progress += len(in_progress_tasks)
-                
-                if all_agents_have_no_tasks:
-                    logger.info("MANDATORY: All agents have no tasks - forcing supervisor to finalize report (bypassing call limit)",
-                               agents_checked=len(all_agent_ids),
-                               note="Supervisor will be instructed to synthesize all findings and finish - this call bypasses limit")
-                    if stream:
-                        stream.emit_status("👔 All tasks completed - supervisor finalizing report...", step="supervisor")
-                    # Force should_continue to False before calling supervisor
-                    state_dict["should_continue"] = False
-                    state_dict["replanning_needed"] = False
-                    # CRITICAL: Set flag to bypass supervisor call limit for this finalization call
-                    state_dict["_force_supervisor_finalization"] = True
-                else:
-                    logger.info("Some agents still have tasks", 
-                               agents_with_tasks=len(all_agent_ids) - sum(1 for aid in all_agent_ids if not any(t.status in ["pending", "in_progress"] for t in (await agent_file_service.read_agent_file(aid)).get("todos", []))),
-                               total_pending=total_pending,
-                               total_in_progress=total_in_progress)
+                        break
             except Exception as e:
                 logger.warning("Could not check agent tasks status in supervisor_review", error=str(e))
-
-        # Use new supervisor agent with ReAct format
+                all_agents_have_no_tasks = False  # Если не можем проверить, предполагаем что есть задачи
+        
+        # Если все задачи завершены - финализация
+        if all_agents_have_no_tasks:
+            logger.info("MANDATORY: All agents have no tasks - finalizing report",
+                       agents_checked=len(all_agent_ids) if agent_file_service else 0)
+            if stream:
+                stream.emit_status("👔 All tasks completed - supervisor finalizing report...", step="supervisor")
+            state_dict["should_continue"] = False
+            state_dict["replanning_needed"] = False
+        
+        # Использовать supervisor chain для обработки оставшихся файндингов
         try:
-            # Get max_iterations from settings (centralized config)
-            settings = state_dict.get("settings")
-            if settings:
-                supervisor_max_iterations = settings.deep_research_supervisor_max_iterations
-            else:
-                from src.config.settings import get_settings
-                settings_obj = get_settings()
-                supervisor_max_iterations = settings_obj.deep_research_supervisor_max_iterations
+            # Создать пустую очередь для финализации (все файндинги уже обработаны)
+            from src.workflow.research.supervisor_queue import SupervisorQueue
+            empty_queue = SupervisorQueue()
             
-            decision = await run_supervisor_agent(
+            # Обработать оставшиеся файндинги из очереди (если есть)
+            decision = await run_supervisor_chain(
                 state=state_dict,
                 llm=llm,
                 stream=stream,
-                supervisor_queue=None,  # No queue for finalization call
-                max_iterations=supervisor_max_iterations
+                supervisor_queue=empty_queue  # Пустая очередь - все уже обработано
             )
             
-            logger.info("Supervisor agent completed", decision=decision)
+            logger.info("Supervisor chain completed", decision=decision)
             
-            # CRITICAL: Update status after supervisor review completes
-            # If supervisor decided to finish, show finalization status
+            # Обновить статус
             if stream:
                 if not decision.get("should_continue", False):
                     stream.emit_status("✅ Supervisor finalized report - generating final result...", step="supervisor")
                 else:
-                    # Supervisor decided to continue (shouldn't happen in finalization, but handle it)
                     stream.emit_status("🚀 Research continuing...", step="agents")
             
             return decision

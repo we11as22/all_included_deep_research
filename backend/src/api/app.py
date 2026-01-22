@@ -23,6 +23,7 @@ from src.llm.factory import create_chat_model
 # Import routers
 from src.api.routes import (
     chat_router,
+    chat_stream_router,
     search_router,
     chats_router,
     config_router,
@@ -180,10 +181,18 @@ async def lifespan(app: FastAPI):
         available_modes=["chat", "search", "deep_search", "deep_research"],
     )
 
-    yield
+    yield  # Application is running
 
     # Shutdown
     logger.info("Shutting down All-Included Deep Research API...")
+
+    # Close scraper session if exists
+    if hasattr(app.state, "chat_service") and hasattr(app.state.chat_service, "scraper"):
+        try:
+            await app.state.chat_service.scraper.close()
+            logger.info("Closed scraper session")
+        except Exception as e:
+            logger.warning("Error closing scraper session", error=str(e))
 
     # Cleanup database connections
     if hasattr(app.state, "engine"):
@@ -219,6 +228,7 @@ def create_app() -> FastAPI:
     # Include routers
     app.include_router(health_router)
     app.include_router(chat_router)
+    app.include_router(chat_stream_router)
     app.include_router(search_router)
     app.include_router(chats_router)
     app.include_router(memory_router)

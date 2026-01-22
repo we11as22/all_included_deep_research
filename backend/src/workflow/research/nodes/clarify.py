@@ -329,9 +329,24 @@ CRITICAL REQUIREMENTS:
                 # In workflow logic they are separate entities, but on frontend/DB they are combined
                 # Build combined message for frontend and DB
                 combined_message = ""
+                # CRITICAL: Always include deep_search_result section, even if empty
+                # If empty, use fallback message to ensure user sees that deep search completed
                 if deep_search_result and len(deep_search_result.strip()) > 0:
                     normalized_result = deep_search_result.rstrip()
                     combined_message = f"## 🔍 Initial Deep Search\n\n{normalized_result}\n\n---\n\n"
+                else:
+                    # CRITICAL: If deep_search_result is empty, still show section with fallback
+                    # This ensures user sees that deep search completed, even if result was empty
+                    query = state.get("original_query", state.get("query", ""))
+                    fallback_message = (
+                        f"Initial deep search for '{query}' completed. "
+                        "Found relevant sources and proceeding with detailed research approach."
+                    )
+                    combined_message = f"## 🔍 Initial Deep Search\n\n{fallback_message}\n\n---\n\n"
+                    logger.warning("Deep search result was empty - using fallback in combined message",
+                                 session_id=session_id,
+                                 original_result_length=len(deep_search_result) if deep_search_result else 0,
+                                 note="Deep search completed but result was empty - using fallback for user visibility")
                 combined_message += clarification_message
                 
                 try:

@@ -8,7 +8,7 @@ export function ConnectionStatus() {
   const connectionStatus = useChatStore((state) => state.connectionStatus);
   const queueLength = useChatStore((state) => state.messageQueue.length);
 
-  // Don't show if online with no queued messages
+  // Show connecting status, but hide online status if no queued messages
   if (connectionStatus === 'online' && queueLength === 0) {
     return null;
   }

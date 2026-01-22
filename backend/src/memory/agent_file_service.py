@@ -165,6 +165,18 @@ class AgentFileService:
                         logger.warning(f"Attempted to change status of in_progress task '{todo_title}' for agent {agent_id} from in_progress to {status}. Ignoring status change to prevent race condition.",
                                      agent_id=agent_id, todo_title=todo_title, current_status=todo.status, attempted_status=status)
                         # Don't update status, but allow other fields to be updated
+                    # CRITICAL: Prevent setting status to in_progress if agent already has another in_progress task
+                    elif status == "in_progress":
+                        other_in_progress = [t for t in todos if t.status == "in_progress" and t.title != todo_title]
+                        if other_in_progress:
+                            logger.error(f"CRITICAL: Attempted to set task '{todo_title}' to in_progress, but agent {agent_id} already has {len(other_in_progress)} in_progress task(s): {[t.title for t in other_in_progress]}. Ignoring status change to prevent multiple in_progress tasks.",
+                                       agent_id=agent_id,
+                                       todo_title=todo_title,
+                                       other_in_progress_tasks=[t.title for t in other_in_progress],
+                                       note="Agent can only work on ONE task at a time. Cannot set task to in_progress when other in_progress tasks exist.")
+                            # Don't update status - keep current status (likely pending)
+                        else:
+                            todo.status = status
                     else:
                         todo.status = status
                 

@@ -1,5 +1,6 @@
 """Report generation node for final research report."""
 
+import re
 import structlog
 from typing import Dict, Any
 from datetime import datetime
@@ -51,6 +52,17 @@ class GenerateReportNode(ResearchNode):
         draft_report = await self._read_draft_report(agent_memory_service, findings, query)
         main_document = await self._read_main_document(agent_memory_service)
 
+        # Determine user language
+        user_language = state.get("user_language", "English")
+        
+        # Get clarification answers for title generation
+        clarification_answers_from_state = state.get("clarification_answers", "")
+        clarification_context = clarification_answers_from_state if clarification_answers_from_state else ""
+        
+        # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
+        if not clarification_context:
+            clarification_context = self._extract_clarification_context(chat_history)
+
         # CRITICAL: If draft_report is substantial (>= 1000 chars), return it directly WITHOUT generation
         # Supervisor wrote it throughout research, so it's the final report
         if draft_report and len(draft_report.strip()) >= 1000:
@@ -61,9 +73,33 @@ class GenerateReportNode(ResearchNode):
             
             # CRITICAL: Remove metadata from draft_report before returning
             # Remove "Research Report Draft", "Query:", "Started:", "Status:", "Overview" headers
+            # CRITICAL: Also check for duplicate Sources sections at the end - sources are already in chapters
             lines = draft_report.split('\n')
             cleaned_lines = []
             skip_metadata = False
+            in_sources_section_at_end = False
+            sources_section_start = -1
+            
+            # First pass: identify if there's a Sources section at the end (after all chapters)
+            # This would be a duplicate - sources are already in each chapter
+            chapter_count = 0
+            last_chapter_line = -1
+            for i, line in enumerate(lines):
+                if line.startswith("## Chapter"):
+                    chapter_count += 1
+                    last_chapter_line = i
+            
+            # Check if there's a "## Sources" section after the last chapter
+            if last_chapter_line >= 0:
+                for i in range(last_chapter_line + 1, len(lines)):
+                    if re.match(r'^##\s+Sources', lines[i], re.IGNORECASE):
+                        sources_section_start = i
+                        logger.warning("Found duplicate Sources section at end of draft_report (after chapters)",
+                                     line_number=i,
+                                     note="Sources are already in each chapter - this section will be removed to prevent duplication")
+                        break
+            
+            # Second pass: clean metadata and remove duplicate Sources section
             for i, line in enumerate(lines):
                 # Skip "Research Report Draft" header and metadata
                 if line.strip() == "# Research Report Draft" or line.strip().startswith("# Research Report Draft"):
@@ -80,16 +116,59 @@ class GenerateReportNode(ResearchNode):
                 # Stop skipping after first chapter or section
                 if skip_metadata and (line.startswith("## Chapter") or line.startswith("## ")):
                     skip_metadata = False
+                
+                # CRITICAL: Skip duplicate Sources section at the end (after all chapters)
+                if sources_section_start >= 0 and i >= sources_section_start:
+                    # Check if this is the start of Sources section
+                    if re.match(r'^##\s+Sources', line, re.IGNORECASE):
+                        in_sources_section_at_end = True
+                        logger.info("Skipping duplicate Sources section at end",
+                                   line_number=i,
+                                   note="Sources are already in each chapter - removing duplicate section")
+                        continue
+                    # Skip all lines in Sources section until next section or end
+                    if in_sources_section_at_end:
+                        # Check if this is a new section (starts with ##)
+                        if re.match(r'^##\s+', line) and not re.match(r'^##\s+Sources', line, re.IGNORECASE):
+                            # New section starts - stop skipping
+                            in_sources_section_at_end = False
+                        else:
+                            # Still in Sources section - skip
+                            continue
+                
                 if not skip_metadata:
                     cleaned_lines.append(line)
             
             cleaned_draft = '\n'.join(cleaned_lines).strip()
             
+            # Generate report title using LLM based on original query, clarification questions, and answers
+            report_title = await self._generate_report_title(
+                original_query=original_query,
+                clarification_answers=clarification_context,
+                llm=llm,
+                user_language=user_language
+            )
+            
             # Format it as a proper report (add title if needed, but only if no chapters)
-            if not cleaned_draft.strip().startswith("#") and not cleaned_draft.strip().startswith("## Chapter"):
-                formatted_report = f"# Research Report: {original_query}\n\n{cleaned_draft}"
+            # CRITICAL: Check if draft already has a title to avoid duplication
+            first_line = cleaned_draft.strip().split('\n')[0] if cleaned_draft.strip() else ""
+            has_title = first_line.startswith("# ") and not first_line.startswith("## ")
+            
+            if not has_title and not cleaned_draft.strip().startswith("## Chapter"):
+                formatted_report = f"# {report_title}\n\n{cleaned_draft}"
             else:
-                formatted_report = cleaned_draft
+                # If draft has title, replace it with generated title to avoid duplication
+                if has_title:
+                    # Remove existing title and add new one
+                    lines = cleaned_draft.split('\n')
+                    # Skip first line if it's a title
+                    if lines[0].startswith("# ") and not lines[0].startswith("## "):
+                        content_lines = lines[1:]
+                    else:
+                        content_lines = lines
+                    formatted_report = f"# {report_title}\n\n" + '\n'.join(content_lines)
+                else:
+                    formatted_report = cleaned_draft
             
             if stream:
                 stream.emit_status("✅ Final report ready (from draft_report)", step="report")
@@ -133,22 +212,8 @@ class GenerateReportNode(ResearchNode):
                    findings_count=len(findings),
                    session_id=session_id)
 
-        # Determine user language
-        # Get user language from state (detected in create_initial_state)
-        user_language = state.get("user_language", "English")
-
-        # CRITICAL: Use clarification_answers from session state (loaded from DB), not chat_history
-        # clarification_answers is the source of truth, loaded from session in create_initial_state
-        clarification_answers_from_state = state.get("clarification_answers", "")
-        clarification_context = clarification_answers_from_state if clarification_answers_from_state else ""
-        
-        # Fallback: if not in state, try to extract from chat_history (for backward compatibility)
-        if not clarification_context:
-            clarification_context = self._extract_clarification_context(chat_history)
-            if clarification_context:
-                logger.warning("Using clarification_answers from chat_history (fallback) - should be in session state",
-                             session_id=session_id,
-                             note="This should not happen in normal flow - clarification_answers should be in session")
+        # Determine user language (already set above)
+        # clarification_context already set above
 
         # Combine draft_report (if exists) with findings summaries for generation
         if draft_report and len(draft_report.strip()) > 0:
@@ -202,14 +267,14 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
                        session_id=session_id)
 
             # Format report as markdown
-            formatted_report = self._format_report(report, original_query)
+            formatted_report = await self._format_report(report, query, original_query, clarification_context, llm, user_language)
 
             # Validate report length
             if len(formatted_report) < 1500:
                 logger.warning("Generated report too short, using combined source as fallback",
                              length=len(formatted_report),
                              session_id=session_id)
-                formatted_report = self._create_fallback_report(original_query, draft_report_for_prompt, findings)
+                formatted_report = await self._create_fallback_report(original_query, draft_report_for_prompt, findings, state)
 
             if stream:
                 stream.emit_status("✅ Final report generated", step="report")
@@ -254,7 +319,7 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
                         source_length=len(draft_report_for_prompt) if draft_report_for_prompt else 0)
 
             # Fallback: use combined source (draft_report + findings or just findings)
-            fallback_report = self._create_fallback_report(original_query, draft_report_for_prompt, findings)
+            fallback_report = await self._create_fallback_report(original_query, draft_report_for_prompt, findings, state)
             logger.info("Using combined source as fallback report",
                        fallback_length=len(fallback_report),
                        session_id=session_id)
@@ -302,11 +367,11 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
             else:
                 logger.warning("Draft report is empty, creating from findings as fallback",
                              draft_length=len(draft_report) if draft_report else 0)
-                return self._create_draft_from_findings(findings, query)
+                return await self._create_draft_from_findings(findings, query, state)
 
         except FileNotFoundError:
             logger.warning("Draft report not found, creating from findings")
-            draft = self._create_draft_from_findings(findings, query)
+            draft = await self._create_draft_from_findings(findings, query, state)
 
             # Save created draft
             try:
@@ -341,7 +406,7 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
             logger.warning("Could not read main document", error=str(e))
             return ""
 
-    def _create_draft_from_findings(self, findings: list, query: str) -> str:
+    async def _create_draft_from_findings(self, findings: list, query: str, state: Dict[str, Any]) -> str:
         """Create comprehensive draft report from all findings.
 
         Args:
@@ -352,7 +417,16 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
             Draft report content
         """
         if not findings:
-            return f"# Research Report\n\n**Query:** {query}\n\nNo findings available."
+            # Generate report title
+            user_language = state.get("user_language", "English")
+            clarification_answers = state.get("clarification_answers", "")
+            report_title = await self._generate_report_title(
+                original_query=query,
+                clarification_answers=clarification_answers,
+                llm=self.deps.llm,
+                user_language=user_language
+            )
+            return f"# {report_title}\n\n**Query:** {query}\n\nNo findings available."
 
         findings_sections = []
         for f in findings:
@@ -442,6 +516,71 @@ Research completed with {len(findings)} findings from multiple agents covering v
         except Exception:
             return "English"
 
+    async def _generate_report_title(
+        self,
+        original_query: str,
+        clarification_answers: str,
+        llm: Any,
+        user_language: str = "English"
+    ) -> str:
+        """Generate report title using LLM based on original query and clarification.
+        
+        Args:
+            original_query: Original user query
+            clarification_answers: User clarification answers (if provided)
+            llm: LLM instance
+            user_language: User's language
+            
+        Returns:
+            Generated report title
+        """
+        from pydantic import BaseModel, Field
+        
+        class ReportTitle(BaseModel):
+            reasoning: str = Field(description="Why this title was chosen")
+            title: str = Field(description="Report title (without 'Research Report:' prefix, just the title itself)")
+        
+        prompt = f"""Generate a concise, descriptive title for a research report.
+
+**Original User Query:** {original_query}
+
+**Clarification Answers (if provided):**
+{clarification_answers if clarification_answers else "No clarification provided"}
+
+**Requirements:**
+1. The title should be in {user_language} - the same language as the user's query
+2. The title should be concise (5-15 words) but descriptive
+3. The title should reflect the main topic of the research
+4. If clarification was provided, incorporate it into the title
+5. Do NOT include "Research Report:" prefix - just the title itself
+6. The title should be professional and informative
+
+**Examples:**
+- Query: "расскажи про развитие видеокарт" → Title: "Развитие видеокарт: от появления до перспективных разработок"
+- Query: "AI in healthcare" → Title: "Artificial Intelligence in Healthcare: Current Applications and Future Prospects"
+- Query: "climate change effects" → Title: "Climate Change Effects: Environmental, Economic, and Social Impacts"
+
+Return structured output with reasoning at the beginning."""
+        
+        try:
+            result = await llm.with_structured_output(ReportTitle).ainvoke([
+                {"role": "system", "content": f"You are an expert at creating concise, descriptive titles. Always create titles in {user_language}."},
+                {"role": "user", "content": prompt}
+            ])
+            
+            logger.info("Report title generated",
+                       original_query=original_query[:100],
+                       generated_title=result.title,
+                       user_language=user_language)
+            
+            return result.title
+        except Exception as e:
+            logger.warning("Failed to generate report title with LLM, using fallback",
+                          error=str(e),
+                          original_query=original_query[:100])
+            # Fallback: use original query as title
+            return original_query[:100] if original_query else "Research Report"
+    
     def _extract_clarification_context(self, chat_history: list) -> str:
         """Extract clarification context from chat history.
 
@@ -478,7 +617,7 @@ Research completed with {len(findings)} findings from multiple agents covering v
             for f in findings
         ])
 
-    def _format_report(self, report: FinalReport, query: str) -> str:
+    async def _format_report(self, report: FinalReport, query: str, original_query: str, clarification_context: str, llm: Any, user_language: str) -> str:
         """Format report object as markdown.
 
         Args:
@@ -505,16 +644,32 @@ Research completed with {len(findings)} findings from multiple agents covering v
         if hasattr(report, "conclusion") and report.conclusion:
             sections_text.append(f"## Conclusion\n\n{report.conclusion}")
 
-        # Sources
-        if hasattr(report, "sources") and report.sources:
-            sources_text = "\n".join([f"- {source}" for source in report.sources])
-            sections_text.append(f"## Sources\n\n{sources_text}")
+        # CRITICAL: Do NOT add Sources section if draft_report already has sources in chapters
+        # Sources are already added to each chapter in draft_report by supervisor
+        # Adding Sources section here would duplicate sources that are already in chapters
+        # Only add Sources section if report was generated from scratch (not from draft_report)
+        # Check if draft_report was used - if so, skip Sources section (sources are in chapters)
+        # Note: This method is only called when draft_report is too short and LLM generates report
+        # In that case, if LLM includes sources in FinalReport.sources, we should NOT add them
+        # because they might duplicate sources from draft_report chapters
+        # Skip Sources section to avoid duplication
+        # if hasattr(report, "sources") and report.sources:
+        #     sources_text = "\n".join([f"- {source}" for source in report.sources])
+        #     sections_text.append(f"## Sources\n\n{sources_text}")
 
-        final_report = f"# Research Report: {query}\n\n" + "\n\n".join(sections_text)
+        # Generate report title
+        report_title = await self._generate_report_title(
+            original_query=original_query,
+            clarification_answers=clarification_context,
+            llm=llm,
+            user_language=user_language
+        )
+        
+        final_report = f"# {report_title}\n\n" + "\n\n".join(sections_text)
 
         return final_report
 
-    def _create_fallback_report(self, query: str, draft: str, findings: list) -> str:
+    async def _create_fallback_report(self, query: str, draft: str, findings: list, state: Dict[str, Any]) -> str:
         """Create fallback report when generation fails.
         
         CRITICAL: This function should use draft_report (written by supervisor) as the main content.
@@ -524,10 +679,21 @@ Research completed with {len(findings)} findings from multiple agents covering v
             query: Original query
             draft: Draft report content (should be draft_report.md written by supervisor)
             findings: Agent findings (used only for metadata, not content)
+            state: Research state (for user_language and clarification_answers)
 
         Returns:
             Fallback report
         """
+        # Generate report title
+        user_language = state.get("user_language", "English")
+        clarification_answers = state.get("clarification_answers", "")
+        report_title = await self._generate_report_title(
+            original_query=query,
+            clarification_answers=clarification_answers,
+            llm=self.deps.llm,
+            user_language=user_language
+        )
+        
         # CRITICAL: If draft is the actual draft_report.md (has chapters), use it directly
         # Don't wrap it in extra structure - supervisor already structured it
         if "## Chapter" in draft or "# Chapter" in draft:
@@ -535,10 +701,58 @@ Research completed with {len(findings)} findings from multiple agents covering v
             logger.info("Using structured draft_report as fallback (has chapters)",
                        draft_length=len(draft),
                        note="Supervisor wrote this, using it directly without modification")
-            return f"# Research Report: {query}\n\n{draft}\n\n---\n\n*Note: This report was generated from the draft report written by the supervisor throughout the research process.*"
+            
+            # CRITICAL: Remove duplicate Sources section at the end if present
+            # Sources are already in each chapter - any Sources section at the end is a duplicate
+            lines = draft.split('\n')
+            cleaned_lines = []
+            in_sources_section_at_end = False
+            sources_section_start = -1
+            
+            # Find last chapter line
+            last_chapter_line = -1
+            for i, line in enumerate(lines):
+                if line.startswith("## Chapter") or line.startswith("# Chapter"):
+                    last_chapter_line = i
+            
+            # Check if there's a "## Sources" section after the last chapter
+            if last_chapter_line >= 0:
+                for i in range(last_chapter_line + 1, len(lines)):
+                    if re.match(r'^##\s+Sources', lines[i], re.IGNORECASE):
+                        sources_section_start = i
+                        logger.warning("Found duplicate Sources section at end of draft in fallback (after chapters)",
+                                     line_number=i,
+                                     note="Sources are already in each chapter - this section will be removed to prevent duplication")
+                        break
+            
+            # Process lines: remove title and duplicate Sources section
+            for i, line in enumerate(lines):
+                # Skip first line if it's a title
+                if i == 0 and line.startswith("# ") and not line.startswith("## "):
+                    continue
+                
+                # Skip duplicate Sources section at the end
+                if sources_section_start >= 0 and i >= sources_section_start:
+                    if re.match(r'^##\s+Sources', line, re.IGNORECASE):
+                        in_sources_section_at_end = True
+                        logger.info("Skipping duplicate Sources section at end in fallback",
+                                   line_number=i,
+                                   note="Sources are already in each chapter - removing duplicate section")
+                        continue
+                    if in_sources_section_at_end:
+                        # Check if this is a new section
+                        if re.match(r'^##\s+', line) and not re.match(r'^##\s+Sources', line, re.IGNORECASE):
+                            in_sources_section_at_end = False
+                        else:
+                            continue
+                
+                cleaned_lines.append(line)
+            
+            content = '\n'.join(cleaned_lines)
+            return f"# {report_title}\n\n{content}\n\n---\n\n*Note: This report was generated from the draft report written by the supervisor throughout the research process.*"
         
         # Otherwise, format it as a report
-        return f"""# Research Report: {query}
+        return f"""# {report_title}
 
 ## Executive Summary
 

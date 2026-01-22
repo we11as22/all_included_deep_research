@@ -24,6 +24,9 @@ class AgentTodoItem:
     url: str | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     todo_id: str = field(default_factory=lambda: str(uuid4()))
+    supervisor_message: str | None = None  # Message from supervisor when task is returned for rework
+    return_count: int = 0  # Number of times this task was returned to progress (max 1)
+    additional_steps: int = 0  # Additional steps granted when task is continued (for step limit increase)
 
 
 @dataclass

@@ -73,34 +73,46 @@ def should_continue_research(state: ResearchState) -> str:
     
     CRITICAL: This function MUST eventually return "compress" to ensure report generation.
     Multiple safety checks prevent infinite loops.
+    CRITICAL: Before returning "compress", verify that NO agents are still working!
+    This prevents frontend from hanging when deep research "completes" but agents are still working.
     """
     iteration = state.get("iteration", 0)
     max_iterations = state.get("max_iterations", 25)
     should_continue = state.get("should_continue", True)
     replanning_needed = state.get("replanning_needed", False)
-    supervisor_call_count = state.get("supervisor_call_count", 0)
-    
-    # Get max_supervisor_calls from settings
-    try:
-        from src.config.settings import get_settings
-        settings = get_settings()
-        max_supervisor_calls = settings.deep_research_max_supervisor_calls
-    except:
-        max_supervisor_calls = 12  # Default fallback
 
-    # CRITICAL SAFETY CHECK 1: Stop if max iterations reached (hard limit)
+    # CRITICAL: Check if agents are still working BEFORE forcing compress
+    # This flag is set in execute_agents.py when agents have pending/in_progress tasks
+    # If agents are working, we MUST continue
+    # This prevents frontend from hanging when deep research "completes" but agents are still working
+    agents_still_working = state.get("_agents_still_working", False)
+    
+    # CRITICAL SAFETY CHECK: Stop if max iterations reached (hard limit)
+    # BUT ONLY if agents are not still working
     if iteration >= max_iterations:
+        if agents_still_working:
+            logger.warning(f"Max iterations reached ({iteration}/{max_iterations}) but agents still working - forcing continue",
+                         note="CRITICAL: Cannot finalize while agents are working - frontend would hang. Research will continue until all agents finish.")
+            return "continue"
         logger.warning(f"MANDATORY: Max iterations reached ({iteration}/{max_iterations}) - forcing compress to generate report")
         return "compress"
 
-    # CRITICAL SAFETY CHECK 2: Stop if supervisor call limit reached (hard limit)
-    if supervisor_call_count >= max_supervisor_calls:
-        logger.warning(f"MANDATORY: Supervisor call limit reached ({supervisor_call_count}/{max_supervisor_calls}) - forcing compress to generate report")
-        return "compress"
-
     # Replan if gaps identified (but only if limits not reached)
+    # CRITICAL: Prevent infinite replanning loops
+    # Track replan count to prevent excessive replanning
+    replan_count = state.get("replan_count", 0)
+    max_replans = 3  # Maximum replans allowed
+    
     if replanning_needed:
-        logger.info("Replanning needed")
+        if replan_count >= max_replans:
+            logger.warning(f"Replan limit reached ({replan_count}/{max_replans}) - forcing continue instead of replan to prevent infinite loop",
+                         iteration=iteration,
+                         note="Too many replans - continuing with current plan instead")
+            # Reset replanning_needed to prevent loop
+            state["replanning_needed"] = False
+            return "continue"  # Force continue instead of replan
+        logger.info("Replanning needed", replan_count=replan_count, max_replans=max_replans)
+        # Increment replan count in state (will be updated in next iteration)
         return "replan"
 
     # Continue if supervisor says so (but only if limits not reached)
@@ -299,12 +311,23 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
                        note="Using clarification_answers from session state, not chat_history")
             return "continue"
         
+        # CRITICAL: If clarification needed but not answered, wait
         if clarification_needed and clarification_just_sent:
             logger.info("🛑 Waiting for user clarification - interrupting graph")
             return "wait"
-        else:
-            logger.info("✅ Clarification answered or not needed - proceeding to analyze_query")
-            return "continue"
+        
+        # CRITICAL: Also check if clarification_needed but answers are missing
+        # This is a safety check in case clarification_just_sent was not set correctly
+        if clarification_needed and session_status == "waiting_clarification" and not clarification_answers:
+            logger.warning("🛑 Clarification needed but answers missing - waiting",
+                         clarification_needed=clarification_needed,
+                         session_status=session_status,
+                         has_clarification_answers=bool(clarification_answers),
+                         note="Safety check: clarification needed but no answers in state")
+            return "wait"
+        
+        logger.info("✅ Clarification answered or not needed - proceeding to analyze_query")
+        return "continue"
 
     workflow.add_conditional_edges(
         "clarify",
@@ -315,14 +338,51 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
         }
     )
     workflow.add_edge("analyze_query", "plan_research")
-    workflow.add_edge("plan_research", "spawn_agents")
+    
+    # CRITICAL: Conditional routing after plan_research
+    # If clarification needed but not answered, stop and wait
+    def should_stop_after_planning(state: ResearchState) -> str:
+        """Check if we should stop after planning (waiting for clarification).
+        
+        CRITICAL: This prevents creating research plan before user answers clarification questions.
+        """
+        planning_waiting = state.get("planning_waiting", False)
+        should_stop = state.get("should_stop", False)
+        
+        if planning_waiting or should_stop:
+            logger.warning("⏸️ Stopping after planning - waiting for clarification answers",
+                         planning_waiting=planning_waiting,
+                         should_stop=should_stop,
+                         note="Research plan should NOT be created before user answers clarification")
+            return "wait"
+        
+        return "continue"
+    
+    workflow.add_conditional_edges(
+        "plan_research",
+        should_stop_after_planning,
+        {
+            "wait": END,  # Stop and wait for user
+            "continue": "spawn_agents",  # Proceed with agent creation
+        }
+    )
     workflow.add_edge("spawn_agents", "execute_agents")
     workflow.add_edge("execute_agents", "supervisor_react")
 
     # Conditional routing from supervisor
+    # CRITICAL: Track replan count to prevent infinite loops
+    def should_continue_research_with_replan_tracking(state: ResearchState) -> str:
+        result = should_continue_research(state)
+        # Increment replan_count if replanning
+        if result == "replan":
+            current_count = state.get("replan_count", 0)
+            state["replan_count"] = current_count + 1
+            logger.info(f"Incremented replan_count to {current_count + 1}")
+        return result
+    
     workflow.add_conditional_edges(
         "supervisor_react",
-        should_continue_research,
+        should_continue_research_with_replan_tracking,
         {
             "continue": "execute_agents",  # More agent work
             "replan": "plan_research",  # New topics

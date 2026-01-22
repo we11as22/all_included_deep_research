@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card } from '@/components/ui/card';
 import { Plus, Trash2, MessageSquare } from 'lucide-react';
-import { listChats, createChat, deleteChat, deleteAllChats, type Chat, type Pagination } from '@/lib/api';
+import { listChats, createChat, deleteChat, deleteAllChats, type Chat, type Pagination, type ChatListResponse } from '@/lib/api';
 import { cn } from '@/lib/utils';
 
 interface ChatSidebarProps {
@@ -37,7 +37,17 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
       } else {
         setLoading(true);
       }
-      const response = await listChats({ limit: pageSize, offset });
+      
+      // CRITICAL: Add timeout to prevent hanging
+      const timeoutPromise = new Promise<ChatListResponse>((_, reject) => {
+        setTimeout(() => reject(new Error('Request timeout')), 10000); // 10 second timeout
+      });
+      
+      const response = await Promise.race([
+        listChats({ limit: pageSize, offset }),
+        timeoutPromise
+      ]) as ChatListResponse;
+      
       setChats((prevChats) => (append ? [...prevChats, ...response.chats] : response.chats));
       setPagination(response.pagination);
       if (!append) {
@@ -53,6 +63,8 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
       return response.chats;
     } catch (error) {
       console.error('Failed to load chats:', error);
+      // CRITICAL: Don't clear chats on error - keep cached data visible
+      // Only return empty array if we don't have cached data
       return [];
     } finally {
       setLoading(false);
@@ -61,6 +73,9 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
   };
 
   useEffect(() => {
+    let cancelled = false;
+    
+    // Load cached data first (non-blocking) - show immediately
     try {
       const cached = localStorage.getItem(cacheKey);
       if (cached) {
@@ -70,13 +85,46 @@ export function ChatSidebar({ currentChatId, onChatSelect, onNewChat, refreshTri
           if (parsed.pagination) {
             setPagination(parsed.pagination);
           }
-          setLoading(false);
+          setLoading(false); // Show cached data immediately
         }
       }
     } catch (error) {
       console.warn('Failed to read chat list cache:', error);
     }
-    loadChats();
+    
+    // Load chats from API in background (non-blocking)
+    // CRITICAL: Don't block rendering - load in background
+    (async () => {
+      try {
+        // Add timeout to prevent hanging
+        const timeoutPromise = new Promise<Chat[]>((resolve) => {
+          setTimeout(() => {
+            if (!cancelled) {
+              console.warn('Chat list loading timeout - using cached data');
+              resolve([]);
+            }
+          }, 10000); // 10 second timeout
+        });
+        
+        const chatsPromise = loadChats();
+        const result = await Promise.race([chatsPromise, timeoutPromise]);
+        
+        if (!cancelled && result && result.length > 0) {
+          setChats(result);
+        }
+      } catch (error) {
+        console.error('Failed to load chats:', error);
+        // Keep cached data visible on error
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    })();
+    
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   // Refresh chat list when refreshTrigger changes (e.g., after title generation)

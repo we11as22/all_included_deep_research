@@ -250,35 +250,64 @@ class SessionManager:
 
         Args:
             session_id: Session identifier
-            result: Deep search result text
+            result: Deep search result text (must not be None)
         """
-        async with self.session_factory() as session:
-            # CRITICAL: Save result and commit immediately
-            await session.execute(
-                update(ResearchSessionModel)
-                .where(ResearchSessionModel.id == session_id)
-                .values(deep_search_result=result, updated_at=datetime.now())
-            )
-            await session.commit()
-            
-            # CRITICAL: Verify that result was saved by reading it back in a NEW transaction
-            # This ensures the save was successful and visible to other transactions
-            async with self.session_factory() as verify_session:
-                verification = await verify_session.execute(
-                    select(ResearchSessionModel.deep_search_result)
-                    .where(ResearchSessionModel.id == session_id)
+        # CRITICAL: Ensure result is not None - convert None to empty string
+        if result is None:
+            logger.warning("save_deep_search_result: result is None, converting to empty string",
+                         session_id=session_id)
+            result = ""
+        
+        try:
+            async with self.session_factory() as session:
+                # CRITICAL: Check if session exists before updating
+                existing_session = await session.execute(
+                    select(ResearchSessionModel).where(ResearchSessionModel.id == session_id)
                 )
-                verified_result = verification.scalar_one_or_none()
-                if verified_result:
-                    logger.warning("✅ save_deep_search_result: Result saved and VERIFIED in separate transaction",
-                                 session_id=session_id,
-                                 result_length=len(result),
-                                 verified_length=len(verified_result),
-                                 note="CRITICAL: Result is now in DB and visible to other transactions. This prevents double execution.")
-                else:
-                    logger.error("❌ save_deep_search_result: Result NOT found after save!",
+                session_obj = existing_session.scalar_one_or_none()
+                
+                if not session_obj:
+                    logger.error("❌ save_deep_search_result: Session not found in DB",
                                session_id=session_id,
-                               note="CRITICAL ERROR: Save may have failed or transaction not committed properly")
+                               note="Cannot save deep_search_result - session does not exist")
+                    return
+                
+                # CRITICAL: Save result and commit immediately
+                session_obj.deep_search_result = result
+                session_obj.updated_at = datetime.now()
+                await session.commit()
+                
+                logger.info("✅ save_deep_search_result: Result saved to DB",
+                           session_id=session_id,
+                           result_length=len(result) if result else 0,
+                           note="Result saved and committed")
+                
+                # CRITICAL: Verify that result was saved by reading it back in a NEW transaction
+                # This ensures the save was successful and visible to other transactions
+                async with self.session_factory() as verify_session:
+                    verification = await verify_session.execute(
+                        select(ResearchSessionModel.deep_search_result)
+                        .where(ResearchSessionModel.id == session_id)
+                    )
+                    verified_result = verification.scalar_one_or_none()
+                    if verified_result is not None:  # Allow empty string, but not None
+                        logger.info("✅ save_deep_search_result: Result saved and VERIFIED in separate transaction",
+                                 session_id=session_id,
+                                 result_length=len(result) if result else 0,
+                                 verified_length=len(verified_result) if verified_result else 0,
+                                 note="CRITICAL: Result is now in DB and visible to other transactions. This prevents double execution.")
+                    else:
+                        logger.error("❌ save_deep_search_result: Result NOT found after save!",
+                                   session_id=session_id,
+                                   note="CRITICAL ERROR: Save may have failed or transaction not committed properly")
+        except Exception as e:
+            logger.error("❌ save_deep_search_result: Exception during save",
+                       session_id=session_id,
+                       error=str(e),
+                       error_type=type(e).__name__,
+                       exc_info=True,
+                       note="CRITICAL ERROR: Failed to save deep_search_result to DB")
+            raise
 
     async def save_clarification_answers(
         self, session_id: str, answers: str

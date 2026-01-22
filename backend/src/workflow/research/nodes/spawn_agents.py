@@ -144,12 +144,13 @@ Research Topics:
 {chr(10).join([f"- {t.get('topic')}: {t.get('description')}" for t in research_topics])}
 
 **CRITICAL: REASONING REQUIREMENT - Before creating agents, document your thinking in the reasoning field:**
-1. **Original Query Analysis**: What is the user asking for? What is the core topic?
+1. **Original Query Analysis**: What is the user asking for? What is the core topic? What aspects need to be covered?
 2. **Deep Search Context**: What did the initial deep search reveal? What key aspects were found?
 3. **Clarification Answers**: If clarification was provided, what did the user specify? How does it refine the original query?
 4. **Research Topics Integration**: How do the research topics relate to the original query and deep search context?
-5. **Agent Team Strategy**: Why this specific team composition? How will each agent contribute unique insights?
-6. **Task Distribution**: How will tasks be distributed to ensure comprehensive coverage without overlap?
+5. **Coverage Verification**: Do the research topics together provide COMPLETE coverage of the query? What aspects are covered? Are there any gaps?
+6. **Agent Team Strategy**: Why this specific team composition? How will each agent contribute unique insights?
+7. **Task Distribution Strategy**: How should tasks be distributed among agents to ensure comprehensive coverage? Which topics should each agent handle? How will tasks ensure complete coverage without gaps?
 
 **For each agent's reasoning field, document:**
 1. Why this specific agent role is needed for this research
@@ -170,16 +171,20 @@ Requirements:
 - Each task must be specific and include the query in the objective
 - Tasks must be self-contained (agents only see their task description, not the full query)
 
-Task Creation Guidelines:
+Task Creation Guidelines - CRITICAL FOR COMPREHENSIVE COVERAGE:
 - Every task objective MUST include the original user query
 - Every task MUST be specific to the user's query - not generic
 - Task format: Start each task objective with "The user asked: '[query]'. Research [specific aspect related to query]..."
+- **MANDATORY**: Tasks must collectively ensure COMPLETE coverage of the query
+- Each task should address a specific aspect that is ESSENTIAL for answering the query
+- Think systematically: what questions need to be answered? What aspects must be covered?
 - If clarification answers are provided, interpret them IN THE CONTEXT of the original query
   * Clarification specifies WHAT ASPECT of the original topic to focus on, NOT a new topic
   * Include clarification answers in task descriptions, but ALWAYS in context of original query
-- Do NOT create generic tasks - be SPECIFIC
+- Do NOT create generic tasks - be SPECIFIC and ensure each task contributes unique value
 - Do NOT interpret clarification as a standalone query - it's ALWAYS about the original query topic
 - Each task must be self-contained - the agent will NOT see the original query, only the task description
+- **CRITICAL**: Before finalizing tasks, verify: "Do these tasks together fully answer the query?"
 
 For each agent, create:
 1. Unique role (e.g., "Aviation Historian", "Technical Analyst", "Case Study Researcher")
@@ -354,6 +359,8 @@ If any answer is NO, adjust your response!
                         topic_desc = topic.get('description', '')
 
                         fallback_agent = AgentCharacteristic(
+                            reasoning=f"Research Specialist {agent_num} needed to cover {topic_name} from research plan",
+                            agent_id=f"agent_{agent_num}",
                             role=f"Research Specialist {agent_num}",
                             expertise=topic_name,
                             personality="Thorough, analytical, detail-oriented",
@@ -387,6 +394,8 @@ If any answer is NO, adjust your response!
                     else:
                         # If we ran out of topics, create a generic research agent with multiple tasks
                         fallback_agent = AgentCharacteristic(
+                            reasoning=f"General Research Agent {agent_num} needed for additional research coverage",
+                            agent_id=f"agent_{agent_num}",
                             role=f"General Research Agent {agent_num}",
                             expertise=f"General research and analysis",
                             personality="Thorough, analytical, detail-oriented",

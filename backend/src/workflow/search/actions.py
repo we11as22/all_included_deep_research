@@ -228,6 +228,20 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
         for url in urls[:3]:
             stream.emit_status(f"Scraping: {url[:50]}...", step="scrape")
 
+    # CRITICAL: Get task context from context if available (for focused summarization)
+    task_title = context.get("task_title", "")
+    task_objective = context.get("task_objective", "")
+    task_note = context.get("task_note", "")
+    
+    # Build task context for LLM
+    task_context = ""
+    if task_title or task_objective:
+        task_context = f"Research task: {task_title}\n"
+        if task_objective:
+            task_context += f"Objective: {task_objective}\n"
+        if task_note:
+            task_context += f"Guidance: {task_note}\n"
+    
     # Scrape and summarize in parallel
     async def scrape_and_summarize(url: str) -> dict:
         try:
@@ -257,50 +271,112 @@ async def scrape_url_handler(args: dict[str, Any], context: dict[str, Any]) -> d
                 content_to_summarize = full_content
                 logger.debug(f"Using plain text content for summarization", url=url, content_length=len(full_content))
 
-            # Step 2: Summarize content in parallel with other URLs
+            # Step 2: Use LLM to analyze content with focus on task
             summary = ""
+            brief_info = ""
+            reasoning = ""
+            is_relevant = False
+            
             if llm and content_to_summarize:
                 try:
                     if stream:
-                        stream.emit_status(f"Summarizing: {title[:40]}...", step="summarize")
+                        stream.emit_status(f"Analyzing: {title[:40]}...", step="analyze")
 
-                    # CRITICAL: Log max_tokens to verify it's correct
-                    max_tokens_value = None
-                    if hasattr(llm, "max_tokens"):
-                        max_tokens_value = llm.max_tokens
-                    logger.debug(
-                        "Scraping and summarizing URL",
-                        url=url,
-                        content_length=len(content_to_summarize),
-                        llm_max_tokens=max_tokens_value,
-                        summary_target_tokens=4096,
-                        using_markdown=hasattr(content, "markdown") and content.markdown is not None,
-                    )
+                    # CRITICAL: Use structured output to get summary, brief_info, and is_relevant
+                    from src.models.schemas import ScrapedPageAnalysis
+                    
+                    # Build prompt with task context - CRITICAL: Include full task description
+                    analysis_prompt = f"""Analyze the following web page content and create a comprehensive summary focused on the research task.
 
-                    summary = await summarize_text_llm(
-                        content_to_summarize,
-                        max_tokens=4096,  # Comprehensive summary (increased) - this is target summary length, not LLM max_tokens
-                        llm=llm
-                    )
-                    logger.debug(f"Content summarized: {url}", summary_length=len(summary))
+**RESEARCH TASK CONTEXT:**
+{task_context if task_context else "No specific task context provided - analyze the content generally."}
+
+**Page Title:** {title}
+**Page URL:** {url}
+
+**Page Content:**
+{content_to_summarize[:12000]}  # Limit input to avoid context overflow
+
+**Instructions:**
+1. **Reasoning**: First, explain your reasoning about the page content - what information you found, how it relates to the research task (shown above), and why you made decisions about summary and relevance.
+2. **Summary**: Create a comprehensive summary (2000-4000 tokens) that focuses on information relevant to the research task. Include all facts, data, insights, and details that could be useful for findings.
+3. **Brief Info**: Create a brief 2-3 sentence description (max 200 chars) of what information is on this page.
+4. **Relevance**: Determine if this page is relevant to the research task (True) or not (False).
+
+**CRITICAL:** 
+- The summary will be used to create detailed findings, so make it comprehensive and focused on the task.
+- Consider the research task context (title, objective, guidance) when analyzing the page.
+- Your reasoning should explain how the page content relates to the task objectives."""
+                    
+                    analysis_result = await llm.with_structured_output(
+                        ScrapedPageAnalysis,
+                        method="json_schema"
+                    ).ainvoke([
+                        {"role": "system", "content": "You are an expert at analyzing web content and creating focused summaries for research tasks."},
+                        {"role": "user", "content": analysis_prompt}
+                    ])
+                    
+                    # CRITICAL: Check if analysis_result is None before accessing attributes
+                    if analysis_result is None:
+                        raise ValueError("LLM returned None for page analysis")
+                    
+                    # CRITICAL: Check if attributes exist and are not None
+                    reasoning = getattr(analysis_result, 'reasoning', None) or ""
+                    summary = getattr(analysis_result, 'summary', None) or ""
+                    brief_info = getattr(analysis_result, 'brief_info', None) or ""
+                    is_relevant = getattr(analysis_result, 'is_relevant', True)
+                    
+                    # Ensure all required fields have valid values
+                    if not summary:
+                        raise ValueError("LLM analysis returned empty summary")
+                    
+                    logger.debug(f"Page analyzed with reasoning: {url}", 
+                               reasoning_length=len(reasoning) if reasoning else 0,
+                               summary_length=len(summary) if summary else 0,
+                               brief_info_length=len(brief_info) if brief_info else 0,
+                               is_relevant=is_relevant)
+                    
+                    logger.debug(f"Page analyzed: {url}", 
+                               summary_length=len(summary) if summary else 0,
+                               brief_info_length=len(brief_info) if brief_info else 0,
+                               is_relevant=is_relevant)
+                               
                 except Exception as e:
-                    logger.warning(f"Summarization failed: {url}", error=str(e))
-                    # Fallback to smart truncation (not hard cut)
-                    from src.utils.text import summarize_text
-                    summary = summarize_text(content_to_summarize, 3200) if content_to_summarize else ""  # ~800 tokens
+                    logger.warning(f"LLM analysis failed: {url}", error=str(e))
+                    # Fallback to simple summarization
+                    try:
+                        summary = await summarize_text_llm(
+                            content_to_summarize,
+                            max_tokens=3000,
+                            llm=llm
+                        )
+                        brief_info = f"Page about {title[:100]}" if title else "Web page content"
+                        is_relevant = True  # Default to relevant if analysis fails
+                    except:
+                        from src.utils.text import summarize_text
+                        summary = summarize_text(content_to_summarize, 3200) if content_to_summarize else ""
+                        brief_info = f"Page about {title[:100]}" if title else "Web page content"
+                        is_relevant = True
 
             # If no summary and no LLM, use smart truncation
             if not summary and content_to_summarize:
                 from src.utils.text import summarize_text
                 summary = summarize_text(content_to_summarize, 3200)
+                brief_info = f"Page about {title[:100]}" if title else "Web page content"
+                is_relevant = True
 
-            logger.debug(f"URL scraped and summarized: {url}", summary_length=len(summary))
+            logger.debug(f"URL scraped and analyzed: {url}", 
+                        summary_length=len(summary),
+                        brief_info=brief_info[:50],
+                        is_relevant=is_relevant)
 
-            # Return only url, title, summary (summary from markdown if available, otherwise from content)
+            # Return url, title, summary (for findings), brief_info (for history), is_relevant (for history)
             return {
                 "url": url,
                 "title": title,
-                "summary": summary,  # Summary from markdown (if available) or content
+                "summary": summary,  # Comprehensive summary for findings creation
+                "brief_info": brief_info,  # Brief info for tool history (to save context)
+                "is_relevant": is_relevant,  # Whether page is relevant to task (for tool history)
             }
 
         except Exception as e:
@@ -371,8 +447,317 @@ async def reasoning_preamble_handler(args: dict[str, Any], context: dict[str, An
     return {"reasoning": reasoning}
 
 
+async def create_finding_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
+    """Create a comprehensive finding using LLM from scraped page summaries and search snippets.
+    
+    This tool automatically generates a detailed finding from all collected information:
+    - Summary from scraped pages (if is_relevant=True)
+    - Snippets from web_search results (with substantial content >50 chars)
+    
+    The LLM synthesizes all this information into a comprehensive finding focused on the research task.
+    This is the RESULTING tool - it should be called when research is complete to generate the final finding.
+    """
+    from src.models.schemas import FindingContent
+    
+    agent_id = context.get("agent_id", "researcher")
+    llm = context.get("llm")
+    stream = context.get("stream")
+    
+    # Get task context
+    task_title = context.get("task_title", "")
+    task_objective = context.get("task_objective", "")
+    task_note = context.get("task_note", "")
+    
+    # Get scraped_pages and sources from context (passed by researcher)
+    scraped_pages = context.get("scraped_pages", [])
+    sources = context.get("sources", [])
+    
+    if not llm:
+        return {"error": "LLM not available"}
+    
+    try:
+        # Collect relevant data
+        relevant_scraped_summaries = []
+        for page in scraped_pages:
+            if page.get("is_relevant", True) and page.get("summary"):
+                relevant_scraped_summaries.append({
+                    "url": page.get("url", ""),
+                    "title": page.get("title", ""),
+                    "summary": page.get("summary", "")
+                })
+        
+        # Collect useful snippets (>50 chars, not metadata)
+        useful_snippets = []
+        for src in sources:
+            snippet = src.get("snippet", "").strip()
+            if snippet and len(snippet) > 50:
+                snippet_lower = snippet.lower()
+                is_metadata = any([
+                    "found" in snippet_lower and "sources" in snippet_lower and "query" in snippet_lower,
+                    snippet_lower.startswith("search:") or snippet_lower.startswith("query:"),
+                    snippet_lower.count("http") > 2,
+                ])
+                if not is_metadata:
+                    useful_snippets.append({
+                        "title": src.get("title", ""),
+                        "url": src.get("url", ""),
+                        "snippet": snippet
+                    })
+        
+        # Build prompt for LLM
+        task_context = f"Research Task: {task_title}\n"
+        if task_objective:
+            task_context += f"Objective: {task_objective}\n"
+        if task_note:
+            task_context += f"Guidance: {task_note}\n"
+        
+        scraped_summaries_text = ""
+        if relevant_scraped_summaries:
+            scraped_summaries_text = "\n\n".join([
+                f"## {page['title']} ({page['url']})\n\n{page['summary']}"
+                for page in relevant_scraped_summaries
+            ])
+        
+        snippets_text = ""
+        if useful_snippets:
+            # CRITICAL: Use more snippets if available - finding should be comprehensive
+            # Increase limit from 20 to 40 to use more information
+            snippets_text = "\n\n".join([
+                f"**{s['title']}** ({s['url']}): {s['snippet']}"
+                for s in useful_snippets[:40]
+            ])
+        
+        # Count total information available
+        total_scraped_pages = len(relevant_scraped_summaries)
+        total_snippets = len(useful_snippets)
+        total_info_sources = total_scraped_pages + total_snippets
+        
+        finding_prompt = f"""Create a comprehensive, detailed finding based on the research task and collected information.
+
+{task_context}
+
+**Scraped Page Summaries (comprehensive summaries of relevant pages):**
+{scraped_summaries_text if scraped_summaries_text else "No scraped pages available."}
+
+**Web Search Results (snippets from pages not scraped):**
+{snippets_text if snippets_text else "No search snippets available."}
+
+**CRITICAL INSTRUCTIONS - USE ALL AVAILABLE INFORMATION:**
+You have access to {total_scraped_pages} scraped page summaries and {total_snippets} search result snippets (total: {total_info_sources} information sources).
+
+1. **COMPREHENSIVE SUMMARY (2000-4000 words minimum):**
+   - Synthesize ALL information from ALL {total_info_sources} sources - do NOT skip any relevant information
+   - Include ALL relevant facts, data, insights, comparisons, statistics, examples, and context from scraped summaries AND search snippets
+   - Use ALL available information - the user has collected extensive data, so your finding should reflect that depth
+   - If you have many sources ({total_info_sources} sources), your summary MUST be proportionally longer and more detailed
+   - Include specific details, numbers, dates, names, technical terms, and concrete examples from the sources
+
+2. **STRUCTURE AND FORMATTING:**
+   - Use proper markdown formatting with sections (##), subsections (###), lists, bold, and links
+   - Organize information logically by themes or topics
+   - Include subsections for different aspects covered in the sources
+   - Use bullet points and numbered lists for clarity
+
+3. **KEY FINDINGS (10-20 items):**
+   - Extract 10-20 key findings - specific facts, insights, data points, or conclusions
+   - Each finding should be substantial and informative
+   - Include findings from BOTH scraped pages AND search snippets
+   - Prioritize unique or important information from each source
+
+4. **COMPLETENESS:**
+   - The finding must be self-contained and comprehensive enough to stand alone
+   - Include ALL relevant information from the sources - do not summarize too briefly
+   - If sources contain detailed information, your finding should reflect that detail
+   - The more sources you have, the more comprehensive your finding should be
+
+**CRITICAL:** 
+- You have {total_info_sources} information sources available - your finding MUST use information from ALL of them
+- The finding will be used by supervisor to create a chapter in the draft report
+- If you have extensive information ({total_info_sources} sources), create an extensive finding (2000-4000+ words)
+- Do NOT create a brief summary when you have detailed information available - USE ALL THE INFORMATION!"""
+        
+        finding_result = await llm.with_structured_output(
+            FindingContent,
+            method="json_schema"
+        ).ainvoke([
+            {"role": "system", "content": "You are an expert at synthesizing research findings into comprehensive, detailed summaries."},
+            {"role": "user", "content": finding_prompt}
+        ])
+        
+        logger.info(f"Agent {agent_id} created finding via create_finding tool",
+                   summary_length=len(finding_result.summary),
+                   key_findings_count=len(finding_result.key_findings),
+                   scraped_pages_used=len(relevant_scraped_summaries),
+                   snippets_used=len(useful_snippets))
+        
+        return {
+            "success": True,
+            "summary": finding_result.summary,
+            "key_findings": finding_result.key_findings,
+            "scraped_pages_count": len(relevant_scraped_summaries),
+            "snippets_count": len(useful_snippets),
+            "note": "Finding created successfully. This will be used as the final result."
+        }
+    except Exception as e:
+        logger.error(f"Agent {agent_id} failed to create finding", error=str(e))
+        return {"error": f"Failed to create finding: {str(e)}"}
+
+
+async def create_note_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
+    """Create a comprehensive note using LLM from scraped page summaries and search snippets.
+    
+    This tool automatically generates a detailed note from all collected information:
+    - Summary from scraped pages (if is_relevant=True)
+    - Snippets from web_search results (with substantial content >50 chars)
+    
+    The LLM synthesizes all this information into a comprehensive note focused on the research task.
+    """
+    from src.models.agent_models import AgentNote
+    from src.models.schemas import NoteContent
+    
+    agent_id = context.get("agent_id", "researcher")
+    llm = context.get("llm")
+    agent_memory_service = context.get("agent_memory_service")
+    agent_file_service = context.get("agent_file_service")
+    research_memory_service = context.get("research_memory_service")
+    session_id = context.get("session_id")
+    stream = context.get("stream")
+    
+    # Get task context
+    task_title = context.get("task_title", "")
+    task_objective = context.get("task_objective", "")
+    task_note = context.get("task_note", "")
+    
+    # Get scraped_pages and sources from context (passed by researcher)
+    scraped_pages = context.get("scraped_pages", [])
+    sources = context.get("sources", [])
+    
+    if not agent_memory_service or not llm:
+        return {"error": "Agent memory service or LLM not available"}
+    
+    try:
+        # Collect relevant data
+        relevant_scraped_summaries = []
+        for page in scraped_pages:
+            if page.get("is_relevant", True) and page.get("summary"):
+                relevant_scraped_summaries.append({
+                    "url": page.get("url", ""),
+                    "title": page.get("title", ""),
+                    "summary": page.get("summary", "")
+                })
+        
+        # Collect useful snippets (>50 chars, not metadata)
+        useful_snippets = []
+        for src in sources:
+            snippet = src.get("snippet", "").strip()
+            if snippet and len(snippet) > 50:
+                snippet_lower = snippet.lower()
+                is_metadata = any([
+                    "found" in snippet_lower and "sources" in snippet_lower and "query" in snippet_lower,
+                    snippet_lower.startswith("search:") or snippet_lower.startswith("query:"),
+                    snippet_lower.count("http") > 2,
+                ])
+                if not is_metadata:
+                    useful_snippets.append({
+                        "title": src.get("title", ""),
+                        "url": src.get("url", ""),
+                        "snippet": snippet
+                    })
+        
+        # Build prompt for LLM
+        task_context = f"Research Task: {task_title}\n"
+        if task_objective:
+            task_context += f"Objective: {task_objective}\n"
+        if task_note:
+            task_context += f"Guidance: {task_note}\n"
+        
+        scraped_summaries_text = ""
+        if relevant_scraped_summaries:
+            scraped_summaries_text = "\n\n".join([
+                f"## {page['title']} ({page['url']})\n\n{page['summary']}"
+                for page in relevant_scraped_summaries
+            ])
+        
+        snippets_text = ""
+        if useful_snippets:
+            snippets_text = "\n\n".join([
+                f"**{s['title']}** ({s['url']}): {s['snippet']}"
+                for s in useful_snippets[:15]
+            ])
+        
+        note_prompt = f"""Create a comprehensive research note based on the research task and collected information.
+
+{task_context}
+
+**Scraped Page Summaries:**
+{scraped_summaries_text if scraped_summaries_text else "No scraped pages available."}
+
+**Web Search Results (snippets):**
+{snippets_text if snippets_text else "No search snippets available."}
+
+**Instructions:**
+1. Create a concise, descriptive title (max 100 chars) for the note.
+2. Create comprehensive note content (500-2000 words) that synthesizes ALL information.
+3. Focus on the research task and include all relevant facts, insights, and context.
+4. Make the note detailed and informative.
+
+**CRITICAL:** The note will be stored for vector search and used by other agents, so make it comprehensive!"""
+        
+        note_result = await llm.with_structured_output(
+            NoteContent,
+            method="json_schema"
+        ).ainvoke([
+            {"role": "system", "content": "You are an expert at creating comprehensive research notes from multiple sources."},
+            {"role": "user", "content": note_prompt}
+        ])
+        
+        # Save the note
+        note = AgentNote(
+            title=note_result.title,
+            summary=note_result.summary,
+            urls=[page.get("url") for page in relevant_scraped_summaries[:5] if page.get("url")],
+            tags=["research_note"]
+        )
+        
+        file_path = await agent_memory_service.save_agent_note(
+            note,
+            agent_id,
+            agent_file_service=agent_file_service,
+            research_memory_service=research_memory_service,
+            session_id=session_id
+        )
+        
+        if stream:
+            stream.emit_agent_note(agent_id, {
+                "title": note.title,
+                "summary": note.summary,
+                "urls": note.urls,
+                "shared": True
+            })
+        
+        logger.info(f"Agent {agent_id} created note via create_note tool",
+                   title=note.title[:100],
+                   summary_length=len(note.summary),
+                   scraped_pages_used=len(relevant_scraped_summaries),
+                   snippets_used=len(useful_snippets))
+        
+        return {
+            "success": True,
+            "file_path": file_path,
+            "title": note.title,
+            "summary_length": len(note.summary),
+            "note": "Note created and saved successfully. It will be available for vector search."
+        }
+    except Exception as e:
+        logger.error(f"Agent {agent_id} failed to create note", error=str(e))
+        return {"error": f"Failed to create note: {str(e)}"}
+
+
 async def save_note_handler(args: dict[str, Any], context: dict[str, Any]) -> dict:
     """Save a research note with title, summary, and optional URLs.
+    
+    **DEPRECATED**: Use create_note instead, which automatically generates comprehensive notes from collected data.
+    This handler is kept for backward compatibility.
     
     Use this tool to save important findings, discoveries, insights, or information
     that you've gathered during research. Notes are stored with vector search
@@ -531,18 +916,35 @@ Return the selected URLs and your reasoning."""
             HumanMessage(content=prompt)
         ])
         
-        selected_urls = result.selected_urls[:max_urls]  # Limit to max_urls
+        # CRITICAL: Check if result is None before accessing attributes
+        if result is None:
+            raise ValueError("LLM returned None for URL selection")
+        
+        # CRITICAL: Check if selected_urls exists and is not None
+        selected_urls_list = getattr(result, 'selected_urls', None)
+        if selected_urls_list is None:
+            selected_urls_list = []
+        elif not isinstance(selected_urls_list, list):
+            # If it's not a list, try to convert or use empty list
+            try:
+                selected_urls_list = list(selected_urls_list) if selected_urls_list else []
+            except (TypeError, ValueError):
+                selected_urls_list = []
+        
+        selected_urls = selected_urls_list[:max_urls] if selected_urls_list else []  # Limit to max_urls
+        reasoning = getattr(result, 'reasoning', '') or 'URLs selected based on relevance to query'
+        
         logger.info(f"URL selection completed", 
                    selected_count=len(selected_urls),
                    total_results=len(search_results),
-                   reasoning=result.reasoning[:200])
+                   reasoning=reasoning[:200] if reasoning else "No reasoning provided")
         
         if stream:
             stream.emit_status(f"Selected {len(selected_urls)} URLs for scraping", step="analyze")
         
         return {
             "selected_urls": selected_urls,
-            "reasoning": result.reasoning
+            "reasoning": reasoning
         }
     except Exception as e:
         logger.error(f"URL selection failed", error=str(e), exc_info=True)
@@ -717,53 +1119,89 @@ def register_actions():
         handler=done_handler,
     )
 
-    # Save Note (for deep research mode)
+    # Create Finding (for deep research mode) - RESULTING tool for task completion
     ActionRegistry.register(
-        name="save_note",
-        description="Save an important research note with title, detailed summary, and optional URLs. "
-        "**WHEN TO USE**: Use this when you discover SUBSTANTIAL, ACTIONABLE INFORMATION during research. "
-        "**WHAT TO SAVE**: Key discoveries, important facts, significant insights, technical details, "
-        "expert opinions, historical context, real-world examples, comparative analysis, or patterns/trends. "
-        "**WHAT NOT TO SAVE**: Never save routine notes like 'Found X sources', 'Search: query', "
-        "lists of URLs without context, or generic summaries without specific facts. "
-        "**QUALITY REQUIREMENTS**: Notes MUST be LARGE and DETAILED (minimum 200-500 words) with full context, "
-        "specific facts, data points, numbers, dates, analysis, explanations, and source URLs. "
-        "**COORDINATION**: Consider other agents' active tasks (shown in your context) - if your finding relates "
-        "to their research topics, make your note comprehensive so they can find it via vector search. "
-        "**STORAGE**: Notes are stored with vector search and can be retrieved by you and other agents for future reference.",
+        name="create_finding",
+        description="Create a comprehensive research finding automatically from all collected information. "
+        "**RESULTING TOOL**: This is the final tool you should call when research is complete. "
+        "**AUTOMATIC**: This tool uses LLM to synthesize information from scraped page summaries and search snippets into a detailed finding. "
+        "**WHEN TO CALL**: Call this when you have completed your research and want to generate the final finding. "
+        "**WHAT IT DOES**: Automatically generates comprehensive summary (1500-3000 words) and key findings from all relevant scraped summaries and search snippets. "
+        "**NO PARAMETERS NEEDED**: The tool automatically uses all collected data from your research session. "
+        "**CRITICAL**: If you don't call this tool, it will be called automatically when you reach max_steps or call done(). "
+        "**PREFERRED**: It's better to call this explicitly when you feel research is complete.",
         args_schema={
             "type": "object",
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "Clear, descriptive title for the note (e.g., 'Key Finding: X', 'Discovery: Y', 'Technical Analysis: Z'). "
-                    "Make it searchable and informative.",
-                },
-                "summary": {
-                    "type": "string",
-                    "description": "Detailed summary of the finding (MINIMUM 200-500 words - this is CRITICAL). "
-                    "Include: specific facts, data, numbers, dates, concrete information, full context (what, why, when, where, how), "
-                    "detailed explanations (not just brief summaries), analysis/interpretation/synthesis, multiple related facts together, "
-                    "relationships between different pieces of information, quotes/statistics/examples from sources, "
-                    "clear explanation of WHY this information is important, and how it relates to the research objective. "
-                    "Write it so other agents can find and understand it via vector search.",
-                },
-                "urls": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "List of source URLs related to this note. Include ALL relevant sources that support your findings.",
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional list of tags for categorizing the note (e.g., 'technical', 'historical', 'expert_opinion', 'case_study').",
-                },
-            },
-            "required": ["title", "summary"],
+            "properties": {},
+            "required": [],
         },
-        handler=save_note_handler,
+        handler=create_finding_handler,
         enabled_condition=lambda ctx: ctx.get("mode") in ["quality"],  # Only for deep research
     )
+    
+    # Create Note (for deep research mode) - automatically generates comprehensive note from collected data
+    ActionRegistry.register(
+        name="create_note",
+        description="Create a comprehensive research note automatically from all collected information. "
+        "**AUTOMATIC**: This tool uses LLM to synthesize information from scraped page summaries and search snippets into a detailed note. "
+        "**WHEN TO USE**: Call this when you have collected enough information (scraped pages and search results) and want to save a comprehensive note. "
+        "**WHAT IT DOES**: Automatically generates title and detailed content (500-2000 words) from all relevant scraped summaries and search snippets. "
+        "**NO PARAMETERS NEEDED**: The tool automatically uses all collected data from your research session. "
+        "**CRITICAL**: This is the preferred way to create notes - it ensures comprehensive, well-structured notes from all your research.",
+        args_schema={
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+        handler=create_note_handler,
+        enabled_condition=lambda ctx: ctx.get("mode") in ["quality"],  # Only for deep research
+    )
+    
+    # Save Note (for deep research mode) - REMOVED, use create_note instead
+    # ActionRegistry.register(
+    #     name="save_note",
+    #     description="Save an important research note with title, detailed summary, and optional URLs. "
+    #     "**DEPRECATED**: Prefer create_note which automatically generates comprehensive notes from collected data. "
+    #     "**WHEN TO USE**: Only use this if you need to manually specify note content. "
+    #     "**WHAT TO SAVE**: Key discoveries, important facts, significant insights, technical details, "
+    #     "expert opinions, historical context, real-world examples, comparative analysis, or patterns/trends. "
+    #     "**WHAT NOT TO SAVE**: Never save routine notes like 'Found X sources', 'Search: query', "
+    #     "lists of URLs without context, or generic summaries without specific facts. "
+    #     "**QUALITY REQUIREMENTS**: Notes MUST be LARGE and DETAILED (minimum 200-500 words) with full context, "
+    #     "specific facts, data points, numbers, dates, analysis, explanations, and source URLs.",
+    #     args_schema={
+    #         "type": "object",
+    #         "properties": {
+    #             "title": {
+    #                 "type": "string",
+    #                 "description": "Clear, descriptive title for the note (e.g., 'Key Finding: X', 'Discovery: Y', 'Technical Analysis: Z'). "
+    #                 "Make it searchable and informative.",
+    #             },
+    #             "summary": {
+    #                 "type": "string",
+    #                 "description": "Detailed summary of the finding (MINIMUM 200-500 words - this is CRITICAL). "
+    #                 "Include: specific facts, data, numbers, dates, concrete information, full context (what, why, when, where, how), "
+    #                 "detailed explanations (not just brief summaries), analysis/interpretation/synthesis, multiple related facts together, "
+    #                 "relationships between different pieces of information, quotes/statistics/examples from sources, "
+    #                 "clear explanation of WHY this information is important, and how it relates to the research objective. "
+    #                 "Write it so other agents can find and understand it via vector search.",
+    #             },
+    #             "urls": {
+    #                 "type": "array",
+    #                 "items": {"type": "string"},
+    #                 "description": "List of source URLs related to this note. Include ALL relevant sources that support your findings.",
+    #             },
+    #             "tags": {
+    #                 "type": "array",
+    #                 "items": {"type": "string"},
+    #                 "description": "Optional list of tags for categorizing the note (e.g., 'technical', 'historical', 'expert_opinion', 'case_study').",
+    #             },
+    #         },
+    #         "required": ["title", "summary"],
+    #     },
+    #     handler=save_note_handler,
+    #     enabled_condition=lambda ctx: ctx.get("mode") in ["quality"],  # Only for deep research
+    # )
 
     logger.info(f"Registered {len(ActionRegistry._actions)} actions")
 

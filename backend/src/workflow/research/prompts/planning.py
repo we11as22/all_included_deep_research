@@ -101,32 +101,47 @@ class PlanningPromptBuilder(PromptBuilder):
         """Format planning guidelines."""
         guidelines = f"""**Planning Principles:**
 
-1. **Comprehensive Coverage:**
-   - Break down the topic into distinct research areas
-   - Each topic should cover a different aspect/angle
-   - Aim for 4-8 topics depending on complexity
-   - Ensure topics collectively cover the full scope
+1. **Comprehensive Coverage - CRITICAL:**
+   - Break down the topic into distinct research areas that TOGETHER provide complete coverage
+   - Each topic should cover a different aspect/angle that is ESSENTIAL for answering the query
+   - Aim for 4-8 topics depending on complexity, ensuring NO gaps in coverage
+   - **MANDATORY**: Topics must collectively answer ALL aspects of the query: "{query}"
+   - Think systematically: what questions need to be answered to fully address the query?
+   - Consider: What? Why? How? When? Where? Who? What are the implications? What are the challenges?
+   - Ensure topics complement each other and together form a complete picture
 
 2. **Topic Quality:**
-   - Each topic should be specific and actionable
-   - Provide clear description of what to research
-   - Explain why this topic is important
-   - Set appropriate priority (high/medium/low)
+   - Each topic should be specific, actionable, and researchable
+   - Provide clear, detailed description of what to research (not vague)
+   - Explain why this topic is important for answering the query
+   - Set appropriate priority (high/medium/low) based on importance to the query
+   - Each topic should be substantial enough to generate a full, informative chapter
 
-3. **Diversity:**
-   - Cover multiple angles: historical, technical, practical, expert opinions, trends, comparisons, challenges
-   - Avoid overlapping topics
-   - Balance breadth and depth
+3. **Diversity and Completeness:**
+   - Cover multiple angles: historical context, technical details, practical applications, expert opinions, current trends, comparisons, challenges, future implications
+   - Avoid overlapping topics - each should be distinct
+   - Balance breadth (covering all aspects) and depth (sufficient detail)
+   - Consider both theoretical and practical perspectives
+   - Include foundational topics (basics, definitions) AND advanced topics (implications, trends)
 
 4. **Context Retention:**
-   - **CRITICAL**: All topics MUST relate to the original query: "{query}"
-   - Include query context in topic descriptions
+   - **CRITICAL**: All topics MUST directly relate to and help answer the original query: "{query}"
+   - Include query context in topic descriptions so agents understand the connection
    - If clarification was provided, interpret it in context of original query
+   - Each topic should contribute unique value toward answering the query
+
+5. **Gap Prevention:**
+   - Before finalizing topics, verify: "Do these topics together fully answer the query?"
+   - Identify potential gaps: what aspects of the query might not be covered?
+   - If gaps exist, add topics to fill them
+   - Ensure no critical aspect of the query is left unaddressed
 
 **FORBIDDEN:**
 - Creating generic topics unrelated to the query
 - Overlapping topics that duplicate research effort
-- Topics too broad or too narrow for effective research"""
+- Topics too broad (unfocused) or too narrow (insignificant) for effective research
+- Leaving gaps in coverage - all aspects of the query must be addressed
+- Creating topics that don't contribute to answering the query"""
 
         return self._format_section("Planning Guidelines", guidelines)
 

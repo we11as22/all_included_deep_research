@@ -124,3 +124,33 @@ class SupervisorQueue:
     def size(self) -> int:
         """Get current queue size."""
         return self.queue.qsize()
+    
+    def has_finding_from_agent(self, agent_id: str) -> bool:
+        """
+        Check if there is a finding from specific agent in queue.
+        
+        Args:
+            agent_id: Agent identifier to check
+            
+        Returns:
+            True if agent has finding in queue, False otherwise
+        """
+        # Check all items in queue without removing them
+        queue_items = []
+        found = False
+        
+        # Get all items from queue
+        while True:
+            try:
+                item = self.queue.get_nowait()
+                queue_items.append(item)
+                if item.agent_id == agent_id:
+                    found = True
+            except asyncio.QueueEmpty:
+                break
+        
+        # Put items back
+        for item in queue_items:
+            self.queue.put_nowait(item)
+        
+        return found

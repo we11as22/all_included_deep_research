@@ -479,61 +479,19 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         if hasattr(element, 'name'):
             process_element(element)
     
-    # Add sources section at the end if available
-    # Also check if there's a "## Sources" section in the HTML that we should preserve
-    sources_section = soup.find('h2', string=re.compile(r'Sources', re.IGNORECASE))
-    if sources_section:
-        # Process the Sources section from HTML (preserves markdown links)
-        story.append(PageBreak())
-        story.append(Paragraph("Sources", heading1_style))
-        story.append(Spacer(1, 0.2 * inch))
-        
-        # Find the content after the Sources heading
-        next_sibling = sources_section.find_next_sibling()
-        while next_sibling:
-            if next_sibling.name and next_sibling.name.startswith('h'):
-                break  # Stop at next heading
-            process_element(next_sibling)
-            next_sibling = next_sibling.find_next_sibling()
-    
-    # Also add extracted sources as a table if we have them
-    if sources:
-        if not sources_section:  # Only add table if Sources section wasn't in HTML
-            story.append(PageBreak())
-            story.append(Paragraph("Sources", heading1_style))
-            story.append(Spacer(1, 0.2 * inch))
-        
-        # Create table for sources with clickable links
-        source_data = [['#', 'Title', 'URL']]
-        for num in sorted(sources.keys()):
-            title, url = sources[num]
-            # Make URL clickable in the table
-            source_data.append([
-                str(num), 
-                title[:50], 
-                f'<link href="{url}" color="blue"><u>{url[:60]}</u></link>'
-            ])
-        
-        source_table = Table(source_data, colWidths=[0.5 * inch, 3 * inch, 3.5 * inch])
-        source_table.setStyle(
-            TableStyle(
-                [
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#f0f0f0')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.HexColor('#333333')),
-                    ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                    ('FONTNAME', (0, 0), (-1, 0), unicode_bold_font_name),
-                    ('FONTSIZE', (0, 0), (-1, 0), 10),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-                    ('BACKGROUND', (0, 1), (-1, -1), colors.white),
-                    ('TEXTCOLOR', (0, 1), (-1, -1), colors.HexColor('#333333')),
-                    ('FONTNAME', (0, 1), (-1, -1), unicode_font_name),
-                    ('FONTSIZE', (0, 1), (-1, -1), 9),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.HexColor('#e0e0e0')),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f9f9f9')]),
-                ]
-            )
-        )
-        story.append(source_table)
+    # CRITICAL: Do NOT add Sources section at the end of PDF
+    # Sources are already included in each chapter of draft_report (added automatically by supervisor)
+    # Adding Sources section here would duplicate sources that are already in chapters
+    # Sources are processed as part of the main content (each chapter has its own Sources section)
+    # 
+    # NOTE: The `sources` dict extracted by `_extract_sources_from_report` is only used
+    # for making citations [1], [2] clickable in the text, NOT for adding a Sources section
+    # 
+    # Removed code that was adding Sources section at the end:
+    # - Checking for "## Sources" section in HTML and processing it separately
+    # - Adding extracted sources as a table at the end
+    # 
+    # Sources in chapters are already processed as part of the main content flow above
     
     # Build PDF
     try:
