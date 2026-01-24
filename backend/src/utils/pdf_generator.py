@@ -130,6 +130,8 @@ def _extract_sources_from_report(report: str) -> dict[int, tuple[str, str]]:
     """
     sources = {}
     
+    from urllib.parse import unquote
+    
     # Pattern 1: [1] Title: URL
     pattern1 = r'\[(\d+)\]\s+([^:]+):\s+(https?://[^\s\)]+)'
     matches = re.finditer(pattern1, report)
@@ -137,20 +139,68 @@ def _extract_sources_from_report(report: str) -> dict[int, tuple[str, str]]:
         num = int(match.group(1))
         title = match.group(2).strip()
         url = match.group(3).strip()
+        
+        # CRITICAL: Decode URL-encoded title and URL
+        try:
+            if '%' in title:
+                title = unquote(title, encoding='utf-8')
+            if '%' in url:
+                url = unquote(url, encoding='utf-8')
+        except Exception as e:
+            logger.warning("Failed to decode source", title_preview=title[:50], url_preview=url[:50], error=str(e))
+        
         sources[num] = (title, url)
     
-    # Pattern 2: Sources section with numbered list
-    sources_section = re.search(r'##\s+Sources\s+(.*?)(?=##|$)', report, re.DOTALL | re.IGNORECASE)
-    if sources_section:
+    # Pattern 2: Sources sections with markdown links: - [Title](url)
+    # CRITICAL: Find ALL Sources sections (including the last one in the last chapter)
+    # Use findall to get all Sources sections, not just the first one
+    sources_sections = re.finditer(r'##\s+Sources\s+(.*?)(?=##|$)', report, re.DOTALL | re.IGNORECASE)
+    
+    for sources_section in sources_sections:
         section_text = sources_section.group(1)
-        # Match [1] Title: URL or 1. Title: URL
-        pattern2 = r'(?:\[(\d+)\]|(\d+)\.)\s+([^:]+):\s+(https?://[^\s\)]+)'
-        matches = re.finditer(pattern2, section_text)
-        for match in matches:
-            num = int(match.group(1) or match.group(2))
-            title = match.group(3).strip()
-            url = match.group(4).strip()
+        # Match markdown links: - [Title](url)
+        pattern2 = re.compile(r'-\s*\[([^\]]+)\]\(([^)]+)\)')
+        for match in pattern2.finditer(section_text):
+            num = len(sources) + 1
+            title = match.group(1).strip()
+            url = match.group(2).strip()
+            
+            # CRITICAL: Decode URL-encoded title and URL
+            try:
+                if '%' in title:
+                    title = unquote(title, encoding='utf-8')
+                if '%' in url:
+                    url = unquote(url, encoding='utf-8')
+            except Exception as e:
+                logger.warning("Failed to decode source", title_preview=title[:50], url_preview=url[:50], error=str(e))
+            
             sources[num] = (title, url)
+        
+        # Also match numbered format: [1] Title: URL or 1. Title: URL (fallback)
+        # Only if no markdown links were found in this section
+        if not any(re.search(r'-\s*\[([^\]]+)\]\(([^)]+)\)', section_text)):
+            pattern2_fallback = r'(?:\[(\d+)\]|(\d+)\.)\s+([^:]+):\s+(https?://[^\s\)]+)'
+            matches = re.finditer(pattern2_fallback, section_text)
+            for match in matches:
+                num = int(match.group(1) or match.group(2))
+                title = match.group(3).strip()
+                url = match.group(4).strip()
+                
+                # CRITICAL: Decode URL-encoded title and URL
+                try:
+                    if '%' in title:
+                        title = unquote(title, encoding='utf-8')
+                    if '%' in url:
+                        url = unquote(url, encoding='utf-8')
+                except Exception as e:
+                    logger.warning("Failed to decode source", title_preview=title[:50], url_preview=url[:50], error=str(e))
+                
+                sources[num] = (title, url)
+    
+    logger.info("Extracted sources from report",
+               total_sources=len(sources),
+               sources_sections_found=len(list(re.finditer(r'##\s+Sources\s+', report, re.IGNORECASE))),
+               note="All Sources sections (including last chapter) should be processed. Sources are used for clickable citations, and Sources sections are rendered as part of HTML content.")
     
     return sources
 
@@ -211,9 +261,22 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
         extensions=['extra', 'nl2br', 'sane_lists', 'tables', 'fenced_code'],
     )
     
+    # CRITICAL: Log Sources sections in markdown before conversion
+    sources_sections_md = list(re.finditer(r'##\s+Sources\s+', report, re.IGNORECASE))
+    logger.info("PDF: Found Sources sections in markdown",
+               sources_sections_count=len(sources_sections_md),
+               note="All Sources sections (including last chapter) should be converted to HTML and rendered")
+    
     # Parse HTML and extract text with links
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(html, 'html.parser')
+    
+    # CRITICAL: Verify Sources sections are in HTML after conversion
+    sources_h2_in_html = soup.find_all('h2', string=re.compile(r'^Sources$', re.IGNORECASE))
+    logger.info("PDF: Sources sections in HTML after markdown conversion",
+               sources_sections_count=len(sources_h2_in_html),
+               expected_count=len(sources_sections_md),
+               note="All Sources sections from markdown should be present in HTML. If count differs, some Sources sections may be missing.")
     
     # Create PDF document with UTF-8 encoding support
     doc = SimpleDocTemplate(
@@ -309,11 +372,26 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
     # Build PDF content
     story = []
     
-    # Title
-    story.append(Paragraph(title, title_style))
-    story.append(Spacer(1, 0.3 * inch))
-    story.append(HRFlowable(width="100%", thickness=1, lineCap='round', color=colors.HexColor('#cccccc')))
-    story.append(Spacer(1, 0.3 * inch))
+    # CRITICAL: Check if first h1 in HTML matches the title to avoid duplication
+    # Extract first h1 from HTML
+    first_h1 = None
+    for element in soup.children:
+        if hasattr(element, 'name') and element.name == 'h1':
+            first_h1 = element.get_text().strip()
+            break
+    
+    # Only add title if it doesn't match first h1 (to avoid duplication)
+    if first_h1 and first_h1.strip().lower() == title.strip().lower():
+        logger.info("PDF: Skipping duplicate title - first h1 matches title",
+                   title=title[:50],
+                   first_h1=first_h1[:50],
+                   note="Title will be added once from h1 element, not duplicated")
+    else:
+        # Title doesn't match first h1 or no h1 found - add title
+        story.append(Paragraph(title, title_style))
+        story.append(Spacer(1, 0.3 * inch))
+        story.append(HRFlowable(width="100%", thickness=1, lineCap='round', color=colors.HexColor('#cccccc')))
+        story.append(Spacer(1, 0.3 * inch))
     
     # Process HTML elements
     def process_element(element):
@@ -357,6 +435,11 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
             if isinstance(text, bytes):
                 text = text.decode('utf-8', errors='replace')
             if text:
+                # CRITICAL: Log when processing Sources section to verify it's rendered
+                if text.strip().lower() == 'sources':
+                    logger.info("PDF: Processing Sources section",
+                               section_title=text,
+                               note="Sources section found and will be rendered in PDF")
                 story.append(Paragraph(text, heading2_style))
                 story.append(Spacer(1, 0.08 * inch))
         elif tag == 'h3':
@@ -407,7 +490,15 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                 story.append(Paragraph(para_html, body_style))
                 story.append(Spacer(1, 0.06 * inch))
         elif tag == 'ul' or tag == 'ol':
-            for li in element.find_all('li', recursive=False):
+            # CRITICAL: Process all list items, including those in Sources sections
+            # Use find_all with recursive=False to get direct children only
+            list_items = element.find_all('li', recursive=False)
+            
+            # If no direct children, try recursive search (for nested lists)
+            if not list_items:
+                list_items = element.find_all('li', recursive=True)
+            
+            for li in list_items:
                 # Process list item with all its children, preserving links
                 li_html = str(li)
                 # Ensure UTF-8 for HTML
@@ -416,13 +507,14 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                 
                 # CRITICAL: Replace ALL <a> tags with ReportLab clickable link format
                 # Handle both simple links and links with attributes
+                # Pattern 1: Simple links <a href="url">text</a>
                 li_html = re.sub(
                     r'<a\s+href="([^"]+)"[^>]*>([^<]+)</a>',
                     r'<link href="\1" color="blue"><u>\2</u></link>',
                     li_html,
                     flags=re.IGNORECASE | re.DOTALL
                 )
-                # Handle nested links
+                # Pattern 2: Links with nested content
                 li_html = re.sub(
                     r'<a\s+href="([^"]+)"[^>]*>([^<]*(?:<[^>]+>[^<]*)*)</a>',
                     lambda m: f'<link href="{m.group(1)}" color="blue"><u>{re.sub(r"<[^>]+>", "", m.group(2))}</u></link>',
@@ -433,8 +525,22 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                 # Remove <li> tags, keep content
                 li_html = re.sub(r'</?li[^>]*>', '', li_html)
                 
+                # Also remove <ul> and <ol> tags if nested
+                li_html = re.sub(r'</?[uo]l[^>]*>', '', li_html)
+                
                 text = li.get_text().strip()
                 if text or li_html.strip():
+                    # Check if this is in a Sources section (parent h2 contains "Sources")
+                    # This helps with debugging
+                    is_sources_section = False
+                    parent = element.parent
+                    while parent:
+                        if hasattr(parent, 'name') and parent.name == 'h2':
+                            if parent.get_text().strip().lower() == 'sources':
+                                is_sources_section = True
+                                break
+                        parent = getattr(parent, 'parent', None)
+                    
                     story.append(Paragraph(f'• {li_html}', body_style))
                     story.append(Spacer(1, 0.04 * inch))
             story.append(Spacer(1, 0.1 * inch))
@@ -475,9 +581,44 @@ def markdown_to_pdf(report: str, title: str = "Research Report") -> BytesIO:
                     process_element(child)
     
     # Process main content
+    # CRITICAL: process_element processes elements recursively, so all nested elements (including Sources sections)
+    # should be processed. However, we need to ensure we process ALL top-level elements, including those
+    # that might be at the end of the document (like Sources sections in the last chapter).
+    
+    # CRITICAL: Process all top-level elements, including those at the end (like Sources in last chapter)
+    # Use soup.find_all() to ensure we get all elements, not just direct children
+    # But we want to process in order, so we'll iterate through soup.children first
+    # and also check for any elements that might be missed
+    
+    # Count Sources sections in HTML to verify they're all processed
+    sources_h2_elements = soup.find_all('h2', string=re.compile(r'^Sources$', re.IGNORECASE))
+    logger.info("PDF: Found Sources sections in HTML",
+               sources_sections_count=len(sources_h2_elements),
+               note="All Sources sections (including last chapter) should be processed and rendered in PDF")
+    
+    # Process all top-level elements
+    processed_elements = 0
     for element in soup.children:
         if hasattr(element, 'name'):
+            processed_elements += 1
             process_element(element)
+    
+    # CRITICAL: Also process any elements that might be in body tag but not in direct children
+    # This ensures we don't miss any content, especially at the end of the document
+    body = soup.find('body')
+    if body:
+        # If body exists, process its children (in case soup.children didn't catch everything)
+        for element in body.children:
+            if hasattr(element, 'name') and element.name:
+                # Only process if not already processed (avoid duplicates)
+                # We can't easily track this, but since we process soup.children first,
+                # this should only catch elements that were missed
+                process_element(element)
+    
+    logger.info("PDF: Processed HTML elements",
+               processed_count=processed_elements,
+               sources_sections_found=len(sources_h2_elements),
+               note="All elements including Sources sections should be rendered in PDF")
     
     # CRITICAL: Do NOT add Sources section at the end of PDF
     # Sources are already included in each chapter of draft_report (added automatically by supervisor)

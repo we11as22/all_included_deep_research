@@ -312,18 +312,34 @@ def create_research_graph(checkpoint_path: str = "./research_checkpoints.db") ->
             return "continue"
         
         # CRITICAL: If clarification needed but not answered, wait
+        # This prevents multi-agent system from starting before user answers
         if clarification_needed and clarification_just_sent:
-            logger.info("🛑 Waiting for user clarification - interrupting graph")
+            logger.info("🛑 Waiting for user clarification - interrupting graph BEFORE multi-agent system",
+                       clarification_needed=clarification_needed,
+                       clarification_just_sent=clarification_just_sent,
+                       session_status=session_status,
+                       note="CRITICAL: Multi-agent system (execute_agents) will NOT start until user answers")
             return "wait"
         
         # CRITICAL: Also check if clarification_needed but answers are missing
         # This is a safety check in case clarification_just_sent was not set correctly
+        # This prevents multi-agent system from starting if clarification is needed but not answered
         if clarification_needed and session_status == "waiting_clarification" and not clarification_answers:
-            logger.warning("🛑 Clarification needed but answers missing - waiting",
+            logger.warning("🛑 Clarification needed but answers missing - waiting BEFORE multi-agent system",
                          clarification_needed=clarification_needed,
                          session_status=session_status,
                          has_clarification_answers=bool(clarification_answers),
-                         note="Safety check: clarification needed but no answers in state")
+                         note="CRITICAL: Multi-agent system (execute_agents) will NOT start - waiting for user answers")
+            return "wait"
+        
+        # CRITICAL: Additional safety check - if clarification_needed is True but we're here,
+        # it means something went wrong. Better to wait than start multi-agent system prematurely
+        if clarification_needed and not clarification_answers:
+            logger.error("🛑 CRITICAL: clarification_needed=True but no answers - waiting to prevent premature multi-agent start",
+                       clarification_needed=clarification_needed,
+                       session_status=session_status,
+                       has_clarification_answers=bool(clarification_answers),
+                       note="CRITICAL ERROR: Multi-agent system should NOT start - waiting for clarification answers")
             return "wait"
         
         logger.info("✅ Clarification answered or not needed - proceeding to analyze_query")
@@ -792,19 +808,49 @@ async def run_research_graph(
                 "session_id": session_id,  # CRITICAL: Always include session_id so nodes can use it!
             }
             
-            # CRITICAL: If session_status changed to "researching", user answered clarification
-            # Update clarification flags accordingly
+            # CRITICAL: Check if user answered clarification
+            # Priority: session_status from DB > clarification_answers in state
+            # If clarification_answers exists but status is still "waiting_clarification", 
+            # it means answers were just saved - update status and flags
+            clarification_answers_in_state = initial_state.get("clarification_answers", "") or filtered_state.get("clarification_answers", "")
+            has_clarification_answers = bool(clarification_answers_in_state and clarification_answers_in_state.strip())
+            
             if current_session_status == "researching":
+                # Status is already "researching" - user answered
                 update_state["clarification_needed"] = False
                 update_state["clarification_just_sent"] = False
                 logger.info("✅ Session status is 'researching' - user answered clarification, updating flags",
-                           session_id=session_id)
+                           session_id=session_id,
+                           has_clarification_answers=has_clarification_answers)
+            elif has_clarification_answers and current_session_status == "waiting_clarification":
+                # CRITICAL: Answers exist but status is still "waiting_clarification"
+                # This means answers were just saved - update status to "researching"
+                # This handles race condition where answers were saved but status wasn't updated yet
+                if session_manager:
+                    try:
+                        await session_manager.update_status(session_id, "researching")
+                        current_session_status = "researching"
+                        update_state["session_status"] = "researching"
+                        logger.info("✅ Updated session status to 'researching' (answers exist but status was 'waiting_clarification')",
+                                   session_id=session_id,
+                                   answers_length=len(clarification_answers_in_state),
+                                   note="Answers were saved but status wasn't updated - fixing now")
+                    except Exception as e:
+                        logger.warning("Failed to update session status", error=str(e), exc_info=True)
+                update_state["clarification_needed"] = False
+                update_state["clarification_just_sent"] = False
+                logger.info("✅ User answered clarification (answers in state, status updated) - proceeding",
+                           session_id=session_id,
+                           answers_length=len(clarification_answers_in_state),
+                           note="Answers exist in state - proceeding with research")
             elif current_session_status == "waiting_clarification":
-                # Still waiting for user answer
+                # Still waiting for user answer (no answers in state)
                 update_state["clarification_needed"] = True
                 update_state["clarification_just_sent"] = True
                 logger.info("⏸️ Session status is 'waiting_clarification' - still waiting for user answer",
-                           session_id=session_id)
+                           session_id=session_id,
+                           has_clarification_answers=has_clarification_answers,
+                           note="No answers in state - waiting for user response")
             
             # CRITICAL: Preserve deep_search_result from initial_state (loaded from DB) OR from filtered_state (checkpoint)
             # Priority: initial_state (from DB) > filtered_state (checkpoint) > empty

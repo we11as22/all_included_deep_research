@@ -219,3 +219,4 @@ cursor_docs/
 # Backup directories
 backup_nodes_*/
 backup_workflow_*/
+cursor_docks/

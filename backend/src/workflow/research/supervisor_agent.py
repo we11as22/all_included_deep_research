@@ -28,6 +28,10 @@ from src.models.agent_models import AgentTodoItem
 
 logger = structlog.get_logger(__name__)
 
+# CRITICAL: Lock for sequential chapter writing to prevent concurrent writes
+# This ensures chapters are written one at a time, even if multiple findings are processed
+_draft_report_write_lock = asyncio.Lock()
+
 
 # ==================== Supervisor Tools Schema ====================
 
@@ -242,6 +246,12 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
     - chapter_summaries: Summaries of existing chapters (to avoid repetition)
     """
     agent_memory_service = context.get("agent_memory_service")
+    # Fallback: try to get from stream.app_state if not in context
+    if not agent_memory_service:
+        stream = context.get("stream")
+        if stream and hasattr(stream, "app_state"):
+            agent_memory_service = stream.app_state.get("agent_memory_service")
+    
     session_id = context.get("session_id")
     session_factory = context.get("session_factory")
     query = context.get("query", "")
@@ -679,13 +689,49 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                     if url_normalized:
                         seen_source_urls.add(url_normalized)
                     
-                    if url:
-                        sources_list.append(f"- [{title}]({url})")
+                    # CRITICAL: Decode URL-encoded title and URL if needed
+                    # Handle both URL-encoded strings and normal strings
+                    from urllib.parse import unquote
+                    try:
+                        # Try to decode URL-encoded title
+                        if '%' in title:
+                            title_decoded = unquote(title, encoding='utf-8')
+                            if title_decoded != title:
+                                title = title_decoded
+                                logger.debug("Decoded URL-encoded title", original=title[:50], decoded=title_decoded[:50])
+                    except Exception as e:
+                        logger.warning("Failed to decode title", title_preview=title[:50], error=str(e))
+                    
+                    # Clean title - remove any HTML entities or special characters that might break markdown
+                    # Replace common problematic characters
+                    title_clean = title.replace('[', '(').replace(']', ')')  # Replace brackets that break markdown links
+                    title_clean = title_clean.strip()
+                    
+                    # Ensure title is not empty after cleaning
+                    if not title_clean:
+                        title_clean = "Source"
+                    
+                    # CRITICAL: Ensure URL is properly formatted
+                    url_clean = url.strip() if url else ""
+                    
+                    if url_clean:
+                        # Try to decode URL if it's URL-encoded
+                        try:
+                            if '%' in url_clean:
+                                url_decoded = unquote(url_clean, encoding='utf-8')
+                                if url_decoded != url_clean:
+                                    url_clean = url_decoded
+                                    logger.debug("Decoded URL-encoded URL", original=url_clean[:50], decoded=url_decoded[:50])
+                        except Exception as e:
+                            logger.warning("Failed to decode URL", url_preview=url_clean[:50], error=str(e))
+                        
+                        # Format as markdown link
+                        sources_list.append(f"- [{title_clean}]({url_clean})")
                     else:
                         # Also check for duplicate titles if no URL
                         existing_titles = [s.split(']')[0].replace('- [', '').lower() for s in sources_list]
-                        if title.lower() not in existing_titles:
-                            sources_list.append(f"- {title}")
+                        if title_clean.lower() not in existing_titles:
+                            sources_list.append(f"- {title_clean}")
                 elif isinstance(source, str):
                     # If source is a string (URL), check for duplicates
                     url_normalized = source.lower().rstrip('/')
@@ -714,10 +760,13 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
         # CRITICAL: Clean content from any chapter headers and sources sections that LLM might have added
         # LLM should NOT add headers or sources, but sometimes does - remove them to prevent duplication
         # Remove any "## Chapter" or "# Chapter" lines from content
+        # CRITICAL: Also remove headers that match chapter_title (any number of #)
         # CRITICAL: Also remove "## Sources", "## References", or any source lists - sources are added automatically
         content_lines = content.split('\n')
         cleaned_content_lines = []
         in_sources_section = False
+        chapter_title_normalized = chapter_title.strip().lower() if chapter_title else ""
+        
         for i, line in enumerate(content_lines):
             # Skip lines that look like chapter headers with number: "## Chapter 1:", "# Chapter 1:", etc.
             # Also match patterns like "## Chapter 1: ## Chapter 1:" (duplicate headers)
@@ -741,6 +790,25 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
                              chapter_title=chapter_title,
                              note="LLM added header but it's added automatically - removed to prevent duplication")
                 continue
+            
+            # CRITICAL: Remove headers that match chapter_title (any number of # at start)
+            # This catches cases like "# Title" or "## Title" where Title matches chapter_title
+            if chapter_title_normalized:
+                # Extract text after # symbols
+                header_match = re.match(r'^(#+)\s+(.+)$', line)
+                if header_match:
+                    header_text = header_match.group(2).strip()
+                    header_text_normalized = header_text.lower()
+                    # Check if header text matches chapter_title (exact or partial match)
+                    if (header_text_normalized == chapter_title_normalized or 
+                        header_text_normalized in chapter_title_normalized or 
+                        chapter_title_normalized in header_text_normalized):
+                        logger.warning("Removed duplicate title header from content (matches chapter_title)",
+                                     line=line[:100],
+                                     chapter_title=chapter_title,
+                                     header_text=header_text[:100],
+                                     note="LLM added header that matches chapter_title - removed to prevent duplication")
+                        continue
             
             # CRITICAL: Remove sources sections - they are added automatically
             # Check for "## Sources", "## References", "## Ссылки", "## Источники", etc.
@@ -784,9 +852,101 @@ async def write_draft_report_handler(args: Dict[str, Any], context: Dict[str, An
 
 """
         
-        # Append chapter to draft
-        updated = current + chapter
-        await agent_memory_service.file_manager.write_file(draft_file, updated)
+        # CRITICAL: Use lock to ensure sequential chapter writing
+        # This prevents concurrent writes even if multiple findings are processed
+        logger.info(
+            "SUPERVISOR: Acquiring draft_report write lock for sequential chapter writing",
+            chapter_title=chapter_title,
+            chapter_number=chapter_number,
+            note="Lock ensures chapters are written sequentially in order of processing"
+        )
+        
+        async with _draft_report_write_lock:
+            logger.info(
+                "SUPERVISOR: Acquired draft_report write lock - writing chapter",
+                chapter_title=chapter_title,
+                chapter_number=chapter_number,
+                note="Lock acquired - will re-read draft_report to get latest version before writing"
+            )
+            
+            # Re-read current draft inside lock to get latest version
+            # This ensures we have the most up-to-date content even if another chapter was written
+            try:
+                current_locked = await agent_memory_service.file_manager.read_file(draft_file)
+                logger.info(
+                    "SUPERVISOR: Re-read draft_report inside lock",
+                    chapter_title=chapter_title,
+                    chapter_number=chapter_number,
+                    current_draft_length=len(current_locked),
+                    note="Got latest version of draft_report - will recalculate chapter number if needed"
+                )
+            except FileNotFoundError:
+                current_locked = ""
+                logger.info(
+                    "SUPERVISOR: Draft report not found - will create new",
+                    chapter_title=chapter_title,
+                    chapter_number=chapter_number
+                )
+            
+            # Re-check chapter number inside lock to prevent duplicates
+            existing_chapter_numbers_locked = []
+            for line in current_locked.split('\n'):
+                match = re.match(chapter_pattern, line, re.IGNORECASE)
+                if match:
+                    try:
+                        chapter_num = int(match.group(1))
+                        existing_chapter_numbers_locked.append(chapter_num)
+                    except (ValueError, IndexError):
+                        pass
+                match = re.match(single_hash_pattern, line, re.IGNORECASE)
+                if match:
+                    try:
+                        chapter_num = int(match.group(1))
+                        existing_chapter_numbers_locked.append(chapter_num)
+                    except (ValueError, IndexError):
+                        pass
+            
+            # Recalculate chapter number inside lock
+            if existing_chapter_numbers_locked:
+                chapter_number_locked = max(existing_chapter_numbers_locked) + 1
+            else:
+                chapter_number_locked = 1
+            
+            # Update chapter with correct number
+            if chapter_number_locked != chapter_number:
+                logger.info("Chapter number updated inside lock",
+                           original_number=chapter_number,
+                           new_number=chapter_number_locked,
+                           note="Another chapter was written while waiting for lock")
+                chapter = f"""
+
+---
+
+## Chapter {chapter_number_locked}: {chapter_title}
+
+{cleaned_content}{sources_section}
+
+"""
+                chapter_number = chapter_number_locked
+            
+            # Append chapter to draft
+            updated = current_locked + chapter
+            logger.info(
+                "SUPERVISOR: Writing chapter to draft_report (inside lock)",
+                chapter_title=chapter_title,
+                chapter_number=chapter_number_locked,
+                updated_draft_length=len(updated),
+                note="Writing chapter sequentially - lock ensures no concurrent writes"
+            )
+            
+            await agent_memory_service.file_manager.write_file(draft_file, updated)
+            
+            logger.info(
+                "SUPERVISOR: Chapter written successfully (releasing lock)",
+                chapter_title=chapter_title,
+                chapter_number=chapter_number_locked,
+                note="Chapter written - lock will be released, next chapter can be written"
+            )
         
         # CRITICAL: Store chapter summary in session_metadata for fallback synthesis
         if finding_data and session_id and session_factory:
@@ -986,18 +1146,68 @@ Summary:"""
         finding_agent_id = finding_data.get("agent_id", "unknown") if finding_data else "unknown"
         sources_count = len(sources) if isinstance(sources, list) else 0
         
-        # Get agent's task status to log what happens next
+        # CRITICAL: Verify task status after chapter is written
+        # Task should already be 'done' (agent marked it when completing the task)
+        # If task is NOT 'done', this indicates a problem - task may have been returned for rework
+        # In that case, chapter should NOT have been written (supervisor should have returned early)
         agent_file_service = context.get("agent_file_service")
         pending_tasks_count = 0
         done_tasks_count = 0
-        if agent_file_service and finding_agent_id:
+        task_status_verified = False
+        if agent_file_service and finding_agent_id and finding_topic:
             try:
                 agent_file = await agent_file_service.read_agent_file(finding_agent_id)
                 todos = agent_file.get("todos", [])
+                
+                # Find the task that matches the finding topic
+                matching_task = None
+                for todo in todos:
+                    if todo.title == finding_topic:
+                        matching_task = todo
+                        break
+                
+                # CRITICAL: Verify task status - it should be 'done' if chapter was written
+                # If task is 'in_progress', this means it was returned for rework, and chapter should NOT have been written
+                if matching_task:
+                    if matching_task.status == "done":
+                        task_status_verified = True
+                        logger.debug(
+                            "Task status verified as 'done' after chapter was written",
+                            agent_id=finding_agent_id,
+                            task_title=matching_task.title,
+                            note="Task is correctly in 'done' status - agent will pick next pending task"
+                        )
+                    elif matching_task.status == "in_progress":
+                        # CRITICAL ERROR: Chapter was written but task is in_progress
+                        # This should NOT happen - if task was returned for rework, chapter should NOT be written
+                        logger.error(
+                            "CRITICAL ERROR: Chapter was written but task is 'in_progress' - this should not happen!",
+                            agent_id=finding_agent_id,
+                            task_title=matching_task.title,
+                            current_status=matching_task.status,
+                            note="If task was returned for rework, chapter should NOT be written. This indicates a logic error in supervisor chain."
+                        )
+                        # Don't change status - this is an error that needs investigation
+                    else:
+                        # Task is in unexpected status (pending)
+                        logger.warning(
+                            "Task is in unexpected status after chapter was written",
+                            agent_id=finding_agent_id,
+                            task_title=matching_task.title,
+                            current_status=matching_task.status,
+                            note="Task should be 'done' after chapter is written. This may indicate a problem."
+                        )
+                
+                # Get counts for logging
                 pending_tasks_count = len([t for t in todos if t.status == "pending"])
                 done_tasks_count = len([t for t in todos if t.status == "done"])
-            except:
-                pass
+            except Exception as e:
+                logger.error(
+                    "Failed to verify task status after chapter was written",
+                    error=str(e),
+                    agent_id=finding_agent_id,
+                    finding_topic=finding_topic
+                )
         
         logger.info("✅ MANDATORY ACTION COMPLETED: Draft report chapter added", 
                    chapter_number=chapter_number,
@@ -1009,13 +1219,14 @@ Summary:"""
                    total_length=len(updated),
                    agent_pending_tasks=pending_tasks_count,
                    agent_done_tasks=done_tasks_count,
+                   task_status_verified=task_status_verified,
                    context_used={
                        "query": bool(query),
                        "deep_search": bool(deep_search_result),
                        "clarification": bool(clarification_context),
                        "existing_chapters": len(chapter_summaries)
                    },
-                   note=f"Chapter added successfully. Agent {finding_agent_id}'s task remains 'done'. GUARANTEE: Agent will pick next pending task ({pending_tasks_count} waiting) ONLY when chapter is added (task status = 'done'). If chapter not added, task becomes 'in_progress' and agent continues this task.")
+                   note=f"Chapter added successfully. Agent {finding_agent_id}'s task should be 'done' (agent marked it when completing). GUARANTEE: Agent will pick next pending task ({pending_tasks_count} waiting) ONLY when chapter is added (task status = 'done'). If task was returned for rework, chapter is NOT written and task becomes 'in_progress' - agent continues this task.")
         
         # Return success with context info for supervisor
         # CRITICAL: Include sources_count so supervisor knows how many sources were added
@@ -1290,8 +1501,27 @@ async def create_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
         character = agent_file.get("character", "")
         preferences = agent_file.get("preferences", "")
         
+        # CRITICAL: Validate required fields before creating task
+        title = args.get("title")
+        if not title or not isinstance(title, str):
+            logger.error(f"Cannot create task for agent {agent_id} - title is missing or invalid",
+                        title=title, title_type=type(title).__name__)
+            return {
+                "error": f"Task title is required and must be a non-empty string. Received: {title}",
+                "agent_id": agent_id
+            }
+        
+        objective = args.get("objective")
+        if not objective or not isinstance(objective, str):
+            logger.error(f"Cannot create task for agent {agent_id} - objective is missing or invalid",
+                        objective=objective, objective_type=type(objective).__name__)
+            return {
+                "error": f"Task objective is required and must be a non-empty string. Received: {objective}",
+                "agent_id": agent_id
+            }
+        
         # CRITICAL: Check for duplicate tasks by title before creating new one
-        new_task_title = args.get("title", "").strip()
+        new_task_title = title.strip()
         if new_task_title:
             for existing_todo in current_todos:
                 if existing_todo.title.strip() == new_task_title:
@@ -1316,16 +1546,16 @@ async def create_agent_todo_handler(args: Dict[str, Any], context: Dict[str, Any
             preferences = "Focus on comprehensive research coverage and accuracy."
             logger.info(f"Creating new agent {agent_id} with basic characteristics")
         
-        # Create new todo
+        # Create new todo (title and objective already validated above)
         new_todo = AgentTodoItem(
-            reasoning=args.get("reasoning", ""),
-            title=args.get("title", ""),
-            objective=args.get("objective", ""),
-            expected_output=args.get("expected_output", ""),
+            reasoning=args.get("reasoning", "") or "",
+            title=new_task_title,  # Use validated and stripped title
+            objective=objective.strip() if objective else "",  # Use validated objective
+            expected_output=args.get("expected_output", "") or "Comprehensive findings",
             sources_needed=[],
-            priority=args.get("priority", "medium"),
+            priority=args.get("priority", "medium") or "medium",
             status="pending",
-            note=args.get("guidance", "")
+            note=args.get("guidance", "") or ""
         )
         
         current_todos.append(new_todo)

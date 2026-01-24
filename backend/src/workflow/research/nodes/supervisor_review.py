@@ -73,7 +73,8 @@ class SupervisorReviewNode(ResearchNode):
         # Использовать supervisor chain для обработки оставшихся файндингов
         try:
             # Создать пустую очередь для финализации (все файндинги уже обработаны)
-            from src.workflow.research.supervisor_queue import SupervisorQueue
+            # CRITICAL: Use correct SupervisorQueue from queue.py (has get_finding method)
+            from src.workflow.research.queue import SupervisorQueue
             empty_queue = SupervisorQueue()
             
             # Обработать оставшиеся файндинги из очереди (если есть)

@@ -1123,13 +1123,16 @@ def register_actions():
     ActionRegistry.register(
         name="create_finding",
         description="Create a comprehensive research finding automatically from all collected information. "
-        "**RESULTING TOOL**: This is the final tool you should call when research is complete. "
+        "**MANDATORY RESULTING TOOL**: This is the FINAL tool you MUST call when research is complete. "
+        "**FORBIDDEN**: Do NOT write text summaries - you MUST call this tool instead. Text responses will be IGNORED. "
         "**AUTOMATIC**: This tool uses LLM to synthesize information from scraped page summaries and search snippets into a detailed finding. "
         "**WHEN TO CALL**: Call this when you have completed your research and want to generate the final finding. "
+        "**MANDATORY**: When you have gathered sufficient information (sources, scraped pages), you MUST call this tool - do NOT write text summaries. "
         "**WHAT IT DOES**: Automatically generates comprehensive summary (1500-3000 words) and key findings from all relevant scraped summaries and search snippets. "
         "**NO PARAMETERS NEEDED**: The tool automatically uses all collected data from your research session. "
         "**CRITICAL**: If you don't call this tool, it will be called automatically when you reach max_steps or call done(). "
-        "**PREFERRED**: It's better to call this explicitly when you feel research is complete.",
+        "**PREFERRED**: It's better to call this explicitly when you feel research is complete. "
+        "**REMINDER**: You are in a tool-calling loop - you MUST call tools, not write text. When research is done, call create_finding(), not a text summary.",
         args_schema={
             "type": "object",
             "properties": {},

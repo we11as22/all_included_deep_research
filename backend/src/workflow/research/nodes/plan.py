@@ -9,6 +9,12 @@ from src.workflow.research.nodes.base import ResearchNode
 from src.workflow.research.models import ResearchPlan, ResearchTopic
 from src.workflow.research.prompts.planning import PlanningPromptBuilder
 
+try:
+    from openai import PermissionDeniedError
+except ImportError:
+    # Fallback if openai is not available
+    PermissionDeniedError = Exception
+
 logger = structlog.get_logger(__name__)
 
 
@@ -189,8 +195,63 @@ CRITICAL: All topics must relate to the original query. Include query context in
                 logger.error("LLM call timed out after 120 seconds",
                            session_id=session_id,
                            prompt_length=prompt_length,
-                           note="Planning LLM call exceeded timeout - this may indicate API issues")
-                raise TimeoutError("Research planning LLM call timed out after 120 seconds")
+                           note="Planning LLM call exceeded timeout - creating fallback plan")
+                # Create fallback plan instead of raising error
+                plan = ResearchPlan(
+                    reasoning=f"Fallback research plan created due to LLM timeout. Research will focus on: {query}",
+                    research_depth="comprehensive",
+                    coordination_strategy="parallel",
+                    topics=[
+                        ResearchTopic(
+                            topic=query,
+                            description=f"Comprehensive research on: {query}",
+                            priority="high",
+                            estimated_sources=10
+                        )
+                    ]
+                )
+            except PermissionDeniedError as e:
+                # CRITICAL: If LLM is blocked (403), create fallback plan instead of failing
+                logger.error("LLM call blocked by provider (403) - creating fallback plan",
+                           session_id=session_id,
+                           prompt_length=prompt_length,
+                           error=str(e),
+                           note="LLM provider blocked request. Creating fallback plan to ensure research continues.")
+                plan = ResearchPlan(
+                    reasoning=f"Fallback research plan created due to LLM provider blocking. Research will focus on: {query}",
+                    research_depth="comprehensive",
+                    coordination_strategy="parallel",
+                    topics=[
+                        ResearchTopic(
+                            topic=query,
+                            description=f"Comprehensive research on: {query}",
+                            priority="high",
+                            estimated_sources=10
+                        )
+                    ]
+                )
+            except Exception as e:
+                # CRITICAL: Catch any other LLM errors and create fallback plan
+                error_type = type(e).__name__
+                logger.error("LLM call failed - creating fallback plan",
+                           session_id=session_id,
+                           prompt_length=prompt_length,
+                           error=str(e),
+                           error_type=error_type,
+                           note="LLM call failed. Creating fallback plan to ensure research continues.")
+                plan = ResearchPlan(
+                    reasoning=f"Fallback research plan created due to LLM error. Research will focus on: {query}",
+                    research_depth="comprehensive",
+                    coordination_strategy="parallel",
+                    topics=[
+                        ResearchTopic(
+                            topic=query,
+                            description=f"Comprehensive research on: {query}",
+                            priority="high",
+                            estimated_sources=10
+                        )
+                    ]
+                )
 
             logger.info("Research plan created",
                        topics_count=len(plan.topics) if hasattr(plan, "topics") else 0,

@@ -317,14 +317,59 @@ export const useChatStore = create<ChatStore>()(
     }),
     {
       name: 'chat-store',
-      partialize: (state) => ({
-        currentChatId: state.currentChatId,
-        currentSessionId: state.currentSessionId,
-        mode: state.mode,
-        progressByChat: state.progressByChat,
-        progressPanelByChat: state.progressPanelByChat,
-        activeMessageByChat: state.activeMessageByChat,
-      }),
+      partialize: (state) => {
+        // CRITICAL: Limit progressByChat size to prevent localStorage quota exceeded
+        // Keep only the last 10 chats' progress data
+        const MAX_CHATS_TO_STORE = 10;
+        const progressByChatEntries = Object.entries(state.progressByChat || {});
+        const sortedEntries = progressByChatEntries.sort((a, b) => {
+          // Sort by most recent activity (simple heuristic: use chatId as timestamp proxy)
+          // In production, you might want to track last activity timestamp
+          return b[0].localeCompare(a[0]);
+        });
+        const limitedProgressByChat = Object.fromEntries(
+          sortedEntries.slice(0, MAX_CHATS_TO_STORE)
+        );
+        
+        // Also limit progressPanelByChat and activeMessageByChat
+        const limitedProgressPanelByChat = Object.fromEntries(
+          Object.entries(state.progressPanelByChat || {}).slice(0, MAX_CHATS_TO_STORE)
+        );
+        const limitedActiveMessageByChat = Object.fromEntries(
+          Object.entries(state.activeMessageByChat || {}).slice(0, MAX_CHATS_TO_STORE)
+        );
+        
+        return {
+          currentChatId: state.currentChatId,
+          currentSessionId: state.currentSessionId,
+          mode: state.mode,
+          progressByChat: limitedProgressByChat,
+          progressPanelByChat: limitedProgressPanelByChat,
+          activeMessageByChat: limitedActiveMessageByChat,
+        } as any;
+      },
+      // CRITICAL: Handle localStorage quota exceeded errors gracefully
+      onRehydrateStorage: () => (state, error) => {
+        if (error) {
+          console.error('Failed to rehydrate chat store from localStorage:', error);
+          // If rehydration fails, try to clear old data and retry
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          if (errorMessage?.includes('quota') || errorMessage?.includes('exceeded')) {
+            console.warn('localStorage quota exceeded, clearing old chat data...');
+            try {
+              // Clear all chat-related localStorage items except current chat/session
+              const currentChatId = localStorage.getItem('currentChatId');
+              const currentSessionId = localStorage.getItem('currentSessionId');
+              localStorage.removeItem('chat-store');
+              if (currentChatId) localStorage.setItem('currentChatId', currentChatId);
+              if (currentSessionId) localStorage.setItem('currentSessionId', currentSessionId);
+              console.log('Cleared old chat store data, please refresh the page');
+            } catch (clearError) {
+              console.error('Failed to clear localStorage:', clearError);
+            }
+          }
+        }
+      },
     }
   )
 );

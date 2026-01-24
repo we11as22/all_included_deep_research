@@ -118,12 +118,14 @@ class ChatSearchService:
             settings,
             max_tokens=settings.chat_model_max_tokens,
             temperature=0.4,
+            provider_order=settings.chat_model_provider_order,
         )
         self.summarizer_llm = create_chat_model(
             settings.search_summarization_model,
             settings,
             max_tokens=settings.search_summarization_model_max_tokens,
             temperature=0.2,
+            provider_order=settings.search_summarization_model_provider_order,
         )
 
     async def answer_simple(

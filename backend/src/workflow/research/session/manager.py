@@ -91,12 +91,14 @@ class SessionManager:
         """Get active deep_research session for chat_id.
 
         Active statuses: active, waiting_clarification, researching
+        CRITICAL: Only returns sessions that are NOT completed
+        This ensures each new deep research in a chat gets a new session
 
         Args:
             chat_id: Chat identifier
 
         Returns:
-            Active session or None
+            Active session or None (if all sessions are completed)
         """
         async with self.session_factory() as session:
             result = await session.execute(
@@ -106,11 +108,30 @@ class SessionManager:
                     ResearchSessionModel.status.in_(
                         ["active", "waiting_clarification", "researching"]
                     ),
+                    # CRITICAL: Exclude completed sessions
+                    ResearchSessionModel.status != "completed",
                 )
                 .order_by(ResearchSessionModel.created_at.desc())
                 .limit(1)
             )
-            return result.scalar_one_or_none()
+            active = result.scalar_one_or_none()
+            
+            if active:
+                logger.info(
+                    "Found active session for chat",
+                    session_id=active.id,
+                    chat_id=chat_id,
+                    status=active.status,
+                    note="This session will be reused for continuation"
+                )
+            else:
+                logger.info(
+                    "No active session found for chat",
+                    chat_id=chat_id,
+                    note="All sessions are completed - new session will be created"
+                )
+            
+            return active
 
     async def create_session(
         self, chat_id: str, query: str, mode: str

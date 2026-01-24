@@ -134,18 +134,21 @@ async def lifespan(app: FastAPI):
         settings,
         max_tokens=settings.research_model_max_tokens,
         temperature=0.7,
+        provider_order=settings.research_model_provider_order,
     )
     compression_llm = create_chat_model(
         settings.compression_model,
         settings,
         max_tokens=settings.compression_model_max_tokens,
         temperature=0.3,
+        provider_order=settings.compression_model_provider_order,
     )
     final_report_llm = create_chat_model(
         settings.final_report_model,
         settings,
         max_tokens=settings.final_report_model_max_tokens,
         temperature=0.7,
+        provider_order=settings.final_report_model_provider_order,
     )
     app.state.research_llm = research_llm
     app.state.compression_llm = compression_llm
@@ -158,6 +161,7 @@ async def lifespan(app: FastAPI):
         settings,
         max_tokens=settings.chat_model_max_tokens,
         temperature=0.7,
+        provider_order=settings.chat_model_provider_order,
     )
     app.state.chat_llm = chat_llm
 

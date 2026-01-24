@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from typing import Optional, Type
 
 import structlog
@@ -22,6 +24,7 @@ def create_chat_model(
     max_tokens: int,
     temperature: float = 0.7,
     structured_output: Optional[Type[BaseModel]] = None,
+    provider_order: Optional[str] = None,
 ) -> BaseChatModel:
     """Create a chat model from provider:model string."""
     if settings.llm_mode == "mock" or model_str.startswith("mock"):
@@ -50,8 +53,10 @@ def create_chat_model(
         }
 
         # Support for any OpenAI-compatible API (OpenRouter, 302.AI, etc.)
+        is_openrouter = False
         if settings.openai_base_url:
             llm_kwargs["base_url"] = settings.openai_base_url
+            is_openrouter = "openrouter.ai" in settings.openai_base_url
             
             # Build headers for OpenAI-compatible APIs
             headers = {}
@@ -59,13 +64,13 @@ def create_chat_model(
             # Use explicit header settings if provided
             if settings.openai_api_http_referer:
                 headers["HTTP-Referer"] = settings.openai_api_http_referer
-            elif "openrouter.ai" in settings.openai_base_url:
+            elif is_openrouter:
                 # Default headers for OpenRouter if not explicitly set
                 headers["HTTP-Referer"] = "https://github.com/all-included-deep-research"
             
             if settings.openai_api_x_title:
                 headers["X-Title"] = settings.openai_api_x_title
-            elif "openrouter.ai" in settings.openai_base_url:
+            elif is_openrouter:
                 # Default headers for OpenRouter if not explicitly set
                 headers["X-Title"] = "All-Included Deep Research"
             
@@ -76,6 +81,24 @@ def create_chat_model(
                     base_url=settings.openai_base_url,
                     headers=list(headers.keys()),
                 )
+            
+        # CRITICAL: Add provider order for OpenRouter (only works with OpenRouter API)
+        # Parse provider order before creating client
+        providers = None
+        provider_order_set_in_kwargs = False
+        if is_openrouter and provider_order and provider_order.strip():
+            providers = [p.strip() for p in provider_order.split(",") if p.strip()]
+            if providers:
+                # Try to pass extra_body directly in kwargs (if ChatOpenAI supports it)
+                # Note: This may not work in all versions, so we'll also patch the client after creation
+                try:
+                    if "extra_body" not in llm_kwargs:
+                        llm_kwargs["extra_body"] = {}
+                    llm_kwargs["extra_body"]["provider"] = {"order": providers}
+                    provider_order_set_in_kwargs = True
+                except Exception:
+                    # If extra_body is not supported in kwargs, we'll patch after creation
+                    pass
 
         logger.info(
             "creating_openai_model",
@@ -83,8 +106,63 @@ def create_chat_model(
             max_tokens=max_tokens,
             temperature=temperature,
             base_url=settings.openai_base_url or "default (api.openai.com)",
+            has_provider_order=providers is not None,
         )
         llm = ChatOpenAI(**llm_kwargs)
+        
+        # CRITICAL: If extra_body wasn't set in kwargs, patch the client after creation
+        if is_openrouter and providers and not provider_order_set_in_kwargs:
+            try:
+                # Patch the underlying OpenAI client to include provider parameter
+                if hasattr(llm, "client") and hasattr(llm.client, "chat"):
+                    original_create = llm.client.chat.completions.create
+                    
+                    async def create_with_provider(*args, **kwargs):
+                        """Wrapper to add provider parameter to requests (async)."""
+                        if "extra_body" not in kwargs:
+                            kwargs["extra_body"] = {}
+                        kwargs["extra_body"]["provider"] = {"order": providers}
+                        return await original_create(*args, **kwargs)
+                    
+                    def create_with_provider_sync(*args, **kwargs):
+                        """Wrapper to add provider parameter to requests (sync)."""
+                        if "extra_body" not in kwargs:
+                            kwargs["extra_body"] = {}
+                        kwargs["extra_body"]["provider"] = {"order": providers}
+                        return original_create(*args, **kwargs)
+                    
+                    # Check if original method is async
+                    if inspect.iscoroutinefunction(original_create):
+                        llm.client.chat.completions.create = create_with_provider
+                    else:
+                        llm.client.chat.completions.create = create_with_provider_sync
+                    
+                    logger.info(
+                        "added_provider_order_via_patch",
+                        model=model_name,
+                        providers=providers,
+                        note="Provider order added via client patching"
+                    )
+                else:
+                    logger.warning(
+                        "cannot_patch_client",
+                        model=model_name,
+                        note="ChatOpenAI client structure not as expected"
+                    )
+            except Exception as e:
+                logger.warning(
+                    "failed_to_add_provider_order",
+                    model=model_name,
+                    error=str(e),
+                    note="Failed to add provider order, continuing without it"
+                )
+        elif is_openrouter and providers and provider_order_set_in_kwargs:
+            logger.debug(
+                "provider_order_set_via_kwargs",
+                model=model_name,
+                providers=providers,
+                note="Provider order set via kwargs (extra_body)"
+            )
         
         # CRITICAL: Verify max_tokens was set correctly
         if hasattr(llm, "max_tokens"):

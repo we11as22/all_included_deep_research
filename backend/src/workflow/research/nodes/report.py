@@ -49,7 +49,7 @@ class GenerateReportNode(ResearchNode):
                    session_id=session_id)
 
         # Read draft_report.md and main.md
-        draft_report = await self._read_draft_report(agent_memory_service, findings, query)
+        draft_report = await self._read_draft_report(agent_memory_service, findings, query, state)
         main_document = await self._read_main_document(agent_memory_service)
 
         # Determine user language
@@ -331,13 +331,14 @@ Include Executive Summary, Main Body (min 3 sections), and Conclusion."""
                 "confidence": "medium" if draft_report_for_prompt else "low"
             }
 
-    async def _read_draft_report(self, agent_memory_service: Any, findings: list, query: str) -> str:
+    async def _read_draft_report(self, agent_memory_service: Any, findings: list, query: str, state: Dict[str, Any]) -> str:
         """Read draft_report.md or create from findings if not available.
 
         Args:
             agent_memory_service: Agent memory service
             findings: All agent findings
             query: Research query
+            state: Research state (needed for _create_draft_from_findings)
 
         Returns:
             Draft report content

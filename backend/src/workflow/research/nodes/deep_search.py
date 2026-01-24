@@ -85,6 +85,31 @@ class DeepSearchNode(ResearchNode):
                         stream = self.deps.stream
                         if stream:
                             stream.emit_status("Deep search completed (using existing result from DB)", step="deep_search")
+                            
+                            # CRITICAL: If clarification was already answered (session_status == "researching"),
+                            # clarify node will be skipped, so we need to send deep search result here
+                            # Otherwise, it will be sent together with clarification in clarify node
+                            if session_status == "researching":
+                                # User already answered - clarify node will be skipped
+                                # Send deep search result to frontend now
+                                logger.info("Deep search result loaded from DB - sending to frontend (clarification already answered)",
+                                           session_id=session_id,
+                                           result_length=len(existing_result),
+                                           note="Clarification already answered - sending deep search result directly to frontend")
+                                # Send deep search result to frontend
+                                chunk_size = 10000
+                                chunks = [existing_result[i:i+chunk_size] for i in range(0, len(existing_result), chunk_size)]
+                                for i, chunk in enumerate(chunks):
+                                    stream.emit_report_chunk(chunk)
+                                    if i < len(chunks) - 1:
+                                        await asyncio.sleep(0.03)
+                            else:
+                                # CRITICAL: Deep search result will be sent together with clarification in clarify node
+                                # Not sending separately here to avoid duplication
+                                logger.info("Deep search result loaded from DB - will be combined with clarification",
+                                           session_id=session_id,
+                                           result_length=len(existing_result),
+                                           note="Result exists in DB - clarify node will combine with clarification for frontend")
                         return {
                             "deep_search_result": {"type": "override", "value": existing_result}
                         }
@@ -142,6 +167,12 @@ class DeepSearchNode(ResearchNode):
                 stream = self.deps.stream
                 if stream:
                     stream.emit_status("Deep search completed (using existing result from state)", step="deep_search")
+                    # CRITICAL: Deep search result will be sent together with clarification in clarify node
+                    # Not sending separately here to avoid duplication
+                    logger.info("Deep search result loaded from state - will be combined with clarification",
+                               session_id=session_id,
+                               result_length=len(existing_result),
+                               note="Result exists in state - clarify node will combine with clarification for frontend")
                 return {
                     "deep_search_result": {"type": "override", "value": existing_result}
                 }
@@ -409,6 +440,12 @@ class DeepSearchNode(ResearchNode):
 
         if stream:
             stream.emit_status("Deep search completed", step="deep_search")
+            # CRITICAL: Do NOT send deep_search_result to frontend here
+            # It will be sent together with clarification as unified message
+            # In workflow logic they are separate entities, but on frontend/DB they are combined
+            logger.info("Deep search completed - result will be combined with clarification for frontend/DB",
+                       result_length=len(deep_search_result),
+                       note="Not sent separately - will be combined with clarification in clarify node")
             # CRITICAL: Do NOT send deep_search_result to frontend here
             # It will be sent together with clarification as unified message
             # In workflow logic they are separate entities, but on frontend/DB they are combined

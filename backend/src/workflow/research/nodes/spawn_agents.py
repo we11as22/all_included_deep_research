@@ -132,9 +132,21 @@ class SpawnAgentsNode(ResearchNode):
         else:
             language_instruction = f"\n\n**LANGUAGE REQUIREMENT:** All research outputs should be in {user_language}."
 
+        # CRITICAL: Use original_query for agent creation, not query (which might be clarification answer)
+        # Agents should be created based on the ORIGINAL research topic, not clarification answers
+        # Clarification answers refine the approach, but the core topic is original_query
+        original_query = state_dict.get("original_query", query)
+        
+        logger.info("🔍 SPAWN AGENTS: Using query for agent creation",
+                   session_id=session_id,
+                   original_query=original_query[:100] if original_query else None,
+                   query=query[:100] if query else None,
+                   query_matches_original=(query == original_query),
+                   note="CRITICAL: Agents are created based on original_query, not clarification answers")
+        
         prompt = f"""Create a team of {agent_count} specialized research agents for this project.
 
-Query: {query}{language_instruction}
+Query: {original_query}{language_instruction}
 
 Initial Context:
 {deep_search_result[:2000] if deep_search_result else "No initial context available."}
@@ -172,9 +184,10 @@ Requirements:
 - Tasks must be self-contained (agents only see their task description, not the full query)
 
 Task Creation Guidelines - CRITICAL FOR COMPREHENSIVE COVERAGE:
-- Every task objective MUST include the original user query
-- Every task MUST be specific to the user's query - not generic
-- Task format: Start each task objective with "The user asked: '[query]'. Research [specific aspect related to query]..."
+- Every task objective MUST include the original user query (NOT clarification answers)
+- Every task MUST be specific to the user's ORIGINAL query - not generic
+- Task format: Start each task objective with "The user asked: '[original_query]'. Research [specific aspect related to original_query]..."
+- CRITICAL: Use the ORIGINAL query ({original_query}), NOT clarification answers, when creating task objectives
 - **MANDATORY**: Tasks must collectively ensure COMPLETE coverage of the query
 - Each task should address a specific aspect that is ESSENTIAL for answering the query
 - Think systematically: what questions need to be answered? What aspects must be covered?
@@ -368,7 +381,7 @@ If any answer is NO, adjust your response!
                                 AgentTodo(
                                     reasoning=f"Research {topic_name} as specified in the research plan",
                                     title=f"Research: {topic_name}",
-                                    objective=f"The user asked: '{query}'. Research {topic_name}: {topic_desc}",
+                                    objective=f"The user asked: '{original_query}'. Research {topic_name}: {topic_desc}",
                                     expected_output=f"Comprehensive findings about {topic_name} with verified sources",
                                     sources_needed=[],
                                     guidance="Use web search to find authoritative sources. Focus on accuracy and depth."
@@ -376,7 +389,7 @@ If any answer is NO, adjust your response!
                                 AgentTodo(
                                     reasoning=f"Analyze findings and identify key insights about {topic_name}",
                                     title=f"Analyze {topic_name} findings",
-                                    objective=f"Synthesize research on {topic_name} and extract key insights relevant to the user's query: '{query}'",
+                                    objective=f"Synthesize research on {topic_name} and extract key insights relevant to the user's query: '{original_query}'",
                                     expected_output=f"Key insights and analysis of {topic_name}",
                                     sources_needed=[],
                                     guidance="Focus on answering the user's original question with your findings."
@@ -384,7 +397,7 @@ If any answer is NO, adjust your response!
                                 AgentTodo(
                                     reasoning=f"Verify and cross-reference key claims about {topic_name}",
                                     title=f"Verify {topic_name} findings",
-                                    objective=f"The user asked: '{query}'. Verify important claims about {topic_name} by finding multiple independent sources and cross-referencing information.",
+                                    objective=f"The user asked: '{original_query}'. Verify important claims about {topic_name} by finding multiple independent sources and cross-referencing information.",
                                     expected_output=f"Verified and cross-referenced findings about {topic_name}",
                                     sources_needed=[],
                                     guidance="Find multiple independent sources to verify key claims. Cross-reference information for accuracy."
@@ -402,24 +415,24 @@ If any answer is NO, adjust your response!
                             initial_todos=[
                                 AgentTodo(
                                     reasoning=f"Provide additional research coverage for the user's query",
-                                    title=f"Additional research for: {query}",
-                                    objective=f"The user asked: '{query}'. Conduct supplementary research to fill any gaps not covered by other agents.",
+                                    title=f"Additional research for: {original_query}",
+                                    objective=f"The user asked: '{original_query}'. Conduct supplementary research to fill any gaps not covered by other agents.",
                                     expected_output="Additional relevant findings that complement other agents' work",
                                     sources_needed=[],
                                     guidance="Focus on aspects not fully covered by other agents. Use web search to find authoritative sources."
                                 ),
                                 AgentTodo(
                                     reasoning=f"Analyze and synthesize findings from multiple sources",
-                                    title=f"Synthesize findings for: {query}",
-                                    objective=f"The user asked: '{query}'. Analyze and synthesize findings from multiple sources to provide comprehensive coverage.",
+                                    title=f"Synthesize findings for: {original_query}",
+                                    objective=f"The user asked: '{original_query}'. Analyze and synthesize findings from multiple sources to provide comprehensive coverage.",
                                     expected_output="Synthesized analysis combining multiple perspectives",
                                     sources_needed=[],
                                     guidance="Combine findings from different sources to provide a comprehensive view."
                                 ),
                                 AgentTodo(
                                     reasoning=f"Identify and investigate related aspects not yet covered",
-                                    title=f"Explore related aspects for: {query}",
-                                    objective=f"The user asked: '{query}'. Identify and investigate related aspects, connections, or implications that haven't been fully explored by other agents.",
+                                    title=f"Explore related aspects for: {original_query}",
+                                    objective=f"The user asked: '{original_query}'. Identify and investigate related aspects, connections, or implications that haven't been fully explored by other agents.",
                                     expected_output="Findings about related aspects and connections",
                                     sources_needed=[],
                                     guidance="Look for related topics, connections, or implications that add depth to the research."

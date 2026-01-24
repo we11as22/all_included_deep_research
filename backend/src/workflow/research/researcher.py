@@ -550,7 +550,16 @@ async def _run_researcher_agent_impl(
     task_guidance = current_task.note if hasattr(current_task, 'note') and current_task.note else ""
     task_objective = current_task.objective if hasattr(current_task, 'objective') else ""
     
+    # Get current date and time for context
+    from datetime import datetime
+    current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    
     plan_prompt = f"""You are {role} with expertise in {expertise}.
+
+**CURRENT DATE AND TIME:**
+- Date: {current_date}
+- Full datetime: {current_datetime}
 
 Current task: {current_task.title}
 Objective: {current_task.objective}
@@ -573,37 +582,13 @@ Create a BRIEF, actionable research plan for completing this task.
 
     try:
         # Use structured output - it handles JSON parsing automatically
-        # CRITICAL: The issue is LLM generating 131k tokens in RESPONSE, not in input
-        # We need to limit the RESPONSE tokens, not truncate input
-        try:
-            # Try to bind max_tokens if LLM supports it
-            llm_for_plan = llm
-            if hasattr(llm, "bind") or hasattr(llm, "with_config"):
-                try:
-                    if hasattr(llm, "with_config"):
-                        llm_for_plan = llm.with_config({"max_tokens": 500})  # Limit response to 500 tokens
-                    elif hasattr(llm, "bind"):
-                        llm_for_plan = llm.bind(max_tokens=500)
-                except:
-                    pass  # If binding fails, use original LLM
-            
-            plan = await llm_for_plan.with_structured_output(
-                AgentPlan,
-                method="json_schema"  # Use JSON schema mode for better token control
-            ).ainvoke([
-                {"role": "system", "content": f"You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. CRITICAL: Your response must be under 500 tokens total."},
-                {"role": "user", "content": plan_prompt}
-            ])
-        except Exception as e:
-            logger.warning(f"Plan creation with max_tokens failed, using fallback", error=str(e))
-            # Fallback without max_tokens
-            plan = await llm.with_structured_output(
-                AgentPlan,
-                method="json_schema"
-            ).ainvoke([
-                {"role": "system", "content": f"You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured."},
-                {"role": "user", "content": plan_prompt}
-            ])
+        plan = await llm.with_structured_output(
+            AgentPlan,
+            method="json_schema"
+        ).ainvoke([
+            {"role": "system", "content": f"You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured."},
+            {"role": "user", "content": plan_prompt}
+        ])
         logger.info(f"Agent {agent_id} created plan", goal=plan.current_goal[:100] if plan.current_goal else "N/A")
     except Exception as e:
         error_msg = str(e)
@@ -667,11 +652,22 @@ Create a BRIEF, actionable research plan for completing this task.
             f"This message will be included in the finding as 'supervisor_message' field."
         )
 
+    # Get current date and time for context
+    from datetime import datetime
+    current_datetime = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    current_date = datetime.now().strftime("%Y-%m-%d")
+    current_time = datetime.now().strftime("%H:%M:%S")
+    
     system_prompt = f"""You are {role}.
 
 Expertise: {expertise}
 Personality: {personality}
 Character: {character}
+
+**CURRENT DATE AND TIME:**
+- Date: {current_date}
+- Time: {current_time}
+- Full datetime: {current_datetime}
 
 **IMPORTANT: Respond in {user_language} whenever generating text for the user.**
 
@@ -728,9 +724,18 @@ Your previous notes (for coordination - see what others might need):
 
 **CRITICAL: READ TOOL DESCRIPTIONS CAREFULLY:**
 - All detailed instructions for verification, source quality, deep research, and completion requirements are in the tool descriptions
-- Read web_search, scrape_url, and done tool descriptions for complete guidance on verification and deep research
+- Read web_search, scrape_url, create_finding, and done tool descriptions for complete guidance on verification and deep research
 - You have up to {max_steps} steps - use EVERY SINGLE ONE to thoroughly research, verify, and cross-reference information
 - Be thorough, cite sources with links, verify everything in multiple sources, and fulfill the objective. Go DEEP, not just surface-level!
+
+**CRITICAL: YOU MUST ALWAYS CALL TOOLS - NEVER OUTPUT TEXT DIRECTLY!**
+- **MANDATORY**: ALL your responses MUST be tool calls, NEVER plain text
+- **FORBIDDEN**: Do NOT output text responses - they will be IGNORED
+- **MANDATORY**: When research is complete, you MUST call create_finding() or done() - NEVER write a text summary
+- **FORBIDDEN**: Text responses are FORBIDDEN - only tool calls are allowed
+- **CRITICAL**: If you have gathered information and want to complete research, you MUST call create_finding() tool - do NOT write text
+- **CRITICAL**: The create_finding tool automatically synthesizes all your collected information - you don't need to write summaries manually
+- **REMINDER**: You are in a tool-calling loop - every response must be a tool call, not text
 """
 
     agent_history.append({
@@ -964,10 +969,13 @@ Your previous notes (for coordination - see what others might need):
                        note="Calling LLM to get next action - this may take time")
             
             try:
-                # Add timeout to prevent infinite hanging (default 120 seconds per LLM call)
+                # CRITICAL: Increased timeout to 180 seconds for complex queries
+                # Some LLM calls with large contexts or complex reasoning may take longer
+                # This prevents premature timeouts while still preventing infinite hanging
+                llm_timeout = 180.0  # 3 minutes - increased from 120 seconds
                 response = await asyncio.wait_for(
                     llm_with_tools.ainvoke(messages),
-                    timeout=120.0
+                    timeout=llm_timeout
                 )
                 logger.info(f"Agent {agent_id} step {step + 1}: received LLM response",
                            agent_id=agent_id,
@@ -976,11 +984,12 @@ Your previous notes (for coordination - see what others might need):
                            response_content_length=len(str(response.content)) if hasattr(response, "content") else 0,
                            note="LLM responded successfully")
             except asyncio.TimeoutError:
-                logger.error(f"Agent {agent_id} step {step + 1}: LLM call timed out after 120 seconds",
+                logger.error(f"Agent {agent_id} step {step + 1}: LLM call timed out after {llm_timeout} seconds",
                            agent_id=agent_id,
                            step=step + 1,
                            task=current_task.title,
-                           note="LLM call exceeded timeout - agent may be stuck. This is a critical error.")
+                           messages_count=len(messages),
+                           note=f"LLM call exceeded timeout ({llm_timeout}s) - agent may be stuck or query is too complex. This is a critical error.")
                 # Continue to next step or break
                 raise
             except Exception as e:
@@ -999,9 +1008,98 @@ Your previous notes (for coordination - see what others might need):
                 tool_calls = response.tool_calls
                 logger.debug(f"Agent {agent_id} step {step}: extracted {len(tool_calls)} tool calls")
             else:
-                logger.warning(f"Agent {agent_id} step {step}: no tool_calls in response", 
+                # CRITICAL: LLM returned text instead of tool calls
+                response_content = str(response.content) if hasattr(response, "content") else ""
+                response_content_preview = response_content[:200] if response_content else "no content"
+                
+                logger.warning(f"Agent {agent_id} step {step}: no tool_calls in response - LLM returned text instead of calling tools", 
                              response_type=type(response).__name__,
-                             has_tool_calls=hasattr(response, "tool_calls"))
+                             has_tool_calls=hasattr(response, "tool_calls"),
+                             response_content_length=len(response_content),
+                             response_content_preview=response_content_preview,
+                             sources_count=len(sources),
+                             scraped_pages_count=len(scraped_pages),
+                             note="LLM returned text response instead of tool calls. This indicates LLM decided to write text instead of calling create_finding() or done(). Text responses are FORBIDDEN - only tool calls are allowed. Will add correction message and retry.")
+                
+                # CRITICAL: Add correction message to history and retry
+                # This helps LLM understand that text responses are not allowed
+                correction_message = f"""ERROR: You returned a text response instead of calling tools. 
+
+**CRITICAL**: You are in a tool-calling loop - you MUST ALWAYS call tools, NEVER output text directly.
+
+**WHAT YOU DID WRONG**: You wrote text instead of calling a tool.
+
+**WHAT YOU MUST DO**: 
+- If research is complete: Call create_finding() tool (no parameters needed) - it will automatically synthesize all your collected information
+- If research continues: Call web_search(), scrape_url(), or other research tools
+- NEVER write text summaries or responses - only tool calls are allowed
+
+**YOUR CURRENT STATUS**:
+- Sources collected: {len(sources)}
+- Scraped pages: {len(scraped_pages)}
+- Step: {step + 1}/{max_steps}
+
+**ACTION REQUIRED**: Call create_finding() if research is complete, or call another research tool if you need more information."""
+                
+                # Add correction to history
+                agent_history.append({
+                    "role": "user",
+                    "content": correction_message
+                })
+                
+                # Retry LLM call with correction
+                logger.info(f"Agent {agent_id} step {step}: retrying LLM call with correction message",
+                           note="Added correction message explaining that text responses are forbidden. Will retry LLM call.")
+                
+                try:
+                    # Rebuild messages with correction
+                    retry_messages = [SystemMessage(content=system_prompt)]
+                    for msg in agent_history:
+                        if msg["role"] == "user":
+                            retry_messages.append(HumanMessage(content=msg["content"]))
+                        elif msg["role"] == "assistant":
+                            content = msg.get("content", "")
+                            tool_calls_data = msg.get("tool_calls", [])
+                            if tool_calls_data:
+                                from langchain_core.messages.tool import ToolCall
+                                tool_calls_retry = []
+                                for tc in tool_calls_data:
+                                    if isinstance(tc, dict):
+                                        tool_calls_retry.append(ToolCall(
+                                            name=tc.get("name", ""),
+                                            args=tc.get("args", {}),
+                                            id=tc.get("id", f"call_{step}_{len(tool_calls_retry)}")
+                                        ))
+                                    else:
+                                        tool_calls_retry.append(tc)
+                                retry_messages.append(AIMessage(content=content, tool_calls=tool_calls_retry))
+                            else:
+                                retry_messages.append(AIMessage(content=content))
+                        elif msg["role"] == "tool":
+                            retry_messages.append(ToolMessage(
+                                content=msg["content"],
+                                tool_call_id=msg.get("tool_call_id", f"call_{step}")
+                            ))
+                    
+                    retry_response = await asyncio.wait_for(
+                        llm_with_tools.ainvoke(retry_messages),
+                        timeout=llm_timeout
+                    )
+                    
+                    # Check if retry was successful
+                    if hasattr(retry_response, "tool_calls") and retry_response.tool_calls:
+                        tool_calls = retry_response.tool_calls
+                        logger.info(f"Agent {agent_id} step {step}: retry successful - LLM now calling tools",
+                                   tool_calls_count=len(tool_calls),
+                                   note="Correction message worked - LLM now calling tools instead of returning text")
+                        response = retry_response  # Use retry response
+                    else:
+                        logger.warning(f"Agent {agent_id} step {step}: retry failed - LLM still returned text",
+                                     note="Even after correction, LLM returned text. Will continue without tool calls.")
+                except Exception as retry_error:
+                    logger.error(f"Agent {agent_id} step {step}: retry failed with error",
+                               error=str(retry_error),
+                               note="Retry failed - will continue without tool calls")
 
             # Check for done - handle both ToolCall objects and dicts
             done = False
@@ -1575,39 +1673,13 @@ Create an updated research plan incorporating this new direction. Keep it concis
 - fallback_if_stuck: 1 sentence maximum
 """
                         
-                        # CRITICAL: The issue is LLM generating 131k tokens in RESPONSE
-                        # We need to add max_tokens limit to the LLM call itself, not truncate input
-                        # Check if LLM supports max_tokens parameter
-                        try:
-                            # Try to bind max_tokens if LLM supports it
-                            llm_for_replan = llm
-                            if hasattr(llm, "bind") or hasattr(llm, "with_config"):
-                                # Some LLMs support max_tokens via bind/with_config
-                                try:
-                                    if hasattr(llm, "with_config"):
-                                        llm_for_replan = llm.with_config({"max_tokens": 500})  # Limit response to 500 tokens
-                                    elif hasattr(llm, "bind"):
-                                        llm_for_replan = llm.bind(max_tokens=500)
-                                except:
-                                    pass  # If binding fails, use original LLM
-                            
-                            plan = await llm_for_replan.with_structured_output(
-                                AgentPlan,
-                                method="json_schema"
-                            ).ainvoke([
-                                {"role": "system", "content": "You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. DO NOT repeat previous plan details - just create a new brief plan. CRITICAL: Your response must be under 500 tokens total."},
-                                {"role": "user", "content": replan_prompt}
-                            ])
-                        except Exception as e:
-                            logger.warning(f"Replan with max_tokens failed, using fallback", error=str(e))
-                            # Fallback without max_tokens
-                            plan = await llm.with_structured_output(
-                                AgentPlan,
-                                method="json_schema"
-                            ).ainvoke([
-                                {"role": "system", "content": "You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. DO NOT repeat previous plan details - just create a new brief plan."},
-                                {"role": "user", "content": replan_prompt}
-                            ])
+                        plan = await llm.with_structured_output(
+                            AgentPlan,
+                            method="json_schema"
+                        ).ainvoke([
+                            {"role": "system", "content": "You are a research planning expert. Create VERY BRIEF, concise, actionable plans. Each field must be SHORT (1-2 sentences max). DO NOT write long explanations - keep it minimal and structured. DO NOT repeat previous plan details - just create a new brief plan."},
+                            {"role": "user", "content": replan_prompt}
+                        ])
                         logger.info(f"Agent {agent_id} replanned", new_goal=plan.current_goal)
 
                         # Update agent history with new direction

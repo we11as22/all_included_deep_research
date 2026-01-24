@@ -145,20 +145,35 @@ class Settings(BaseSettings):
     llm_mode: Literal["live", "mock"] = Field(default="live", description="LLM mode: live or mock")
     chat_model: str = Field(default="z-ai:glm-4.7", description="Chat model for search answers")
     chat_model_max_tokens: int = Field(default=32768, description="Chat model max tokens for writer synthesis")
+    chat_model_provider_order: Optional[str] = Field(
+        default=None, description="Provider order for chat model (comma-separated, e.g., 'deepinfra,openai,together'). Only works with OpenRouter."
+    )
 
     search_summarization_model: str = Field(
         default="z-ai:glm-4.7", description="Model for summarizing scraped sources"
     )
     search_summarization_model_max_tokens: int = Field(default=32768, description="Summarization model max tokens")
+    search_summarization_model_provider_order: Optional[str] = Field(
+        default=None, description="Provider order for search summarization model (comma-separated). Only works with OpenRouter."
+    )
 
     research_model: str = Field(default="z-ai:glm-4.7", description="Research model")
     research_model_max_tokens: int = Field(default=65536, description="Research model max tokens (increased for deep research)")
+    research_model_provider_order: Optional[str] = Field(
+        default=None, description="Provider order for research model (comma-separated). Only works with OpenRouter."
+    )
 
     compression_model: str = Field(default="z-ai:glm-4.7", description="Compression model")
     compression_model_max_tokens: int = Field(default=32768, description="Compression model max tokens")
+    compression_model_provider_order: Optional[str] = Field(
+        default=None, description="Provider order for compression model (comma-separated). Only works with OpenRouter."
+    )
 
     final_report_model: str = Field(default="z-ai:glm-4.7", description="Final report model")
     final_report_model_max_tokens: int = Field(default=131072, description="Final report model max tokens (increased for comprehensive reports)")
+    final_report_model_provider_order: Optional[str] = Field(
+        default=None, description="Provider order for final report model (comma-separated). Only works with OpenRouter."
+    )
 
     # Anthropic (for Claude models)
     anthropic_api_key: Optional[str] = Field(default=None, description="Anthropic API key")

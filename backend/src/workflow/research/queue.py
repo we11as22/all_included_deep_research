@@ -7,7 +7,7 @@ to avoid race conditions and enable batch processing.
 import asyncio
 import time
 from collections import deque
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import structlog
 
@@ -144,6 +144,23 @@ class SupervisorQueue:
         """Check if queue is empty."""
         return len(self.queue) == 0
     
+    def has_finding_from_agent(self, agent_id: str) -> bool:
+        """
+        Check if there is a finding from specific agent in queue.
+        
+        Args:
+            agent_id: Agent identifier to check
+            
+        Returns:
+            True if agent has finding in queue, False otherwise
+        """
+        # Check all items in queue without removing them
+        # Since queue is a deque, we can iterate without modifying
+        for item in self.queue:
+            if isinstance(item, dict) and item.get("agent_id") == agent_id:
+                return True
+        return False
+    
     async def agent_completed_task(self, agent_id: str, task_title: str, result: Any):
         """
         Agent reports task completion and requests supervisor review.
@@ -163,6 +180,47 @@ class SupervisorQueue:
             queue_size=len(self.queue),
             task_title=task_title
         )
+    
+    async def get_finding(self, timeout: float = 2.0) -> Optional[Dict[str, Any]]:
+        """
+        Get finding from queue with timeout.
+        
+        Args:
+            timeout: Maximum time to wait for finding in seconds
+            
+        Returns:
+            Finding dict with 'agent_id', 'action', 'result', 'timestamp' or None if timeout
+        """
+        start_time = time.time()
+        
+        while True:
+            async with self.lock:
+                if self.queue:
+                    # Get first finding from queue (FIFO)
+                    finding = self.queue.popleft()
+                    logger.debug(
+                        "SUPERVISOR: Retrieved finding from queue",
+                        agent_id=finding.get("agent_id") if isinstance(finding, dict) else None,
+                        queue_size_after=len(self.queue),
+                        note="Finding removed from queue for processing"
+                    )
+                    return finding
+            
+            # Check timeout
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                logger.debug(
+                    "SUPERVISOR: Timeout waiting for finding in queue",
+                    elapsed=elapsed,
+                    timeout=timeout,
+                    queue_size=len(self.queue),
+                    note="No finding available within timeout"
+                )
+                return None
+            
+            # Wait a bit before retrying (shorter wait if close to timeout)
+            wait_time = min(0.1, timeout - elapsed) if timeout - elapsed > 0 else 0.01
+            await asyncio.sleep(wait_time)
 
 
 # ==================== Global Queue Instance ==========
