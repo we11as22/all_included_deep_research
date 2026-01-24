@@ -178,7 +178,8 @@ def _extract_sources_from_report(report: str) -> dict[int, tuple[str, str]]:
         
         # Also match numbered format: [1] Title: URL or 1. Title: URL (fallback)
         # Only if no markdown links were found in this section
-        if not any(re.search(r'-\s*\[([^\]]+)\]\(([^)]+)\)', section_text)):
+        # Use search() result directly, not any(), to avoid TypeError
+        if not re.search(r'-\s*\[([^\]]+)\]\(([^)]+)\)', section_text):
             pattern2_fallback = r'(?:\[(\d+)\]|(\d+)\.)\s+([^:]+):\s+(https?://[^\s\)]+)'
             matches = re.finditer(pattern2_fallback, section_text)
             for match in matches:

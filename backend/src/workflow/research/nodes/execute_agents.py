@@ -709,14 +709,6 @@ class ExecuteAgentsNode(ResearchNode):
                                         # 2. Agent is returned to work (task created and scheduled)
                                         # 3. Only then next finding can start processing
                                     
-                                    # CRITICAL: Lock is released here (after exiting async with block)
-                                    logger.info(
-                                        "SUPERVISOR: Processing lock released",
-                                        agent_id=processed_agent_id if processed_agent_id else "none",
-                                        queue_size_remaining=supervisor_queue.size() if supervisor_queue else 0,
-                                        note="Lock released. Next finding in queue can now acquire lock and start processing."
-                                    )
-                                    
                                     except Exception as e:
                                         logger.error("SUPERVISOR: Error processing finding (continuous)", error=str(e), exc_info=True)
                                         # CRITICAL: Even if processing fails, continue processing queue
